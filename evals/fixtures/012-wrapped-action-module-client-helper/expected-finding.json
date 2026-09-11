@@ -1,0 +1,29 @@
+{
+  "ruleId": "supabase.service-role-object-access-without-tenant-scope",
+  "title": "Cross-tenant delete on \"invoices\" via service-role client",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": [
+    "server action deleteInvoice"
+  ],
+  "sources": [
+    "action_arg:data"
+  ],
+  "sinks": [
+    "supabase.delete:public.invoices"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/app/invoices/actions.ts",
+    "vulnerable/lib/invoices.ts",
+    "vulnerable/lib/supabase/admin.ts"
+  ],
+  "mustNotFlag": [
+    "secure/app/invoices/actions.ts",
+    "secure/lib/invoices.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "row deleted",
+    "expectedAfter": "row intact"
+  }
+}

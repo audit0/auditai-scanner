@@ -1,0 +1,9 @@
+{
+  "name": "fixture-011-vulnerable",
+  "version": "0.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

@@ -152,3 +152,125 @@ describe("parseProject on fixture 001", () => {
     expect(m.routes).toEqual([]);
   });
 });
+
+import { matchPattern, resolveExports } from "./resolve.js";
+
+async function tempProject(files: Record<string, string>): Promise<string> {
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { dirname, join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "auditai-proj-"));
+  for (const [rel, text] of Object.entries(files)) {
+    mkdirSync(dirname(join(dir, rel)), { recursive: true });
+    writeFileSync(join(dir, rel), text);
+  }
+  return dir;
+}
+
+describe("import resolution", () => {
+  it("maps package.json exports, including conditions and wildcards", () => {
+    expect(resolveExports("./src/index.ts", ".")).toEqual(["./src/index.ts"]);
+    expect(resolveExports({ "./server": "./src/server.ts" }, "./server")).toEqual([
+      "./src/server.ts",
+    ]);
+    expect(resolveExports({ "./hooks/*": "./src/hooks/*.ts" }, "./hooks/use-x")).toEqual([
+      "./src/hooks/use-x.ts",
+    ]);
+    expect(
+      resolveExports({ ".": { import: "./dist/index.js", types: "./dist/index.d.ts" } }, "."),
+    ).toEqual(["./dist/index.js"]);
+    expect(resolveExports({ import: "./a.js", default: "./b.js" }, ".")).toEqual(["./a.js"]);
+    expect(resolveExports(null, ".")).toEqual([]);
+    expect(matchPattern("~/*", "~/lib/http")).toBe("lib/http");
+    expect(matchPattern("@kit/*", "@other/x")).toBeNull();
+  });
+
+  it("follows a class-based service and a tsconfig path alias into the query", async () => {
+    const dir = await tempProject({
+      "tsconfig.json": JSON.stringify({ compilerOptions: { paths: { "~/*": ["./src/*"] } } }),
+      "src/lib/supabase.ts": `import { createClient } from "@supabase/supabase-js";
+export function getAdmin() { return createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!); }
+export function getDb() { return getAdmin(); }
+`,
+      "src/lib/accounts.ts": `import type { SupabaseClient } from "@supabase/supabase-js";
+class AccountsApi {
+  constructor(private readonly client: SupabaseClient) {}
+  async getAccount(id: string) {
+    return this.client.from("accounts").select("*").eq("id", id).single();
+  }
+  async getMine(id: string) { return this.getAccount(id); }
+}
+export function createAccountsApi(client: SupabaseClient) { return new AccountsApi(client); }
+`,
+      "src/app/api/accounts/[id]/route.ts": `import { NextResponse } from "next/server";
+import { getDb } from "~/lib/supabase";
+import { createAccountsApi } from "~/lib/accounts";
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const api = createAccountsApi(getDb());
+  const { data } = await api.getMine(id);
+  return NextResponse.json(data);
+}
+`,
+    });
+    const m = parseProject(dir);
+    expect(m.warnings).toEqual([]);
+    expect(m.routes).toHaveLength(1);
+    const q = m.routes[0]?.queries[0];
+    expect(q).toMatchObject({ table: "accounts", operation: "select", client: "service_role" });
+    expect(q?.filters).toEqual([
+      { method: "eq", column: "id", valueText: "id", inputDerived: true },
+    ]);
+    expect(q?.location.file).toBe("src/lib/accounts.ts");
+    expect(q?.via?.map((v) => v.split(" ")[0])).toEqual([
+      "AccountsApi.getMine",
+      "AccountsApi.getAccount",
+    ]);
+  });
+
+  it("treats a dynamic page as an entry point with params as input", async () => {
+    const dir = await tempProject({
+      "lib/admin.ts": `import { createClient } from "@supabase/supabase-js";
+export const admin = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+`,
+      "app/invoices/[id]/page.tsx": `import { admin } from "@/lib/admin";
+export default async function InvoicePage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const { data } = await admin.from("invoices").select("*").eq("id", id).single();
+  return <pre>{JSON.stringify(data)}</pre>;
+}
+`,
+    });
+    const m = parseProject(dir);
+    const r = m.routes[0];
+    expect(r?.entry).toBe("PAGE /invoices/[id]");
+    expect(r?.kind).toBe("page");
+    expect(r?.inputs).toContainEqual(expect.objectContaining({ kind: "route_param", name: "id" }));
+    expect(r?.queries[0]).toMatchObject({ client: "service_role", clientName: "admin" });
+    expect(r?.queries[0]?.filters[0]).toMatchObject({ column: "id", inputDerived: true });
+  });
+
+  it("sees through wrapped handlers and keeps auth-helper results untainted", async () => {
+    const dir = await tempProject({
+      "lib/supabase.ts": `import { createClient } from "@supabase/supabase-js";
+export function admin() { return createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!); }
+export async function getUserFromRequest(req: Request) { const { data } = await admin().auth.getUser(req.headers.get("authorization") ?? ""); return data.user; }
+`,
+      "lib/wrap.ts": `export function withAuth<T>(fn: (req: Request) => Promise<T>) { return fn; }`,
+      "app/api/me/route.ts": `import { NextResponse } from "next/server";
+import { admin, getUserFromRequest } from "@/lib/supabase";
+import { withAuth } from "@/lib/wrap";
+export const GET = withAuth(async (req: Request) => {
+  const user = await getUserFromRequest(req);
+  const { data } = await admin().from("profiles").select("*").eq("id", user!.id).single();
+  return NextResponse.json(data);
+});
+`,
+    });
+    const m = parseProject(dir);
+    const r = m.routes[0];
+    expect(r?.entry).toBe("GET /api/me");
+    expect(r?.authChecks.length).toBeGreaterThanOrEqual(1);
+    expect(r?.queries[0]?.filters[0]).toMatchObject({ column: "id", inputDerived: false });
+  });
+});

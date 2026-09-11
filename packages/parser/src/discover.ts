@@ -18,6 +18,10 @@ const SOURCE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
 export interface DiscoveredFiles {
   source: string[];
   sql: string[];
+  /** package.json files inside the project (workspace packages for import resolution). */
+  manifests: string[];
+  /** tsconfig*.json files inside the project (`paths` aliases). */
+  tsconfigs: string[];
 }
 
 /** Minimal glob: `**` matches any path segment(s), `*` matches within a segment. Anchored at the project root; a directory pattern matches everything below it. */
@@ -65,6 +69,8 @@ export function discoverFiles(
 ): DiscoveredFiles {
   const source: string[] = [];
   const sql: string[] = [];
+  const manifests: string[] = [];
+  const tsconfigs: string[] = [];
   const ignore = ignoreGlobs.map(globToRegExp);
   const walk = (dir: string, sqlOnly = false): void => {
     let entries: string[];
@@ -94,12 +100,16 @@ export function discoverFiles(
         continue;
       }
       if (sqlOnly || name.endsWith(".d.ts")) continue;
-      if (SOURCE_EXT.test(name)) source.push(rel);
+      if (name === "package.json") manifests.push(rel);
+      else if (/^tsconfig(\..+)?\.json$/.test(name)) tsconfigs.push(rel);
+      else if (SOURCE_EXT.test(name)) source.push(rel);
     }
   };
   walk(root);
   for (const extra of extraSqlDirs) walk(resolve(root, extra), true);
   source.sort();
   sql.sort();
-  return { source, sql };
+  manifests.sort();
+  tsconfigs.sort();
+  return { source, sql, manifests, tsconfigs };
 }

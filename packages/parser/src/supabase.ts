@@ -1,5 +1,13 @@
 import ts from "typescript";
-import { collect, exportedFunctions, lineOf, unwrap } from "./ast.js";
+import {
+  type ClassInfo,
+  classesIn,
+  collect,
+  lineOf,
+  type TopLevelFunction,
+  topLevelFunctions,
+  unwrap,
+} from "./ast.js";
 import type { AuthHelper, ClientFactory, ClientKind } from "./model.js";
 
 export const CREATE_CLIENT_CALLEES = /^(createClient|createServerClient|createBrowserClient)$/;
@@ -46,13 +54,14 @@ export function classifyCreateClientCall(
       evidence: `${callee}() from @supabase/ssr acts as the signed-in user; RLS applies`,
     };
   }
-  if (/SERVICE_ROLE|service_role|SECRET_KEY|SB_SECRET|sb_secret/i.test(keyArg)) {
+  // SERVICE_ROLE_KEY, serviceRoleKey, getServiceRoleKey(), sb_secret_… all name the secret key.
+  if (/SERVICE_?ROLE|SECRET_KEY|SB_SECRET/i.test(keyArg)) {
     return {
       kind: "service_role",
       evidence: `key ${keyArg} is a service-role secret; RLS is bypassed`,
     };
   }
-  const anonKey = /ANON|PUBLISHABLE|anon|publishable/.test(keyArg);
+  const anonKey = /ANON|PUBLISHABLE/i.test(keyArg);
   if (anonKey && /Authorization|headers/i.test(optArg)) {
     return {
       kind: "user_scoped",
@@ -70,47 +79,143 @@ export function classifyCreateClientCall(
 
 const AUTH_CALL = /\.auth\.(getUser|getSession|getClaims)\s*\(/;
 
+export interface ImportRef {
+  spec: string;
+  /** Exported name in the target module, `default`, or `*` for a namespace import. */
+  imported: string;
+}
+
+export interface ModuleVar {
+  name: string;
+  init: ts.Expression;
+  exported: boolean;
+  node: ts.VariableDeclaration;
+}
+
+export type Reexport =
+  | { star: true; spec: string }
+  | { star: false; name: string; alias: string; spec: string };
+
 export interface ModuleFacts {
   file: string;
   clientFactories: ClientFactory[];
   authHelpers: AuthHelper[];
-  /** local import name -> module specifier */
-  imports: Map<string, string>;
+  /** local name -> what was imported and from where */
+  imports: Map<string, ImportRef>;
+  /** Every top-level function, exported or not. */
+  functions: Map<string, TopLevelFunction>;
+  classes: Map<string, ClassInfo>;
+  /** Top-level `const x = <call or new>` declarations: module-level clients and service instances. */
+  moduleVars: Map<string, ModuleVar>;
+  reexports: Reexport[];
+  /** Local name behind `export default`, when it is a named function or identifier. */
+  defaultExport: string | null;
 }
 
-/** Classifies a module's exported helpers: Supabase client factories and auth helpers. */
+function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
+  const mods = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+  return mods?.some((m) => m.kind === kind) ?? false;
+}
+
+/** Classifies a module: imports, exports, helpers, client factories and auth helpers. */
 export function analyzeModule(rel: string, sf: ts.SourceFile): ModuleFacts {
-  const imports = new Map<string, string>();
+  const imports = new Map<string, ImportRef>();
+  const reexports: Reexport[] = [];
+  const exportedNames = new Set<string>();
+  let defaultExport: string | null = null;
   for (const stmt of sf.statements) {
-    if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
-    const spec = stmt.moduleSpecifier.text;
-    const clause = stmt.importClause;
-    if (!clause) continue;
-    if (clause.name) imports.set(clause.name.text, spec);
-    const nb = clause.namedBindings;
-    if (nb && ts.isNamedImports(nb)) for (const el of nb.elements) imports.set(el.name.text, spec);
-    if (nb && ts.isNamespaceImport(nb)) imports.set(nb.name.text, spec);
+    if (ts.isImportDeclaration(stmt) && ts.isStringLiteral(stmt.moduleSpecifier)) {
+      const spec = stmt.moduleSpecifier.text;
+      const clause = stmt.importClause;
+      if (!clause) continue;
+      if (clause.name) imports.set(clause.name.text, { spec, imported: "default" });
+      const nb = clause.namedBindings;
+      if (nb && ts.isNamedImports(nb)) {
+        for (const el of nb.elements) {
+          imports.set(el.name.text, { spec, imported: (el.propertyName ?? el.name).text });
+        }
+      }
+      if (nb && ts.isNamespaceImport(nb)) imports.set(nb.name.text, { spec, imported: "*" });
+    } else if (ts.isExportDeclaration(stmt)) {
+      const spec =
+        stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)
+          ? stmt.moduleSpecifier.text
+          : null;
+      const clause = stmt.exportClause;
+      if (spec && !clause) reexports.push({ star: true, spec });
+      else if (clause && ts.isNamedExports(clause)) {
+        for (const el of clause.elements) {
+          const name = (el.propertyName ?? el.name).text;
+          if (spec) reexports.push({ star: false, name, alias: el.name.text, spec });
+          else exportedNames.add(name);
+        }
+      }
+    } else if (ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
+      const e = unwrap(stmt.expression);
+      if (ts.isIdentifier(e)) defaultExport = e.text;
+    } else if (
+      ts.isFunctionDeclaration(stmt) &&
+      stmt.name &&
+      hasModifier(stmt, ts.SyntaxKind.DefaultKeyword)
+    ) {
+      defaultExport = stmt.name.text;
+    }
+  }
+
+  const functions = new Map<string, TopLevelFunction>();
+  for (const f of topLevelFunctions(sf)) {
+    functions.set(f.name, exportedNames.has(f.name) ? { ...f, exported: true } : f);
+  }
+  const classes = new Map<string, ClassInfo>();
+  for (const c of classesIn(sf)) {
+    classes.set(c.name, exportedNames.has(c.name) ? { ...c, exported: true } : c);
+  }
+  const moduleVars = new Map<string, ModuleVar>();
+  for (const stmt of sf.statements) {
+    if (!ts.isVariableStatement(stmt)) continue;
+    const exported = hasModifier(stmt, ts.SyntaxKind.ExportKeyword);
+    for (const d of stmt.declarationList.declarations) {
+      if (!ts.isIdentifier(d.name) || !d.initializer || functions.has(d.name.text)) continue;
+      const init = unwrap(d.initializer);
+      if (!ts.isCallExpression(init) && !ts.isNewExpression(init)) continue;
+      moduleVars.set(d.name.text, {
+        name: d.name.text,
+        init,
+        exported: exported || exportedNames.has(d.name.text),
+        node: d,
+      });
+    }
   }
 
   const clientFactories: ClientFactory[] = [];
   const authHelpers: AuthHelper[] = [];
-  for (const ex of exportedFunctions(sf)) {
-    const text = ex.fn.getText(sf);
-    const location = { file: rel, line: lineOf(sf, ex.node) };
+  for (const f of functions.values()) {
+    const text = f.fn.getText(sf);
+    const location = { file: rel, line: lineOf(sf, f.node) };
     if (AUTH_CALL.test(text)) {
       authHelpers.push({
-        name: ex.name,
+        name: f.name,
         location,
         evidence: "calls supabase auth.getUser/getSession/getClaims",
       });
       continue;
     }
-    const creates = collect(ex.fn, ts.isCallExpression).filter((c) => isCreateClientCall(c, sf));
+    const creates = collect(f.fn, ts.isCallExpression).filter((c) => isCreateClientCall(c, sf));
     const first = creates[0];
     if (first) {
       const { kind, evidence } = classifyCreateClientCall(first, sf);
-      clientFactories.push({ name: ex.name, kind, location, evidence });
+      clientFactories.push({ name: f.name, kind, location, evidence });
     }
   }
-  return { file: rel, clientFactories, authHelpers, imports };
+  return {
+    file: rel,
+    clientFactories,
+    authHelpers,
+    imports,
+    functions,
+    classes,
+    moduleVars,
+    reexports,
+    defaultExport,
+  };
 }

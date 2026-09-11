@@ -85,6 +85,8 @@ export interface QueryNodeData {
   payload: QueryPayload | null;
   text: string;
   table: string;
+  /** Helper calls between the handler and the query, when the query lives outside the handler body. */
+  via?: string[];
 }
 
 export interface HandlerNodeData {
@@ -198,6 +200,7 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
         payload: q.payload,
         text: q.text,
         table: q.table,
+        ...(q.via && q.via.length > 0 ? { via: q.via } : {}),
       };
       const qn = g.addNode({
         id: `query:${q.location.file}:${q.location.line}:${i}`,

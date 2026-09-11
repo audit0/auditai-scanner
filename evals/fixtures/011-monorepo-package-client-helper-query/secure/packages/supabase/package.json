@@ -1,0 +1,13 @@
+{
+  "name": "@kit/supabase",
+  "version": "0.1.0",
+  "private": true,
+  "exports": {
+    "./server-client": "./src/clients/server-client.ts",
+    "./server-admin-client": "./src/clients/server-admin-client.ts",
+    "./require-user": "./src/require-user.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0"
+  }
+}

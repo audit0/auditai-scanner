@@ -103,9 +103,11 @@ source files ──► parser ──► Program Security Graph ──► rules �
                  (TS compiler API)   Route → Handler → Query → Client / Table → RLSPolicy
 ```
 
-- **parser** maps App Router routes and server actions, classifies every Supabase client
-  (`service_role`, `anon`, `user_scoped`), follows query chains and filters back to their inputs,
-  reads insert/update payloads, and ingests RLS policies from migration SQL.
+- **parser** maps App Router route handlers, server actions (wrapped ones too) and dynamic pages,
+  classifies every Supabase client (`service_role`, `anon`, `user_scoped`), follows calls from the
+  entry point into helpers, service classes and workspace packages (tsconfig `paths`, package.json
+  `exports`) three levels deep, tracks which arguments carry user input, reads insert/update
+  payloads, and ingests RLS policies from migration SQL.
 - **graph** links handlers, queries, clients, tables and policies into one structure a rule can walk.
 - **rules** are small pure functions over the graph. Each returns findings with file, line, entry
   point, evidence and a one-line remediation.
@@ -116,7 +118,7 @@ instructions" is just a comment.
 
 ## Eval corpus
 
-Ten fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
+Twelve fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
 rule; the secure twin must produce zero findings. `npm run evals` enforces both on every commit.
 
 | # | Fixture | Rule exercised |
@@ -131,6 +133,8 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 008 | mass-assignment-profile-update | mass-assignment-from-request-body |
 | 009 | unprotected-server-action | service-role-object-access-without-tenant-scope |
 | 010 | batch-lookup-by-ids | service-role-object-access-without-tenant-scope |
+| 011 | monorepo-package-client-helper-query | service-role-object-access-without-tenant-scope, through a workspace package and a helper |
+| 012 | wrapped-action-module-client-helper | service-role-object-access-without-tenant-scope, wrapped action and module-level client |
 
 Each fixture also carries the `security-test` the hosted product runs in a sandbox: `DENY` tests
 are the security assertion (Alice must not read Bob's row), `ALLOW` tests are the sanity check

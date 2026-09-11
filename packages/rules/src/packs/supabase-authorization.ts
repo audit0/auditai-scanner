@@ -89,6 +89,11 @@ function locations(...refs: Array<FileRef | undefined>): FileRef[] {
   return refs.filter((r): r is FileRef => r !== undefined);
 }
 
+/** Names the helper chain when the query does not sit in the handler body itself. */
+function viaNote(q: QueryNodeData): string {
+  return q.via && q.via.length > 0 ? ` Reached through ${q.via.join(" -> ")}.` : "";
+}
+
 function rlsNote(t: TableNodeData | undefined, tableName: string): string {
   if (!t?.known) return `public.${tableName} was not found in migrations; RLS state unknown.`;
   if (!t.rlsEnabled) return `RLS is disabled on public.${tableName}.`;
@@ -156,7 +161,7 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
         const evidence: Evidence[] = [
           {
             kind: "rule",
-            summary: `${q.operation} on public.${tableName} filtered by user-controlled "${idFilter.column}" through a service-role client, with no tenant/owner scoping. ${authNote} ${rlsNote(v.tableData, tableName)}`,
+            summary: `${q.operation} on public.${tableName} filtered by user-controlled "${idFilter.column}" through a service-role client, with no tenant/owner scoping. ${authNote} ${rlsNote(v.tableData, tableName)}${viaNote(q)}`,
             locations: locations(h.handler.location, v.query.location, v.client?.location),
             data: {
               deterministic: false,

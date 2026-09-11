@@ -1,0 +1,11 @@
+{
+  "name": "@kit/invoices",
+  "version": "0.1.0",
+  "private": true,
+  "exports": {
+    "./server": "./src/server.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0"
+  }
+}

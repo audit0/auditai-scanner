@@ -1,0 +1,37 @@
+{
+  "id": "012-wrapped-action-module-client-helper",
+  "vulnerabilityExists": true,
+  "class": [
+    "BOLA",
+    "IDOR",
+    "multi-tenancy",
+    "service-role-bypass"
+  ],
+  "cwe": [
+    "CWE-639",
+    "CWE-284"
+  ],
+  "severity": "critical",
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "typescript",
+    "server-actions"
+  ],
+  "vulnerablePath": [
+    "server action deleteInvoice (app/invoices/actions.ts), wrapped by enhanceAction",
+    "data.id (user-controlled action argument)",
+    "removeInvoice(id) (lib/invoices.ts)",
+    "supabaseAdmin (lib/supabase/admin.ts) bypasses RLS",
+    "supabaseAdmin.from('invoices').delete().eq('id', invoiceId)"
+  ],
+  "expectedSecureBehavior": "Bob invoking deleteInvoice with Alice's invoice id leaves Alice's invoice intact.",
+  "acceptableFixes": [
+    "Scope the delete by the caller's tenant id taken from app_metadata or the profiles table",
+    "Use the caller's user-scoped client so the RLS delete policy applies"
+  ],
+  "unacceptableFixes": [
+    "Trusting a tenant id sent in the action payload",
+    "Weakening the RLS policy"
+  ]
+}

@@ -77,6 +77,8 @@ export interface SupabaseQuery {
   payload: QueryPayload | null;
   location: FileRef;
   text: string;
+  /** Helper calls between the entry point and the query, e.g. `loadInvoice (packages/invoices/src/server.ts:12)`. */
+  via?: string[];
 }
 
 /** `// auditai:ignore <ruleId|*> -- reason` placed above a handler (or at the top of a file). */
@@ -86,7 +88,8 @@ export interface IgnoreDirective {
   location: FileRef;
 }
 
-export type EntryKind = "route" | "server_action";
+/** Route handler, server action, or a server-rendered page (a GET that reads data for its params). */
+export type EntryKind = "route" | "server_action" | "page";
 
 /** A `user.user_metadata.role`-style access; user_metadata is editable by the end user. */
 export interface MetadataAccess {
@@ -97,10 +100,10 @@ export interface MetadataAccess {
 
 export interface RouteHandler {
   kind: EntryKind;
-  /** Route path for routes, function name for server actions. */
+  /** Route path for routes and pages, function name for server actions. */
   route: string;
-  method: HttpMethod | "ACTION";
-  /** Human-readable entry label, e.g. `GET /api/invoices/[id]` or `server action deleteInvoice`. */
+  method: HttpMethod | "ACTION" | "PAGE";
+  /** Human-readable entry label, e.g. `GET /api/invoices/[id]`, `PAGE /invoices/[id]` or `server action deleteInvoice`. */
   entry: string;
   location: FileRef;
   inputs: InputSource[];

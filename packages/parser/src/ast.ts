@@ -96,35 +96,136 @@ export function isChainTail(call: ts.CallExpression): boolean {
   return true;
 }
 
-export type FunctionLike = ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression;
+export type FunctionLike =
+  | ts.FunctionDeclaration
+  | ts.ArrowFunction
+  | ts.FunctionExpression
+  | ts.MethodDeclaration;
 
-export interface ExportedFunction {
+export interface TopLevelFunction {
   name: string;
   fn: FunctionLike;
   node: ts.Node;
+  exported: boolean;
+  /** Callee text when the function is passed to a wrapper: `export const x = enhanceAction(async () => {})`. */
+  wrapper?: string;
 }
+
+export type ExportedFunction = TopLevelFunction;
 
 function hasExportModifier(node: ts.Node): boolean {
   const mods = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
   return mods?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
 }
 
-/** Top-level exported functions: `export async function X` and `export const X = () => {}`. */
-export function exportedFunctions(sf: ts.SourceFile): ExportedFunction[] {
-  const out: ExportedFunction[] = [];
-  for (const stmt of sf.statements) {
-    if (ts.isFunctionDeclaration(stmt) && stmt.name && hasExportModifier(stmt)) {
-      out.push({ name: stmt.name.text, fn: stmt, node: stmt });
-    } else if (ts.isVariableStatement(stmt) && hasExportModifier(stmt)) {
-      for (const d of stmt.declarationList.declarations) {
-        if (ts.isIdentifier(d.name) && d.initializer) {
-          const init = unwrap(d.initializer);
-          if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) {
-            out.push({ name: d.name.text, fn: init, node: d });
-          }
-        }
+/** The function behind a variable initializer: a literal, or the first function argument of a wrapper call. */
+export function functionOfInitializer(
+  init: ts.Expression,
+  sf: ts.SourceFile,
+): { fn: FunctionLike; wrapper?: string } | null {
+  const u = unwrap(init);
+  if (ts.isArrowFunction(u) || ts.isFunctionExpression(u)) return { fn: u };
+  if (ts.isCallExpression(u)) {
+    for (const a of u.arguments) {
+      const ua = unwrap(a);
+      if (ts.isArrowFunction(ua) || ts.isFunctionExpression(ua)) {
+        return { fn: ua, wrapper: u.expression.getText(sf).replace(/\s+/g, "") };
       }
     }
+  }
+  return null;
+}
+
+/** Every top-level function: declarations, `const x = () => {}` and wrapped `const x = wrap(() => {})`. */
+export function topLevelFunctions(sf: ts.SourceFile): TopLevelFunction[] {
+  const out: TopLevelFunction[] = [];
+  for (const stmt of sf.statements) {
+    if (ts.isFunctionDeclaration(stmt) && stmt.name) {
+      out.push({ name: stmt.name.text, fn: stmt, node: stmt, exported: hasExportModifier(stmt) });
+    } else if (ts.isVariableStatement(stmt)) {
+      const exported = hasExportModifier(stmt);
+      for (const d of stmt.declarationList.declarations) {
+        if (!ts.isIdentifier(d.name) || !d.initializer) continue;
+        const f = functionOfInitializer(d.initializer, sf);
+        if (!f) continue;
+        out.push(
+          f.wrapper === undefined
+            ? { name: d.name.text, fn: f.fn, node: d, exported }
+            : { name: d.name.text, fn: f.fn, node: d, exported, wrapper: f.wrapper },
+        );
+      }
+    }
+  }
+  return out;
+}
+
+/** Top-level exported functions, including wrapped ones. */
+export function exportedFunctions(sf: ts.SourceFile): ExportedFunction[] {
+  return topLevelFunctions(sf).filter((f) => f.exported);
+}
+
+export interface ClassInfo {
+  name: string;
+  node: ts.ClassDeclaration;
+  exported: boolean;
+  /** Constructor parameter names by position. */
+  ctorParams: string[];
+  /** `this.<prop>` -> constructor parameter index (parameter properties and `this.x = x` assignments). */
+  propFromParam: Map<string, number>;
+  methods: Map<string, ts.MethodDeclaration>;
+}
+
+/** Top-level classes with the constructor wiring needed to follow `this.client` back to a caller's argument. */
+export function classesIn(sf: ts.SourceFile): ClassInfo[] {
+  const out: ClassInfo[] = [];
+  for (const stmt of sf.statements) {
+    if (!ts.isClassDeclaration(stmt) || !stmt.name) continue;
+    const ctorParams: string[] = [];
+    const propFromParam = new Map<string, number>();
+    const methods = new Map<string, ts.MethodDeclaration>();
+    for (const member of stmt.members) {
+      if (ts.isConstructorDeclaration(member)) {
+        member.parameters.forEach((p, i) => {
+          const name = ts.isIdentifier(p.name) ? p.name.text : `arg${i}`;
+          ctorParams.push(name);
+          const mods = ts.getModifiers(p) ?? [];
+          if (
+            mods.some(
+              (m) =>
+                m.kind === ts.SyntaxKind.PrivateKeyword ||
+                m.kind === ts.SyntaxKind.PublicKeyword ||
+                m.kind === ts.SyntaxKind.ProtectedKeyword ||
+                m.kind === ts.SyntaxKind.ReadonlyKeyword,
+            )
+          ) {
+            propFromParam.set(name, i);
+          }
+        });
+        if (member.body) {
+          for (const bin of collect(member.body, ts.isBinaryExpression)) {
+            if (
+              bin.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+              ts.isPropertyAccessExpression(bin.left) &&
+              bin.left.expression.kind === ts.SyntaxKind.ThisKeyword &&
+              ts.isIdentifier(bin.right)
+            ) {
+              const idx = ctorParams.indexOf(bin.right.text);
+              if (idx >= 0) propFromParam.set(bin.left.name.text, idx);
+            }
+          }
+        }
+      } else if (ts.isMethodDeclaration(member) && ts.isIdentifier(member.name)) {
+        methods.set(member.name.text, member);
+      }
+    }
+    out.push({
+      name: stmt.name.text,
+      node: stmt,
+      exported: hasExportModifier(stmt),
+      ctorParams,
+      propFromParam,
+      methods,
+    });
   }
   return out;
 }

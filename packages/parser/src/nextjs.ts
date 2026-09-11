@@ -1,8 +1,16 @@
 import ts from "typescript";
-import { type ExportedFunction, exportedFunctions } from "./ast.js";
+import { type ExportedFunction, exportedFunctions, topLevelFunctions, unwrap } from "./ast.js";
 import { HTTP_METHODS, type HttpMethod } from "./model.js";
 
 const ROUTE_FILE = /^(?:(.*?)\/)?(?:src\/)?app\/(.*?)\/?route\.(ts|tsx|js|jsx|mjs)$/;
+const PAGE_FILE = /^(?:(.*?)\/)?(?:src\/)?app\/(.*?)\/?page\.(tsx|ts|jsx|js)$/;
+
+function routePath(dir: string): string {
+  const parts = dir
+    .split("/")
+    .filter((p) => p.length > 0 && !p.startsWith("(") && !p.startsWith("@"));
+  return `/${parts.join("/")}`;
+}
 
 /** Directory of the Next.js app that owns `rel` (empty string for a root-level app), or null when `rel` is not an App Router file. */
 export function appRootOf(rel: string): string | null {
@@ -17,11 +25,38 @@ export function appRootOf(rel: string): string | null {
 export function routeFromFile(rel: string): string | null {
   const m = ROUTE_FILE.exec(rel);
   if (!m) return null;
-  const dir = m[2] ?? "";
-  const parts = dir
-    .split("/")
-    .filter((p) => p.length > 0 && !p.startsWith("(") && !p.startsWith("@"));
-  return `/${parts.join("/")}`;
+  return routePath(m[2] ?? "");
+}
+
+/** Maps `app/invoices/[id]/page.tsx` to `/invoices/[id]`. */
+export function pageFromFile(rel: string): string | null {
+  const m = PAGE_FILE.exec(rel);
+  if (!m) return null;
+  return routePath(m[2] ?? "");
+}
+
+/**
+ * The default export of a page file: `export default async function Page()`, an anonymous default
+ * function, or `export default Page` referring to a top-level function.
+ */
+export function pageHandlerIn(sf: ts.SourceFile): ExportedFunction | null {
+  for (const stmt of sf.statements) {
+    if (ts.isFunctionDeclaration(stmt)) {
+      const mods = ts.getModifiers(stmt) ?? [];
+      if (mods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) {
+        return { name: stmt.name?.text ?? "Page", fn: stmt, node: stmt, exported: true };
+      }
+    } else if (ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
+      const e = unwrap(stmt.expression);
+      if (ts.isIdentifier(e)) {
+        const f = topLevelFunctions(sf).find((t) => t.name === e.text);
+        if (f) return { ...f, exported: true };
+      } else if (ts.isArrowFunction(e) || ts.isFunctionExpression(e)) {
+        return { name: "Page", fn: e, node: stmt, exported: true };
+      }
+    }
+  }
+  return null;
 }
 
 export interface RouteExport {
