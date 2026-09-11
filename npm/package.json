@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "auditai-scan": "./dist/auditai-scan.mjs"
+    "auditai-scan": "dist/auditai-scan.mjs"
   },
   "files": [
     "dist",
@@ -20,7 +20,7 @@
   "homepage": "https://auditai.sh",
   "repository": {
     "type": "git",
-    "url": "https://github.com/audit0/auditai-scanner.git",
+    "url": "git+https://github.com/audit0/auditai-scanner.git",
     "directory": "npm"
   },
   "bugs": "https://github.com/audit0/auditai-scanner/issues",

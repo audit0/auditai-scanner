@@ -7,7 +7,7 @@
   "homepage": "https://auditai.sh",
   "repository": {
     "type": "git",
-    "url": "https://github.com/audit0/auditai-scanner.git"
+    "url": "git+https://github.com/audit0/auditai-scanner.git"
   },
   "engines": {
     "node": ">=22",
