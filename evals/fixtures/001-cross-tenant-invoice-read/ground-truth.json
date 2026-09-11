@@ -1,0 +1,23 @@
+{
+  "id": "001-cross-tenant-invoice-read",
+  "vulnerabilityExists": true,
+  "class": ["BOLA", "IDOR", "multi-tenancy", "service-role-bypass"],
+  "cwe": ["CWE-639", "CWE-284"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": [
+    "GET /api/invoices/[id] (app/api/invoices/[id]/route.ts)",
+    "params.id (user-controlled)",
+    "createServiceRoleClient() (lib/supabase.ts) bypasses RLS",
+    "supabase.from('invoices').select('*').eq('id', id).single()"
+  ],
+  "expectedSecureBehavior": "A user from tenant A requesting an invoice that belongs to tenant B receives 403 or 404 and no invoice data.",
+  "acceptableFixes": [
+    "Use a per-request client with the caller's JWT so RLS applies, and scope by tenant_id",
+    "Keep service-role client but add an explicit ownership/tenant check before returning data"
+  ],
+  "unacceptableFixes": [
+    "Weakening or dropping the RLS policy",
+    "Returning 200 with an empty body while still reading the row"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "id": "010-batch-lookup-by-ids",
+  "vulnerabilityExists": true,
+  "class": ["BOLA", "IDOR", "multi-tenancy"],
+  "cwe": ["CWE-639", "CWE-284"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": ["POST /api/invoices/batch", "body.ids (user-controlled)", "createServiceRoleClient() bypasses RLS", "invoices.select().in('id', ids)"],
+  "expectedSecureBehavior": "Alice requesting Bob's invoice id receives an empty list for that id.",
+  "acceptableFixes": ["Add a tenant/owner scope to the query", "Use a user-scoped client so RLS filters the rows"],
+  "unacceptableFixes": ["Limiting the array size", "Checking that ids are UUIDs"]
+}

@@ -1,0 +1,12 @@
+{
+  "ruleId": "supabase.service-role-query-without-authentication",
+  "title": "Unauthenticated service-role access to \"profiles\" in GET /api/admin/users",
+  "severity": "critical",
+  "minConfidence": 0.8,
+  "entrypoints": ["GET /api/admin/users"],
+  "sources": [],
+  "sinks": ["supabase.select:public.profiles"],
+  "mustMentionFiles": ["vulnerable/app/api/admin/users/route.ts"],
+  "mustNotFlag": ["secure/app/api/admin/users/route.ts"],
+  "verification": { "strategy": "identity-matrix", "expectedBefore": "HTTP 200 anonymously", "expectedAfter": "HTTP 401 anonymously, 403 as member" }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@auditai/parser",
+  "version": "0.0.1",
+  "private": true,
+  "description": "TypeScript/Next.js/Supabase parser and route enumeration",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@auditai/core": "*",
+    "typescript": "^5.8.0"
+  },
+  "license": "Apache-2.0"
+}

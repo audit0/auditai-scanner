@@ -1,0 +1,12 @@
+{
+  "ruleId": "supabase.mass-assignment-from-request-body",
+  "title": "Mass assignment into \"profiles\" from the request body",
+  "severity": "high",
+  "minConfidence": 0.85,
+  "entrypoints": ["PATCH /api/profile"],
+  "sources": ["body:body"],
+  "sinks": ["supabase.update:public.profiles"],
+  "mustMentionFiles": ["vulnerable/app/api/profile/route.ts"],
+  "mustNotFlag": ["secure/app/api/profile/route.ts"],
+  "verification": { "strategy": "property-matrix", "expectedBefore": "role becomes admin", "expectedAfter": "role unchanged" }
+}

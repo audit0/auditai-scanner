@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.audit/
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+npm/dist/

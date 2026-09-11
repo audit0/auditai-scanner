@@ -1,0 +1,12 @@
+{
+  "id": "007-admin-route-without-auth",
+  "vulnerabilityExists": true,
+  "class": ["missing-authentication", "function-level-authorization"],
+  "cwe": ["CWE-306", "CWE-284"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": ["GET /api/admin/users", "no auth check", "createServiceRoleClient() bypasses RLS", "profiles.select() across all tenants"],
+  "expectedSecureBehavior": "Anonymous callers get 401; non-admin members get 403.",
+  "acceptableFixes": ["Authenticate the caller and require an admin role from app_metadata or a profiles.role column"],
+  "unacceptableFixes": ["Hiding the route behind an obscure path", "Checking a role in user_metadata"]
+}

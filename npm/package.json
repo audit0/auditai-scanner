@@ -1,0 +1,39 @@
+{
+  "name": "auditai-scan",
+  "version": "0.1.0",
+  "description": "Deterministic security scanner for Next.js + Supabase apps: cross-tenant reads, RLS gaps, service-role misuse, mass assignment. No account, no model, seconds.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "auditai-scan": "./dist/auditai-scan.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "typescript": "^5.8.0"
+  },
+  "homepage": "https://auditai.sh",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/audit0/auditai-scanner.git",
+    "directory": "npm"
+  },
+  "bugs": "https://github.com/audit0/auditai-scanner/issues",
+  "keywords": [
+    "security",
+    "nextjs",
+    "supabase",
+    "rls",
+    "idor",
+    "authorization",
+    "multi-tenant",
+    "sast",
+    "vibe-coding",
+    "audit"
+  ]
+}

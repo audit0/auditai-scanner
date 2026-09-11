@@ -1,0 +1,12 @@
+{
+  "ruleId": "supabase.rls-policy-without-caller-predicate",
+  "title": "RLS policy \"invoices: authenticated can read\" on \"invoices\" does not scope rows to the caller",
+  "severity": "high",
+  "minConfidence": 0.85,
+  "entrypoints": ["GET /api/invoices/[id]"],
+  "sources": ["route_param:id"],
+  "sinks": ["supabase.select:public.invoices"],
+  "mustMentionFiles": ["vulnerable/app/api/invoices/[id]/route.ts", "vulnerable/supabase/migrations/0001_init.sql"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": { "strategy": "identity-matrix", "expectedBefore": "HTTP 200", "expectedAfter": "HTTP 404" }
+}

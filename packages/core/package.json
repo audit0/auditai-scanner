@@ -1,0 +1,23 @@
+{
+  "name": "@auditai/core",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Shared types (Finding, Proof, statuses) and pure state-machine helpers",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {},
+  "license": "Apache-2.0"
+}

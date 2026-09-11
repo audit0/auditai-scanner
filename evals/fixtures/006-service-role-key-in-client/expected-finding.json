@@ -1,0 +1,12 @@
+{
+  "ruleId": "supabase.service-role-key-exposed-to-client",
+  "title": "Service-role client inside a client component (components/InvoiceList.tsx)",
+  "severity": "critical",
+  "minConfidence": 1,
+  "entrypoints": ["components/InvoiceList.tsx"],
+  "sources": ["browser bundle"],
+  "sinks": ["supabase service role"],
+  "mustMentionFiles": ["vulnerable/components/InvoiceList.tsx"],
+  "mustNotFlag": ["secure/components/InvoiceList.tsx"],
+  "verification": { "strategy": "bundle-grep", "expectedBefore": "service-role key present in .next/static", "expectedAfter": "absent" }
+}

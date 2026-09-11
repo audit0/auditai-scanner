@@ -1,0 +1,12 @@
+{
+  "id": "003-rls-policy-using-true",
+  "vulnerabilityExists": true,
+  "class": ["RLS-incorrect", "multi-tenancy"],
+  "cwe": ["CWE-863", "CWE-284"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": ["GET /api/invoices/[id]", "user-scoped client (RLS applies)", "policy \"invoices: authenticated can read\" using (true)", "any row is returned"],
+  "expectedSecureBehavior": "Alice (tenant A) requesting Bob's invoice (tenant B) gets 404.",
+  "acceptableFixes": ["Policy predicate that compares tenant_id/owner_id with the caller (auth.uid() or a tenant helper)"],
+  "unacceptableFixes": ["Dropping the policy without replacement", "Filtering only in the route handler"]
+}

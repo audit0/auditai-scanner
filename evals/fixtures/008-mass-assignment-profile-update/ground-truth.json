@@ -1,0 +1,12 @@
+{
+  "id": "008-mass-assignment-profile-update",
+  "vulnerabilityExists": true,
+  "class": ["mass-assignment", "property-level-authorization"],
+  "cwe": ["CWE-915"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": ["PATCH /api/profile", "req.json() (user-controlled object)", "profiles.update(body)", "role / tenant_id overwritten"],
+  "expectedSecureBehavior": "Sending role or tenant_id in the body leaves those columns unchanged.",
+  "acceptableFixes": ["Copy only allow-listed fields into the update payload", "Validate the body with a schema that rejects unknown keys"],
+  "unacceptableFixes": ["Deleting role from the body but leaving other columns writable"]
+}

@@ -1,0 +1,12 @@
+{
+  "id": "006-service-role-key-in-client",
+  "vulnerabilityExists": true,
+  "class": ["secret-exposure", "service-role-leak"],
+  "cwe": ["CWE-798", "CWE-200"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": ["browser bundle", "components/InvoiceList.tsx", "NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY", "full database access"],
+  "expectedSecureBehavior": "No service-role key appears in any client-side code or NEXT_PUBLIC_ variable; browser queries run under RLS.",
+  "acceptableFixes": ["Use the anon key in the browser and rely on RLS", "Move privileged reads to a server route with authorization"],
+  "unacceptableFixes": ["Obfuscating the key", "Renaming the variable while keeping the NEXT_PUBLIC_ prefix"]
+}

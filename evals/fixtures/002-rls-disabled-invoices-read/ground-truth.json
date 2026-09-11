@@ -1,0 +1,12 @@
+{
+  "id": "002-rls-disabled-invoices-read",
+  "vulnerabilityExists": true,
+  "class": ["RLS-missing", "multi-tenancy"],
+  "cwe": ["CWE-284", "CWE-862"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": ["GET /api/invoices/[id]", "user-scoped client (RLS applies)", "public.invoices has RLS disabled", "any row is returned"],
+  "expectedSecureBehavior": "Alice (tenant A) requesting Bob's invoice (tenant B) gets 404; direct PostgREST reads with the anon key return no rows.",
+  "acceptableFixes": ["alter table public.invoices enable row level security + tenant-scoped select policy"],
+  "unacceptableFixes": ["Filtering in the app layer only while the table stays exposed through PostgREST"]
+}

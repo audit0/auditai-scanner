@@ -1,0 +1,36 @@
+{
+  "name": "auditai-scanner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source deterministic security scanner for Next.js + Supabase apps (Audit AI engine)",
+  "license": "Apache-2.0",
+  "homepage": "https://auditai.sh",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/audit0/auditai-scanner.git"
+  },
+  "engines": {
+    "node": ">=22",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "evals": "vitest run evals/harness",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "clean": "rm -rf packages/*/dist packages/*/*.tsbuildinfo npm/dist",
+    "scan": "node packages/scanner/dist/bin.js",
+    "bundle": "node scripts/bundle.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.1.0",
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
+}

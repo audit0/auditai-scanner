@@ -1,0 +1,12 @@
+{
+  "id": "009-unprotected-server-action",
+  "vulnerabilityExists": true,
+  "class": ["BOLA", "missing-authentication", "server-action"],
+  "cwe": ["CWE-639", "CWE-306"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript", "server-actions"],
+  "vulnerablePath": ["server action deleteInvoice(invoiceId)", "invoiceId (user-controlled argument)", "createServiceRoleClient() bypasses RLS", "invoices.delete().eq('id', invoiceId)"],
+  "expectedSecureBehavior": "Bob invoking deleteInvoice with Alice's invoice id leaves the row in place; anonymous callers are rejected.",
+  "acceptableFixes": ["Authenticate inside the action and scope the delete to the caller's tenant", "Use a user-scoped client so RLS enforces ownership"],
+  "unacceptableFixes": ["Hiding the button in the UI"]
+}

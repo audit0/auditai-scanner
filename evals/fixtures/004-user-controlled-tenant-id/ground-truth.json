@@ -1,0 +1,12 @@
+{
+  "id": "004-user-controlled-tenant-id",
+  "vulnerabilityExists": true,
+  "class": ["multi-tenancy", "BOLA"],
+  "cwe": ["CWE-639", "CWE-566"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": ["GET /api/invoices", "searchParams.tenant (user-controlled)", "createServiceRoleClient() bypasses RLS", "invoices.select().eq('tenant_id', tenantId)"],
+  "expectedSecureBehavior": "Alice listing invoices only ever receives Tenant A rows regardless of any parameter she sends.",
+  "acceptableFixes": ["Derive tenant_id from the authenticated user's profile or JWT claim", "Use a user-scoped client so RLS enforces the tenant"],
+  "unacceptableFixes": ["Validating that the tenant id is a UUID"]
+}

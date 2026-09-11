@@ -1,0 +1,12 @@
+{
+  "ruleId": "supabase.table-without-rls",
+  "title": "Table \"invoices\" is exposed without RLS",
+  "severity": "high",
+  "minConfidence": 0.9,
+  "entrypoints": ["GET /api/invoices/[id]"],
+  "sources": ["route_param:id"],
+  "sinks": ["supabase.select:public.invoices"],
+  "mustMentionFiles": ["vulnerable/app/api/invoices/[id]/route.ts", "vulnerable/supabase/migrations/0001_init.sql"],
+  "mustNotFlag": ["secure/app/api/invoices/[id]/route.ts"],
+  "verification": { "strategy": "identity-matrix", "expectedBefore": "HTTP 200", "expectedAfter": "HTTP 404" }
+}

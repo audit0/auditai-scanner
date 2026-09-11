@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Typecheck and build
+        run: npx tsc -b
+      - name: Lint
+        run: npx biome check .
+      - name: Unit tests and fixture eval gate
+        run: npx vitest run
+      - name: Bundle the npm CLI
+        run: npm run bundle
+      - name: Smoke test the bundle (vulnerable fixture must fail, secure must pass)
+        run: |
+          F=evals/fixtures/001-cross-tenant-invoice-read
+          if node npm/dist/auditai-scan.mjs "$F/vulnerable" --migrations "$F/supabase" --fail-on likely; then
+            echo "expected a finding on the vulnerable fixture" && exit 1
+          fi
+          node npm/dist/auditai-scan.mjs "$F/secure" --migrations "$F/supabase" --fail-on likely
+      - name: Dependency audit
+        run: npm audit --audit-level=high

@@ -1,0 +1,27 @@
+{
+  "name": "@auditai/rules",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Deterministic rule packs with positive/negative fixtures",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@auditai/core": "*",
+    "@auditai/graph": "*",
+    "@auditai/parser": "*"
+  },
+  "license": "Apache-2.0"
+}
