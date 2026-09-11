@@ -16,6 +16,8 @@
 npx auditai-scan .
 ```
 
+<p align="center"><img src="./demo.gif" alt="auditai-scan finding a cross-tenant read in a fixture app" width="900"></p>
+
 ```
 AUDIT-001  LIKELY  CRITICAL  Cross-tenant select on "invoices" via service-role client
            app/api/invoices/[id]/route.ts:14  GET /api/invoices/[id]

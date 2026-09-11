@@ -1,5 +1,13 @@
+import { relative } from "node:path";
 import type { Finding } from "@auditai/core";
 import type { ScanResult } from "./scan.js";
+
+/** The scanned root as the user would type it: relative to the working directory when it is inside it. */
+function displayRoot(root: string): string {
+  const rel = relative(process.cwd(), root);
+  if (rel === "") return ".";
+  return rel.startsWith("..") ? root : rel;
+}
 
 function loc(f: Finding): string {
   const first = f.evidence.find((e) => e.locations && e.locations.length > 0)?.locations?.[0];
@@ -32,7 +40,7 @@ export function formatFinding(f: Finding): string {
 export function formatScanText(r: ScanResult): string {
   const s = r.summary;
   const out: string[] = [
-    `Audit AI scan  ${s.root}`,
+    `Audit AI scan  ${displayRoot(s.root)}`,
     `Files ${s.files} · Routes ${s.routes} · Supabase queries ${s.queries} · Tables with RLS ${s.tablesWithRls}/${s.tablesKnown} · Rules ${s.rules}`,
     "",
   ];
@@ -47,7 +55,7 @@ export function formatScanText(r: ScanResult): string {
   const likely = r.findings.filter((f) => f.status === "likely" || f.status === "candidate").length;
   if (likely > 0) {
     out.push(
-      `${likely} likely finding${likely === 1 ? "" : "s"} need${likely === 1 ? "s" : ""} reasoning and verification (audit explain / audit verify, coming in later weeks).`,
+      `${likely} likely finding${likely === 1 ? "" : "s"} await${likely === 1 ? "s" : ""} reasoning and sandbox verification (the hosted Audit AI step, auditai.sh).`,
     );
   }
   out.push(r.blocking ? "Blocking findings present." : "No blocking findings.");
