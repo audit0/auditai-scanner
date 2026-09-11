@@ -1,0 +1,27 @@
+{
+  "ruleId": "supabase.service-role-object-access-without-tenant-scope",
+  "title": "Cross-tenant select on \"invoices\" via direct database connection",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": [
+    "GET /api/invoices/[id]"
+  ],
+  "sources": [
+    "route_param:id"
+  ],
+  "sinks": [
+    "supabase.select:public.invoices"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/app/api/invoices/[id]/route.ts",
+    "vulnerable/lib/db.ts"
+  ],
+  "mustNotFlag": [
+    "secure/app/api/invoices/[id]/route.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200",
+    "expectedAfter": "HTTP 403|404"
+  }
+}

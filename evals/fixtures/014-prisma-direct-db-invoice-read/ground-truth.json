@@ -1,0 +1,37 @@
+{
+  "id": "014-prisma-direct-db-invoice-read",
+  "vulnerabilityExists": true,
+  "class": [
+    "BOLA",
+    "IDOR",
+    "multi-tenancy",
+    "direct-db-bypasses-rls"
+  ],
+  "cwe": [
+    "CWE-639",
+    "CWE-284"
+  ],
+  "severity": "critical",
+  "expectedSecureBehavior": "A user from tenant A requesting an invoice that belongs to tenant B receives 403 or 404 and no invoice data.",
+  "unacceptableFixes": [
+    "Relying on Supabase RLS while still querying through the direct connection",
+    "Filtering in JavaScript after reading the row"
+  ],
+  "stack": [
+    "nextjs-app-router",
+    "prisma",
+    "postgres",
+    "supabase-auth",
+    "typescript"
+  ],
+  "vulnerablePath": [
+    "GET /api/invoices/[id] (app/api/invoices/[id]/route.ts)",
+    "params.id (user-controlled)",
+    "prisma (lib/prisma.ts) direct Postgres connection, RLS does not apply",
+    "prisma.invoice.findUnique({ where: { id } })"
+  ],
+  "acceptableFixes": [
+    "Add the caller's tenantId from their profile to the where clause",
+    "Use Prisma client extensions that inject the tenant filter from the session"
+  ]
+}

@@ -4,11 +4,13 @@ import {
   classesIn,
   collect,
   lineOf,
+  stringLiteralValue,
   type TopLevelFunction,
   topLevelFunctions,
   unwrap,
 } from "./ast.js";
 import type { AuthHelper, ClientFactory, ClientKind } from "./model.js";
+import { clientCreatingOperand, DRIZZLE_TABLE_FNS } from "./orm.js";
 
 export const CREATE_CLIENT_CALLEES = /^(createClient|createServerClient|createBrowserClient)$/;
 
@@ -107,6 +109,8 @@ export interface ModuleFacts {
   classes: Map<string, ClassInfo>;
   /** Top-level `const x = <call or new>` declarations: module-level clients and service instances. */
   moduleVars: Map<string, ModuleVar>;
+  /** Drizzle schema objects: local name -> database table (`export const invoices = pgTable("invoices", …)`). */
+  drizzleTables: Map<string, string>;
   reexports: Reexport[];
   /** Local name behind `export default`, when it is a named function or identifier. */
   defaultExport: string | null;
@@ -171,13 +175,27 @@ export function analyzeModule(rel: string, sf: ts.SourceFile): ModuleFacts {
     classes.set(c.name, exportedNames.has(c.name) ? { ...c, exported: true } : c);
   }
   const moduleVars = new Map<string, ModuleVar>();
+  const drizzleTables = new Map<string, string>();
   for (const stmt of sf.statements) {
     if (!ts.isVariableStatement(stmt)) continue;
     const exported = hasModifier(stmt, ts.SyntaxKind.ExportKeyword);
     for (const d of stmt.declarationList.declarations) {
       if (!ts.isIdentifier(d.name) || !d.initializer || functions.has(d.name.text)) continue;
-      const init = unwrap(d.initializer);
+      const init = clientCreatingOperand(d.initializer);
       if (!ts.isCallExpression(init) && !ts.isNewExpression(init)) continue;
+      if (ts.isCallExpression(init)) {
+        const callee = init.expression;
+        const fn = ts.isIdentifier(callee)
+          ? callee.text
+          : ts.isPropertyAccessExpression(callee)
+            ? callee.name.text
+            : "";
+        const tableName = stringLiteralValue(init.arguments[0]);
+        if ((DRIZZLE_TABLE_FNS.has(fn) || fn === "table") && tableName !== null) {
+          drizzleTables.set(d.name.text, tableName);
+          continue;
+        }
+      }
       moduleVars.set(d.name.text, {
         name: d.name.text,
         init,
@@ -215,6 +233,7 @@ export function analyzeModule(rel: string, sf: ts.SourceFile): ModuleFacts {
     functions,
     classes,
     moduleVars,
+    drizzleTables,
     reexports,
     defaultExport,
   };

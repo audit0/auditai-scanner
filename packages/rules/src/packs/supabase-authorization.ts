@@ -24,14 +24,36 @@ const SCOPE_COLUMNS = new Set([
   "profile_id",
 ]);
 
+/** `tenant_id`, `tenantId` and `TenantID` are the same column for our purposes. */
+function normalizeColumn(column: string): string {
+  return column.toLowerCase().replace(/_/g, "");
+}
+const SCOPE_KEYS = new Set([...SCOPE_COLUMNS].map(normalizeColumn));
+
 export function isScopeColumn(column: string | null): boolean {
-  return column !== null && SCOPE_COLUMNS.has(column.toLowerCase());
+  return column !== null && SCOPE_KEYS.has(normalizeColumn(column));
 }
 
 export function isObjectIdColumn(column: string | null): boolean {
   if (column === null || isScopeColumn(column)) return false;
-  const c = column.toLowerCase();
-  return c === "id" || c === "uuid" || c === "slug" || c.endsWith("_id") || c.endsWith("id");
+  const c = normalizeColumn(column);
+  return c === "id" || c === "uuid" || c === "slug" || c.endsWith("id");
+}
+
+/** Clients for which Row Level Security is not a defence: the service role and direct database connections. */
+export function bypassesRls(kind: string | undefined): boolean {
+  return kind === "service_role" || kind === "direct_db";
+}
+
+function clientLabel(c: ClientNodeData | undefined): string {
+  if (!c) return "client";
+  return c.kind === "direct_db"
+    ? `${c.name} (direct database connection, RLS does not apply)`
+    : `${c.name} (service role, bypasses RLS)`;
+}
+
+function clientNoun(c: ClientNodeData | undefined): string {
+  return c?.kind === "direct_db" ? "direct database connection" : "service-role client";
 }
 
 /** Does an RLS policy expression tie rows to the caller? */
@@ -94,10 +116,14 @@ function viaNote(q: QueryNodeData): string {
   return q.via && q.via.length > 0 ? ` Reached through ${q.via.join(" -> ")}.` : "";
 }
 
-function rlsNote(t: TableNodeData | undefined, tableName: string): string {
+function rlsNote(t: TableNodeData | undefined, tableName: string, kind?: string): string {
   if (!t?.known) return `public.${tableName} was not found in migrations; RLS state unknown.`;
   if (!t.rlsEnabled) return `RLS is disabled on public.${tableName}.`;
-  return `RLS is enabled on public.${tableName} with ${t.policies.length} polic${t.policies.length === 1 ? "y" : "ies"}, but the service role bypasses it.`;
+  const bypass =
+    kind === "direct_db"
+      ? "a direct database connection (Drizzle/Prisma) does not go through PostgREST, so it does not apply"
+      : "the service role bypasses it";
+  return `RLS is enabled on public.${tableName} with ${t.policies.length} polic${t.policies.length === 1 ? "y" : "ies"}, but ${bypass}.`;
 }
 
 type Partial = Omit<
@@ -142,7 +168,7 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
     for (const h of handlerViews(ctx)) {
       for (const v of queryViews(ctx, h.handler)) {
         const q = v.data;
-        if (v.clientData?.kind !== "service_role") continue;
+        if (!bypassesRls(v.clientData?.kind)) continue;
         if (!["select", "update", "delete"].includes(q.operation)) continue;
         const filters: QueryFilter[] = q.filters;
         const idFilter = filters.find((f) => f.inputDerived && isObjectIdColumn(f.column));
@@ -155,13 +181,13 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
           h.data.kind === "server_action" ? "Server action call" : "HTTP request",
           h.data.entry,
           `${idFilter.column} ${idFilter.method} ${idFilter.valueText} (user-controlled)`,
-          `${v.clientData.name} (service role, bypasses RLS)`,
+          clientLabel(v.clientData),
           `public.${tableName}.${q.operation}`,
         ];
         const evidence: Evidence[] = [
           {
             kind: "rule",
-            summary: `${q.operation} on public.${tableName} filtered by user-controlled "${idFilter.column}" through a service-role client, with no tenant/owner scoping. ${authNote} ${rlsNote(v.tableData, tableName)}${viaNote(q)}`,
+            summary: `${q.operation} on public.${tableName} filtered by user-controlled "${idFilter.column}" through a ${clientNoun(v.clientData)}, with no tenant/owner scoping. ${authNote} ${rlsNote(v.tableData, tableName, v.clientData?.kind)}${viaNote(q)}`,
             locations: locations(h.handler.location, v.query.location, v.client?.location),
             data: {
               deterministic: false,
@@ -174,7 +200,7 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
         ];
         out.push(
           finding(ctx, this, {
-            title: `${h.authenticated ? "Cross-tenant" : "Unauthenticated"} ${q.operation} on "${tableName}" via service-role client`,
+            title: `${h.authenticated ? "Cross-tenant" : "Unauthenticated"} ${q.operation} on "${tableName}" via ${clientNoun(v.clientData)}`,
             entrypoints: [h.data.entry],
             sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
             sinks: [`supabase.${q.operation}:public.${tableName}`],
@@ -348,7 +374,7 @@ export const userControlledTenantScope: Rule = {
     const out: Finding[] = [];
     for (const h of handlerViews(ctx)) {
       for (const v of queryViews(ctx, h.handler)) {
-        if (v.clientData?.kind !== "service_role") continue;
+        if (!bypassesRls(v.clientData?.kind)) continue;
         const scope = v.data.filters.find((f) => isScopeColumn(f.column) && f.inputDerived);
         if (!scope) continue;
         const tableName = v.tableData?.table ?? v.data.table;
@@ -356,7 +382,7 @@ export const userControlledTenantScope: Rule = {
           "HTTP request",
           h.data.entry,
           `${scope.column} ${scope.method} ${scope.valueText} (user-controlled)`,
-          `${v.clientData.name} (service role, bypasses RLS)`,
+          clientLabel(v.clientData),
           `public.${tableName}.${v.data.operation}`,
         ];
         out.push(
@@ -486,7 +512,7 @@ export const serviceRoleQueryWithoutAuthentication: Rule = {
     for (const h of handlerViews(ctx)) {
       if (h.authenticated) continue;
       const views = queryViews(ctx, h.handler).filter(
-        (v) => v.clientData?.kind === "service_role" && !coveredByObjectAccessRule(v.data),
+        (v) => bypassesRls(v.clientData?.kind) && !coveredByObjectAccessRule(v.data),
       );
       const v = views[0];
       if (!v) continue;
@@ -495,12 +521,12 @@ export const serviceRoleQueryWithoutAuthentication: Rule = {
         h.data.kind === "server_action" ? "Server action call" : "HTTP request",
         h.data.entry,
         "no authentication",
-        `${v.clientData?.name ?? "client"} (service role, bypasses RLS)`,
+        clientLabel(v.clientData),
         `public.${tables.join(", public.")}`,
       ];
       out.push(
         finding(ctx, this, {
-          title: `Unauthenticated service-role access to "${tables.join('", "')}" in ${h.data.entry}`,
+          title: `Unauthenticated ${views.some((v) => v.clientData?.kind === "direct_db") ? "database" : "service-role"} access to "${tables.join('", "')}" in ${h.data.entry}`,
           entrypoints: [h.data.entry],
           sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
           sinks: views.map(
@@ -510,7 +536,7 @@ export const serviceRoleQueryWithoutAuthentication: Rule = {
           evidence: [
             {
               kind: "rule",
-              summary: `${h.data.entry} runs ${views.length} service-role quer${views.length === 1 ? "y" : "ies"} (${tables.join(", ")}) and contains no auth.getUser/getSession/getClaims call or auth helper. If this is a webhook or cron endpoint, it needs signature verification, which was not detected either.`,
+              summary: `${h.data.entry} runs ${views.length} privileged quer${views.length === 1 ? "y" : "ies"} (${tables.join(", ")}; RLS does not protect them) and contains no auth.getUser/getSession/getClaims call or auth helper. If this is a webhook or cron endpoint, it needs signature verification, which was not detected either.`,
               locations: locations(h.handler.location, ...views.map((x) => x.query.location)),
               data: { deterministic: false, ruleId: this.id },
             },

@@ -47,6 +47,19 @@ import {
   routeFromFile,
   routeHandlersIn,
 } from "./nextjs.js";
+import {
+  clientCreatingOperand,
+  DRIZZLE_QUERY_API,
+  DRIZZLE_WRITE_OPS,
+  drizzleFilters,
+  isDrizzleCall,
+  isPrismaNew,
+  type OrmFilter,
+  objectProperty,
+  PRISMA_OPS,
+  parsePrismaSchema,
+  prismaWhereFilters,
+} from "./orm.js";
 import { Resolver } from "./resolve.js";
 import { parseSqlForRls } from "./rls.js";
 import {
@@ -113,7 +126,8 @@ type Sym =
   | { kind: "function"; name: string; fn: FunctionLike; facts: ModuleFacts }
   | { kind: "class"; cls: ClassInfo; facts: ModuleFacts }
   | { kind: "var"; name: string; init: ts.Expression; facts: ModuleFacts }
-  | { kind: "namespace"; facts: ModuleFacts };
+  | { kind: "namespace"; facts: ModuleFacts }
+  | { kind: "table"; table: string };
 
 interface Project {
   sources: Map<string, ts.SourceFile>;
@@ -122,6 +136,10 @@ interface Project {
   scopes: Map<string, Map<string, Sym>>;
   factoryOfFn: Map<string, ClientBinding | null>;
   varBindings: Map<string, ArgBinding>;
+  /** Drizzle schema export name -> table, across the whole project (for `db.query.<export>`). */
+  drizzleTablesByExport: Map<string, string>;
+  /** Prisma model accessor (`prisma.invoice`) -> table. */
+  prismaModels: Map<string, string>;
   warnings: string[];
 }
 
@@ -177,6 +195,8 @@ function exportedSym(p: Project, tf: ModuleFacts, name: string, depth: number): 
   if (c?.exported) return { kind: "class", cls: c, facts: tf };
   const v = tf.moduleVars.get(name);
   if (v?.exported) return { kind: "var", name, init: v.init, facts: tf };
+  const dt = tf.drizzleTables.get(name);
+  if (dt !== undefined) return { kind: "table", table: dt };
   if (name === "default" && tf.defaultExport) {
     const local = tf.defaultExport;
     const lf = tf.functions.get(local);
@@ -211,6 +231,7 @@ function scopeOf(p: Project, facts: ModuleFacts): Map<string, Sym> {
   for (const [name, v] of facts.moduleVars) {
     scope.set(name, { kind: "var", name, init: v.init, facts });
   }
+  for (const [name, table] of facts.drizzleTables) scope.set(name, { kind: "table", table });
   for (const [local, ref] of facts.imports) {
     const target = p.resolver.resolve(ref.spec, facts.file);
     const tf = target ? p.registry.get(target) : undefined;
@@ -298,6 +319,13 @@ function classifyCall(
     const b = factoryOfFunction(p, sym, depth);
     if (b) return b;
   }
+  if (isDrizzleCall(call)) {
+    return {
+      kind: "direct_db",
+      name: "drizzle",
+      location: { file: sf.fileName, line: lineOf(sf, call) },
+    };
+  }
   if (isCreateClientCall(call, sf)) {
     const c = classifyCreateClientCall(call, sf);
     return {
@@ -347,9 +375,20 @@ function varBinding(p: Project, sym: Extract<Sym, { kind: "var" }>): ArgBinding 
   const sf = p.sources.get(sym.facts.file);
   if (!sf) return NO_ARG;
   const scope = scopeOf(p, sym.facts);
-  const init = unwrap(sym.init);
+  const init = clientCreatingOperand(sym.init);
   let out: ArgBinding = NO_ARG;
-  if (ts.isCallExpression(init)) {
+  if (isPrismaNew(init)) {
+    out = {
+      client: {
+        kind: "direct_db",
+        name: sym.name,
+        location: { file: sym.facts.file, line: lineOf(sf, init) },
+      },
+      instance: null,
+      tainted: false,
+      isRequest: false,
+    };
+  } else if (ts.isCallExpression(init)) {
     const found = classifyCall(p, init, sf, scope, null, 0);
     // Evidence names the module-level binding (`supabaseAdmin`), not the factory it wraps.
     const client = found
@@ -415,6 +454,12 @@ function argBinding(p: Project, arg: ts.Expression | undefined, frame: Frame): A
   } else if (ts.isCallExpression(u)) {
     client = classifyCall(p, u, frame.sf, scope, frame, 0);
     if (!client) instance = instanceOfCall(p, u, frame, scope);
+  } else if (isPrismaNew(u)) {
+    client = {
+      kind: "direct_db",
+      name: "PrismaClient",
+      location: { file: frame.rel, line: lineOf(frame.sf, u) },
+    };
   } else if (ts.isNewExpression(u) && ts.isIdentifier(u.expression)) {
     const cs = scope.get(u.expression.text);
     if (cs?.kind === "class") {
@@ -527,7 +572,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
   // Declarations in source order: inputs, client bindings, service instances, taint propagation.
   for (const decl of collect(body, ts.isVariableDeclaration)) {
     if (!decl.initializer) continue;
-    const init = unwrap(decl.initializer);
+    const init = clientCreatingOperand(decl.initializer);
     const names = boundNames(decl.name);
     const text = init.getText(sf);
     if (frame.depth === 0) {
@@ -559,7 +604,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
         frame.instances.set(decl.name.text, inst);
         continue;
       }
-      if (isQueryChain(init)) continue;
+      if (isQueryChain(init) || isDbChain(init, frame)) continue;
       // What a helper returns from user input is user input (`const body = await parseBody(req)`),
       // unless the helper establishes identity (`const user = await getUserFromRequest(req)`).
       if (returnsIdentity(p, init, sf, scope)) continue;
@@ -567,6 +612,12 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       if (args.some((a) => a.tainted || a.isRequest)) {
         for (const nm of names) frame.inputNames.add(nm);
       }
+    } else if (isPrismaNew(init) && ts.isIdentifier(decl.name)) {
+      frame.clients.set(decl.name.text, {
+        kind: "direct_db",
+        name: decl.name.text,
+        location: loc(init),
+      });
     } else if (ts.isNewExpression(init) && ts.isIdentifier(init.expression)) {
       const cs = scope.get(init.expression.text);
       if (cs?.kind === "class" && ts.isIdentifier(decl.name)) {
@@ -619,6 +670,21 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     return false;
   };
 
+  // `db.transaction(async (tx) => …)` / `prisma.$transaction(async (tx) => …)`: the callback's client is the outer one.
+  for (const call of collect(body, ts.isCallExpression)) {
+    const callee = call.expression;
+    if (!ts.isPropertyAccessExpression(callee) || !/^\$?transaction$/.test(callee.name.text))
+      continue;
+    if (!ts.isIdentifier(callee.expression)) continue;
+    const outer = frame.clients.get(callee.expression.text);
+    const fn = call.arguments
+      .map((a) => unwrap(a))
+      .find((a) => ts.isArrowFunction(a) || ts.isFunctionExpression(a));
+    const param =
+      fn && (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) ? fn.parameters[0] : undefined;
+    if (outer && param && ts.isIdentifier(param.name)) frame.clients.set(param.name.text, outer);
+  }
+
   // Auth checks.
   for (const call of collect(body, ts.isCallExpression)) {
     const calleeText = call.expression.getText(sf);
@@ -642,87 +708,202 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     }
   }
 
-  // Supabase query chains.
+  // Query chains: Supabase (PostgREST), Drizzle and Prisma (direct database connections).
   const seen = new Set<number>();
+  const clientOf = (
+    root: ts.Expression,
+  ): { binding: ClientBinding | null; name: string | null } => {
+    const u = unwrap(root);
+    if (ts.isIdentifier(u)) {
+      const b = frame.clients.get(u.text) ?? null;
+      return { binding: b, name: b ? null : u.text };
+    }
+    if (ts.isCallExpression(u)) {
+      const b = classifyCall(p, u, sf, scope, frame, 0);
+      return { binding: b, name: b ? null : u.expression.getText(sf) };
+    }
+    if (ts.isPropertyAccessExpression(u) && u.expression.kind === ts.SyntaxKind.ThisKeyword) {
+      const b = frame.thisProps.get(u.name.text)?.client ?? null;
+      return { binding: b, name: b ? null : u.getText(sf) };
+    }
+    return { binding: null, name: u.getText(sf) };
+  };
+  const tableSym = (e: ts.Expression | undefined): string | null => {
+    if (!e) return null;
+    const u = unwrap(e);
+    if (ts.isIdentifier(u)) {
+      const sym = scope.get(u.text);
+      return sym?.kind === "table" ? sym.table : null;
+    }
+    if (ts.isPropertyAccessExpression(u) && ts.isIdentifier(u.expression)) {
+      const ns = scope.get(u.expression.text);
+      if (ns?.kind === "namespace") {
+        const sym = exportedSym(p, ns.facts, u.name.text, 0);
+        return sym?.kind === "table" ? sym.table : null;
+      }
+    }
+    return null;
+  };
+  const toFilter = (f: OrmFilter): QueryFilter => ({
+    method: f.method,
+    column: f.column,
+    valueText: f.value ? f.value.getText(sf) : f.text,
+    inputDerived: f.value ? derivedIn(frame, f.value) : false,
+  });
+  const payloadOf = (arg: ts.Expression | null | undefined): QueryPayload | null =>
+    arg
+      ? {
+          text: arg.getText(sf).replace(/\s+/g, " ").slice(0, 200),
+          inputDerived: derivedIn(frame, arg),
+          wholeInput: isWholeInput(arg),
+        }
+      : null;
+  interface Parsed {
+    anchor: ts.Node;
+    table: string;
+    operation: QueryOperation;
+    filters: QueryFilter[];
+    payload: QueryPayload | null;
+    clientRoot: ts.Expression;
+  }
   for (const call of collect(body, ts.isCallExpression)) {
     if (!isChainTail(call)) continue;
     const chain = flattenChain(call);
+    const root = unwrap(chain.root);
+    const first = chain.segments[0];
     const fromIdx = chain.segments.findIndex((s) => s.name === "from");
     const rpcIdx = chain.segments.findIndex((s) => s.name === "rpc");
-    const anchorIdx = fromIdx >= 0 ? fromIdx : rpcIdx;
-    const anchor = chain.segments[anchorIdx];
-    if (anchorIdx < 0 || !anchor) continue;
-    if (seen.has(anchor.node.pos)) continue;
-    seen.add(anchor.node.pos);
+    const fromSeg = fromIdx >= 0 ? chain.segments[fromIdx] : undefined;
+    const fromTable = fromSeg ? stringLiteralValue(fromSeg.args[0]) : null;
+    const whereFilters = (): QueryFilter[] =>
+      chain.segments
+        .filter((s) => s.name === "where")
+        .flatMap((s) => drizzleFilters(s.args[0], sf))
+        .map(toFilter);
+    let parsed: Parsed | null = null;
 
-    let binding: ClientBinding | null = null;
-    let clientName: string | null = null;
-    const root = unwrap(chain.root);
-    if (ts.isIdentifier(root)) {
-      binding = frame.clients.get(root.text) ?? null;
-      if (!binding) clientName = root.text;
-    } else if (ts.isCallExpression(root)) {
-      binding = classifyCall(p, root, sf, scope, frame, 0);
-      if (!binding) clientName = root.expression.getText(sf);
-    } else if (
-      ts.isPropertyAccessExpression(root) &&
-      root.expression.kind === ts.SyntaxKind.ThisKeyword
-    ) {
-      binding = frame.thisProps.get(root.name.text)?.client ?? null;
-      if (!binding) clientName = root.getText(sf);
-    }
-
-    const after = chain.segments.slice(anchorIdx + 1);
-    let operation: QueryOperation = fromIdx >= 0 ? "unknown" : "rpc";
-    let payload: QueryPayload | null = null;
-    for (const s of after) {
-      if (OPERATIONS.has(s.name as QueryOperation)) {
-        operation = s.name as QueryOperation;
-        const arg = s.args[0];
-        if (WRITE_OPERATIONS.has(operation) && arg) {
-          payload = {
-            text: arg.getText(sf).replace(/\s+/g, " ").slice(0, 200),
-            inputDerived: derivedIn(frame, arg),
-            wholeInput: isWholeInput(arg),
-          };
+    const drizzleTable = fromSeg ? tableSym(fromSeg.args[0]) : null;
+    if ((fromSeg && drizzleTable === null) || (rpcIdx >= 0 && fromIdx < 0)) {
+      // Supabase: client.from("table").select().eq(...)  /  client.rpc("fn", ...); dynamic table names stay "(dynamic)"
+      const anchorIdx = fromSeg && drizzleTable === null ? fromIdx : rpcIdx;
+      const anchor = chain.segments[anchorIdx];
+      if (!anchor) continue;
+      const after = chain.segments.slice(anchorIdx + 1);
+      let operation: QueryOperation = anchorIdx === fromIdx ? "unknown" : "rpc";
+      let payload: QueryPayload | null = null;
+      for (const s of after) {
+        if (OPERATIONS.has(s.name as QueryOperation)) {
+          operation = s.name as QueryOperation;
+          if (WRITE_OPERATIONS.has(operation)) payload = payloadOf(s.args[0]);
+          break;
         }
-        break;
       }
-    }
-    const filters: QueryFilter[] = [];
-    for (const s of after) {
-      if (!FILTER_METHODS.has(s.name)) continue;
-      const first = s.args[0];
-      if (s.name === "match" && first && ts.isObjectLiteralExpression(first)) {
-        for (const pr of first.properties) {
-          if (ts.isPropertyAssignment(pr)) {
-            filters.push({
-              method: "match",
-              column: pr.name.getText(sf).replace(/['"]/g, ""),
-              valueText: pr.initializer.getText(sf),
-              inputDerived: derivedIn(frame, pr.initializer),
-            });
+      const filters: QueryFilter[] = [];
+      for (const s of after) {
+        if (!FILTER_METHODS.has(s.name)) continue;
+        const firstArg = s.args[0];
+        if (s.name === "match" && firstArg && ts.isObjectLiteralExpression(firstArg)) {
+          for (const pr of firstArg.properties) {
+            if (ts.isPropertyAssignment(pr)) {
+              filters.push({
+                method: "match",
+                column: pr.name.getText(sf).replace(/['"]/g, ""),
+                valueText: pr.initializer.getText(sf),
+                inputDerived: derivedIn(frame, pr.initializer),
+              });
+            }
           }
+          continue;
         }
-        continue;
+        const val = s.args[1];
+        filters.push({
+          method: s.name,
+          column: stringLiteralValue(firstArg),
+          valueText: val ? val.getText(sf) : "",
+          inputDerived: val ? derivedIn(frame, val) : false,
+        });
       }
-      const val = s.args[1];
-      filters.push({
-        method: s.name,
-        column: stringLiteralValue(first),
-        valueText: val ? val.getText(sf) : "",
-        inputDerived: val ? derivedIn(frame, val) : false,
-      });
+      parsed = {
+        anchor: anchor.node,
+        table: fromTable ?? stringLiteralValue(anchor.args[0]) ?? "(dynamic)",
+        operation,
+        filters,
+        payload,
+        clientRoot: chain.root,
+      };
+    } else if (fromSeg && drizzleTable !== null) {
+      // Drizzle: db.select().from(invoices).where(eq(invoices.id, id))
+      parsed = {
+        anchor: fromSeg.node,
+        table: drizzleTable,
+        operation: "select",
+        filters: whereFilters(),
+        payload: null,
+        clientRoot: chain.root,
+      };
+    } else if (first && DRIZZLE_WRITE_OPS[first.name] && tableSym(first.args[0]) !== null) {
+      // Drizzle: db.insert(t).values(x) / db.update(t).set(x).where(...) / db.delete(t).where(...)
+      const op = DRIZZLE_WRITE_OPS[first.name] ?? "unknown";
+      const payloadSeg = chain.segments.find((s) => s.name === "values" || s.name === "set");
+      parsed = {
+        anchor: first.node,
+        table: tableSym(first.args[0]) ?? "(dynamic)",
+        operation: op,
+        filters: whereFilters(),
+        payload: payloadOf(payloadSeg?.args[0]),
+        clientRoot: chain.root,
+      };
+    } else if (
+      first &&
+      DRIZZLE_QUERY_API.has(first.name) &&
+      ts.isPropertyAccessExpression(root) &&
+      ts.isPropertyAccessExpression(root.expression) &&
+      root.expression.name.text === "query"
+    ) {
+      // Drizzle relational API: db.query.invoices.findFirst({ where: eq(...) })
+      const key = root.name.text;
+      parsed = {
+        anchor: first.node,
+        table: p.drizzleTablesByExport.get(key) ?? key,
+        operation: "select",
+        filters: drizzleFilters(objectProperty(first.args[0], "where") ?? undefined, sf).map(
+          toFilter,
+        ),
+        payload: null,
+        clientRoot: root.expression.expression,
+      };
+    } else if (
+      first &&
+      PRISMA_OPS[first.name] &&
+      ts.isPropertyAccessExpression(root) &&
+      ts.isIdentifier(root.expression) &&
+      clientOf(root.expression).binding?.kind === "direct_db"
+    ) {
+      // Prisma: prisma.invoice.findUnique({ where: { id } })
+      const accessor = root.name.text;
+      const arg = first.args[0];
+      parsed = {
+        anchor: first.node,
+        table: p.prismaModels.get(accessor) ?? accessor.charAt(0).toUpperCase() + accessor.slice(1),
+        operation: PRISMA_OPS[first.name] ?? "unknown",
+        filters: prismaWhereFilters(objectProperty(arg, "where"), sf).map(toFilter),
+        payload: payloadOf(objectProperty(arg, "data")),
+        clientRoot: root.expression,
+      };
     }
+    if (!parsed) continue;
+    if (seen.has(parsed.anchor.pos)) continue;
+    seen.add(parsed.anchor.pos);
+    const { binding, name: clientName } = clientOf(parsed.clientRoot);
     const query: SupabaseQuery = {
-      table: stringLiteralValue(anchor.args[0]) ?? "(dynamic)",
-      operation,
+      table: parsed.table,
+      operation: parsed.operation,
       client: binding?.kind ?? "unknown",
       clientName: binding?.name ?? clientName,
       clientLocation: binding?.location ?? null,
-      filters,
-      payload,
-      location: loc(anchor.node),
+      filters: parsed.filters,
+      payload: parsed.payload,
+      location: loc(parsed.anchor),
       text: call.getText(sf).replace(/\s+/g, " ").slice(0, 200),
     };
     if (frame.via.length > 0) query.via = frame.via;
@@ -781,6 +962,14 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
 
 function isChainWithQuery(e: ts.Expression): boolean {
   return ts.isCallExpression(e) && isQueryChain(e);
+}
+
+/** A call chain rooted at a bound database client (`db.query.x.findFirst()`, `prisma.invoice.findUnique()`): rows, not input. */
+function isDbChain(call: ts.CallExpression, frame: Frame): boolean {
+  const root = unwrap(flattenChain(call).root);
+  let base: ts.Expression = root;
+  while (ts.isPropertyAccessExpression(base)) base = base.expression;
+  return ts.isIdentifier(base) && frame.clients.has(base.text);
 }
 
 const IDENTITY_CALLEE = /\.auth\.|user|session|claims|auth|principal|viewer/i;
@@ -917,7 +1106,7 @@ function findExposures(rel: string, sf: ts.SourceFile): SecretExposure[] {
 /** Parses a Next.js + Supabase project directory into a ProjectModel. Never throws on malformed input. */
 export function parseProject(rootInput: string, opts: ParseOptions = {}): ProjectModel {
   const root = resolve(rootInput);
-  const { source, sql, manifests, tsconfigs } = discoverFiles(
+  const { source, sql, manifests, tsconfigs, prisma } = discoverFiles(
     root,
     opts.sqlDirs ?? [],
     opts.ignore ?? [],
@@ -943,6 +1132,20 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     }
   }
 
+  const prismaModels = new Map<string, string>();
+  for (const rel of prisma) {
+    try {
+      for (const [k, v] of parsePrismaSchema(readFileSync(join(root, rel), "utf8"))) {
+        prismaModels.set(k, v);
+      }
+    } catch (e) {
+      warnings.push(`could not read ${rel}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  const drizzleTablesByExport = new Map<string, string>();
+  for (const f of registry.values()) {
+    for (const [k, v] of f.drizzleTables) drizzleTablesByExport.set(k, v);
+  }
   const project: Project = {
     sources,
     registry,
@@ -950,6 +1153,8 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     scopes: new Map(),
     factoryOfFn: new Map(),
     varBindings: new Map(),
+    drizzleTablesByExport,
+    prismaModels,
     warnings,
   };
 

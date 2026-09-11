@@ -48,7 +48,7 @@ secure fixture that must stay silent.
 
 | Rule | Severity | What it catches |
 |---|---|---|
-| `supabase.service-role-object-access-without-tenant-scope` | critical | Service-role client reads or writes a row by user-supplied id without tenant scope (IDOR / BOLA) |
+| `supabase.service-role-object-access-without-tenant-scope` | critical | Service-role client, or a direct Drizzle/Prisma connection, reads or writes a row by user-supplied id without tenant scope (IDOR / BOLA) |
 | `supabase.user-controlled-tenant-scope` | critical | Tenant scope comes from the request (body, query, params) instead of the session |
 | `supabase.service-role-query-without-authentication` | critical | Route or server action queries with the service role and never checks the caller |
 | `supabase.service-role-key-exposed-to-client` | critical | Service-role key reaches the browser (`NEXT_PUBLIC_*`, client components). Blocking. |
@@ -64,7 +64,7 @@ means a reproduced request. Suppressed findings stay in the output, marked `supp
 
 - It does not prove the absence of vulnerabilities. Every run ends with an honest coverage line:
   `Checked N risks in class authorization/RLS. Verified: X. Confirmed: Y. Unverified: Z.`
-- It does not cover other stacks. Next.js + Supabase + TypeScript only, deep rather than wide.
+- It does not cover other stacks. Next.js + TypeScript with Supabase clients, Drizzle or Prisma on Postgres; deep rather than wide.
 - It does not fix, test or verify. That is the hosted product.
 - It does not call a model. Everything here is static analysis on the TypeScript compiler API.
 
@@ -106,7 +106,8 @@ source files ──► parser ──► Program Security Graph ──► rules �
 ```
 
 - **parser** maps App Router route handlers, server actions (wrapped ones too) and dynamic pages,
-  classifies every Supabase client (`service_role`, `anon`, `user_scoped`), follows calls from the
+  classifies every Supabase client (`service_role`, `anon`, `user_scoped`) and every Drizzle or
+  Prisma connection (`direct_db`: RLS never runs for it), follows calls from the
   entry point into helpers, service classes and workspace packages (tsconfig `paths`, package.json
   `exports`) three levels deep, tracks which arguments carry user input, reads insert/update
   payloads, and ingests RLS policies from migration SQL.
@@ -120,7 +121,7 @@ instructions" is just a comment.
 
 ## Eval corpus
 
-Twelve fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
+Fourteen fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
 rule; the secure twin must produce zero findings. `npm run evals` enforces both on every commit.
 
 | # | Fixture | Rule exercised |
@@ -137,6 +138,8 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 010 | batch-lookup-by-ids | service-role-object-access-without-tenant-scope |
 | 011 | monorepo-package-client-helper-query | service-role-object-access-without-tenant-scope, through a workspace package and a helper |
 | 012 | wrapped-action-module-client-helper | service-role-object-access-without-tenant-scope, wrapped action and module-level client |
+| 013 | drizzle-direct-db-invoice-read | service-role-object-access-without-tenant-scope, Drizzle direct connection |
+| 014 | prisma-direct-db-invoice-read | service-role-object-access-without-tenant-scope, Prisma direct connection |
 
 Each fixture also carries the `security-test` the hosted product runs in a sandbox: `DENY` tests
 are the security assertion (Alice must not read Bob's row), `ALLOW` tests are the sanity check

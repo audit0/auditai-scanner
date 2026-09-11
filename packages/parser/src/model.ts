@@ -18,8 +18,12 @@ export const HTTP_METHODS: readonly HttpMethod[] = [
   "OPTIONS",
 ];
 
-/** How a Supabase client authenticates to PostgREST, which decides whether RLS applies. */
-export type ClientKind = "service_role" | "anon" | "user_scoped" | "unknown";
+/**
+ * How a client reaches the database, which decides whether RLS applies. `direct_db` is a Drizzle or
+ * Prisma connection: it bypasses PostgREST, so Supabase RLS does not apply unless the app sets the
+ * authenticated role itself; for authorization it behaves like the service role.
+ */
+export type ClientKind = "service_role" | "anon" | "user_scoped" | "direct_db" | "unknown";
 
 export interface ClientFactory {
   name: string;

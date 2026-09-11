@@ -1,0 +1,36 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tenant {
+  id       String    @id @default(uuid()) @db.Uuid
+  name     String
+  profiles Profile[]
+  invoices Invoice[]
+
+  @@map("tenants")
+}
+
+model Profile {
+  id       String @id @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  email    String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("profiles")
+}
+
+model Invoice {
+  id          String @id @default(uuid()) @db.Uuid
+  tenantId    String @map("tenant_id") @db.Uuid
+  amountCents Int    @map("amount_cents")
+  status      String @default("open")
+  tenant      Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("invoices")
+}

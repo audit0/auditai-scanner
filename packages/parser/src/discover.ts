@@ -29,6 +29,8 @@ export interface DiscoveredFiles {
   manifests: string[];
   /** tsconfig*.json files inside the project (`paths` aliases). */
   tsconfigs: string[];
+  /** Prisma schema files (`*.prisma`), for model-to-table mapping. */
+  prisma: string[];
 }
 
 /** Minimal glob: `**` matches any path segment(s), `*` matches within a segment. Anchored at the project root; a directory pattern matches everything below it. */
@@ -78,6 +80,7 @@ export function discoverFiles(
   const sql: string[] = [];
   const manifests: string[] = [];
   const tsconfigs: string[] = [];
+  const prisma: string[] = [];
   const ignore = ignoreGlobs.map(globToRegExp);
   const walk = (dir: string, sqlOnly = false): void => {
     let entries: string[];
@@ -114,6 +117,7 @@ export function discoverFiles(
       if (sqlOnly || name.endsWith(".d.ts")) continue;
       if (name === "package.json") manifests.push(rel);
       else if (/^tsconfig(\..+)?\.json$/.test(name)) tsconfigs.push(rel);
+      else if (name.endsWith(".prisma")) prisma.push(rel);
       else if (SOURCE_EXT.test(name)) source.push(rel);
     }
   };
@@ -123,5 +127,6 @@ export function discoverFiles(
   sql.sort();
   manifests.sort();
   tsconfigs.sort();
-  return { source, sql, manifests, tsconfigs };
+  prisma.sort();
+  return { source, sql, manifests, tsconfigs, prisma };
 }

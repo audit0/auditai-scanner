@@ -274,3 +274,95 @@ export const GET = withAuth(async (req: Request) => {
     expect(r?.queries[0]?.filters[0]).toMatchObject({ column: "id", inputDerived: false });
   });
 });
+
+describe("direct database connections (Drizzle, Prisma)", () => {
+  it("reads Drizzle select/insert/relational queries with predicates and a module-level client", async () => {
+    const dir = await tempProject({
+      "db/schema.ts": `import { pgTable, uuid, text } from "drizzle-orm/pg-core";
+export const invoices = pgTable("invoices", { id: uuid("id").primaryKey(), tenantId: uuid("tenant_id"), status: text("status") });
+export const profiles = pgTable("profiles", { id: uuid("id").primaryKey(), tenantId: uuid("tenant_id") });
+`,
+      "lib/db.ts": `import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+import * as schema from "@/db/schema";
+export const db = drizzle(postgres(process.env.DATABASE_URL!), { schema });
+`,
+      "app/api/invoices/[id]/route.ts": `import { and, eq, inArray } from "drizzle-orm";
+import { NextResponse } from "next/server";
+import * as schema from "@/db/schema";
+import { invoices } from "@/db/schema";
+import { db } from "@/lib/db";
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const [row] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
+  const mine = await db.query.profiles.findFirst({ where: (t, { eq }) => eq(t.id, "fixed") });
+  await db.update(schema.invoices).set({ status: "paid" }).where(and(eq(schema.invoices.id, id), eq(schema.invoices.tenantId, mine!.tenantId)));
+  await db.transaction(async (tx) => { await tx.delete(invoices).where(inArray(invoices.id, [id])); });
+  return NextResponse.json(row);
+}
+`,
+    });
+    const m = parseProject(dir);
+    const qs = m.routes[0]?.queries ?? [];
+    expect(qs.map((q) => [q.table, q.operation, q.client, q.clientName])).toEqual([
+      ["invoices", "select", "direct_db", "db"],
+      ["profiles", "select", "direct_db", "db"],
+      ["invoices", "update", "direct_db", "db"],
+      ["invoices", "delete", "direct_db", "db"],
+    ]);
+    expect(qs[0]?.filters).toEqual([
+      { method: "eq", column: "id", valueText: "id", inputDerived: true },
+    ]);
+    expect(qs[1]?.filters).toEqual([
+      { method: "eq", column: "id", valueText: '"fixed"', inputDerived: false },
+    ]);
+    expect(qs[2]?.filters.map((f) => [f.column, f.inputDerived])).toEqual([
+      ["id", true],
+      ["tenantId", false],
+    ]);
+    expect(qs[2]?.payload?.text).toBe('{ status: "paid" }');
+    expect(qs[3]?.filters[0]).toMatchObject({
+      method: "inArray",
+      column: "id",
+      inputDerived: true,
+    });
+    expect(qs[0]?.clientLocation?.file).toBe("lib/db.ts");
+  });
+
+  it("reads Prisma calls through the global singleton and maps models to tables via @@map", async () => {
+    const dir = await tempProject({
+      "prisma/schema.prisma": `model Invoice { id String @id\n tenantId String\n @@map("invoices") }\nmodel Profile { id String @id }`,
+      "lib/prisma.ts": `import { PrismaClient } from "@prisma/client";
+const g = globalThis as unknown as { prisma?: PrismaClient };
+export const prisma = g.prisma ?? new PrismaClient();
+`,
+      "app/api/invoices/[id]/route.ts": `import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+export async function DELETE(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const body = await req.json();
+  const p = await prisma.profile.findUnique({ where: { id: "me" } });
+  await prisma.invoice.update({ where: { id, tenantId: p!.tenantId }, data: body });
+  await prisma.invoice.delete({ where: { id } });
+  return NextResponse.json({ ok: true });
+}
+`,
+    });
+    const m = parseProject(dir);
+    const qs = m.routes[0]?.queries ?? [];
+    expect(qs.map((q) => [q.table, q.operation, q.client])).toEqual([
+      ["Profile", "select", "direct_db"],
+      ["invoices", "update", "direct_db"],
+      ["invoices", "delete", "direct_db"],
+    ]);
+    expect(qs[1]?.filters.map((f) => [f.column, f.inputDerived])).toEqual([
+      ["id", true],
+      ["tenantId", false],
+    ]);
+    expect(qs[1]?.payload).toMatchObject({ inputDerived: true, wholeInput: true });
+    expect(qs[2]?.filters).toEqual([
+      { method: "eq", column: "id", valueText: "id", inputDerived: true },
+    ]);
+    expect(qs[2]?.clientLocation?.file).toBe("lib/prisma.ts");
+  });
+});

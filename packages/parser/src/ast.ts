@@ -241,11 +241,15 @@ export function boundNames(name: ts.BindingName): string[] {
   return out;
 }
 
-/** All identifier names used inside an expression. */
+/** All variable names used inside an expression. Property names (`row.id`) and object keys are not variables. */
 export function identifiersIn(node: ts.Node): Set<string> {
   const out = new Set<string>();
   walk(node, (n) => {
-    if (ts.isIdentifier(n)) out.add(n.text);
+    if (!ts.isIdentifier(n)) return undefined;
+    const parent = n.parent;
+    if (parent && ts.isPropertyAccessExpression(parent) && parent.name === n) return undefined;
+    if (parent && ts.isPropertyAssignment(parent) && parent.name === n) return undefined;
+    out.add(n.text);
     return undefined;
   });
   return out;
