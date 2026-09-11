@@ -1,5 +1,12 @@
-import { readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
+
+/**
+ * Files above this size are not source code we can reason about (bundles, generated data) and
+ * would only cost parse time. Symlinks are never followed: a scanned repository must not be able
+ * to point the scanner at files outside its own tree.
+ */
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 const SKIP_DIRS = new Set([
   "node_modules",
@@ -82,11 +89,16 @@ export function discoverFiles(
     for (const name of entries) {
       const full = join(dir, name);
       let isDir: boolean;
+      let size: number;
       try {
-        isDir = statSync(full).isDirectory();
+        const st = lstatSync(full);
+        if (st.isSymbolicLink()) continue;
+        isDir = st.isDirectory();
+        size = st.size;
       } catch {
         continue;
       }
+      if (!isDir && size > MAX_FILE_BYTES) continue;
       if (isDir) {
         const relDir = relative(root, full).split(sep).join("/");
         if (!SKIP_DIRS.has(name) && !name.startsWith(".") && !isIgnored(relDir, ignore))

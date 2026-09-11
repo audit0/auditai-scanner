@@ -36,3 +36,16 @@ describe("discoverFiles with ignore globs", () => {
     expect(discoverFiles(dir, [], ["evals/**"]).source).toEqual(["app/api/route.ts"]);
   });
 });
+
+describe("discoverFiles hardening", () => {
+  it("never follows symlinks and skips oversized files", async () => {
+    const { symlinkSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "auditai-disc-"));
+    mkdirSync(join(dir, "app"), { recursive: true });
+    writeFileSync(join(dir, "app/route.ts"), "export const GET = () => new Response('ok');");
+    symlinkSync("/etc/hosts", join(dir, "app/evil.ts"));
+    symlinkSync("/etc", join(dir, "linked-dir"));
+    writeFileSync(join(dir, "app/huge.ts"), "x".repeat(2 * 1024 * 1024 + 1));
+    expect(discoverFiles(dir).source).toEqual(["app/route.ts"]);
+  });
+});
