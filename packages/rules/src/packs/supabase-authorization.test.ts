@@ -47,6 +47,46 @@ describe("column classifiers", () => {
   });
 });
 
+describe("policy findings are reported once per policy", () => {
+  it("merges two handlers that reach the same permissive policy into one finding", async () => {
+    const { cpSync, mkdirSync, mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const src = fileURLToPath(
+      new URL("../../../../evals/fixtures/003-rls-policy-using-true/vulnerable/", import.meta.url),
+    );
+    const dir = mkdtempSync(join(tmpdir(), "auditai-dedupe-"));
+    cpSync(src, dir, { recursive: true });
+    mkdirSync(join(dir, "app/api/invoices/recent"), { recursive: true });
+    writeFileSync(
+      join(dir, "app/api/invoices/recent/route.ts"),
+      `import { NextResponse } from "next/server";
+import { bearerToken, createRequestClient } from "@/lib/supabase";
+export async function GET(req: Request) {
+  const token = bearerToken(req);
+  if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const supabase = createRequestClient(token);
+  const { data } = await supabase.from("invoices").select("*").limit(20);
+  return NextResponse.json({ invoices: data ?? [] });
+}
+`,
+    );
+    const model = parseProject(dir, { sqlDirs: ["supabase/migrations"] });
+    const findings = runRules(supabaseAuthorizationPack, model, buildGraph(model), {
+      now: "2026-09-11T00:00:00Z",
+    });
+    const policy = findings.filter(
+      (f) => f.ruleId === "supabase.rls-policy-without-caller-predicate",
+    );
+    expect(policy).toHaveLength(1);
+    expect(policy[0]?.entrypoints.sort()).toEqual([
+      "GET /api/invoices/[id]",
+      "GET /api/invoices/recent",
+    ]);
+    expect(policy[0]?.evidence[0]?.summary).toContain("Reached from 2 entry points");
+  });
+});
+
 describe("supabase authorization pack on fixture 001", () => {
   it("flags the vulnerable handler as a likely cross-tenant read", () => {
     const { findings, model } = scan(fixture("vulnerable"));

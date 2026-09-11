@@ -47,7 +47,8 @@ function splitTopLevel(text: string): string[] {
   return out.map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
-const IDENT = String.raw`(?:public\.)?"?([A-Za-z_][A-Za-z0-9_]*)"?`;
+// Accepts `t`, `"t"`, `public.t`, `"public".t`, `public."t"` and `"public"."t"` (Drizzle and Makerkit emit the quoted forms).
+const IDENT = String.raw`(?:"?public"?\.)?"?([A-Za-z_][A-Za-z0-9_]*)"?`;
 const CREATE_TABLE = new RegExp(
   String.raw`^create\s+table\s+(?:if\s+not\s+exists\s+)?${IDENT}\s*\(`,
   "i",

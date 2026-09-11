@@ -193,46 +193,98 @@ export const tableWithoutRls: Rule = {
   confidence: 0.9,
   cwe: ["CWE-284", "CWE-862"],
   evaluate(ctx) {
-    const out: Finding[] = [];
-    const seen = new Set<string>();
+    // One finding per table: the defect is the missing RLS, every handler that reaches it is evidence.
+    const groups = new Map<string, Group>();
     for (const h of handlerViews(ctx)) {
       for (const v of queryViews(ctx, h.handler)) {
         const c = v.clientData;
         if (c?.kind !== "anon" && c?.kind !== "user_scoped") continue;
         const t = v.tableData;
         if (!t?.known || t.rlsEnabled) continue;
-        const key = `${t.table}:${h.data.entry}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const path = [
-          "HTTP request",
-          h.data.entry,
-          `${c.name} (${c.kind}, RLS would apply)`,
-          `public.${t.table} (RLS disabled)`,
-        ];
-        out.push(
-          finding(ctx, this, {
-            title: `Table "${t.table}" is exposed without RLS`,
-            entrypoints: [h.data.entry],
-            sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
-            sinks: [`supabase.${v.data.operation}:public.${t.table}`],
-            path,
-            evidence: [
-              {
-                kind: "rule",
-                summary: `public.${t.table} has no "enable row level security" in migrations but is queried with a ${c.kind} client. Anyone holding the public anon key can read every row directly through PostgREST.`,
-                locations: locations(v.query.location, v.table?.location),
-                data: { deterministic: true, ruleId: this.id },
-              },
-              { kind: "trace", summary: path.join(" -> ") },
-            ],
-          }),
-        );
+        const g = group(groups, t.table, () => ({
+          path: [
+            "HTTP request",
+            h.data.entry,
+            `${c.name} (${c.kind}, RLS would apply)`,
+            `public.${t.table} (RLS disabled)`,
+          ],
+          summary: `public.${t.table} has no "enable row level security" in migrations but is queried with a ${c.kind} client. Anyone holding the public anon key can read every row directly through PostgREST.`,
+          title: `Table "${t.table}" is exposed without RLS`,
+          data: { deterministic: true, ruleId: this.id },
+          tail: locations(v.table?.location),
+        }));
+        addReach(g, h, v, `supabase.${v.data.operation}:public.${t.table}`);
       }
     }
-    return out;
+    return emitGroups(ctx, this, groups);
   },
 };
+
+/** Accumulates every handler that reaches one defective table or policy into a single finding. */
+interface Group {
+  title: string;
+  path: string[];
+  summary: string;
+  data: Record<string, unknown>;
+  entrypoints: string[];
+  sources: Set<string>;
+  sinks: Set<string>;
+  queryLocations: FileRef[];
+  tail: FileRef[];
+}
+
+function group(
+  groups: Map<string, Group>,
+  key: string,
+  init: () => Pick<Group, "title" | "path" | "summary" | "data" | "tail">,
+): Group {
+  let g = groups.get(key);
+  if (!g) {
+    g = { ...init(), entrypoints: [], sources: new Set(), sinks: new Set(), queryLocations: [] };
+    groups.set(key, g);
+  }
+  return g;
+}
+
+function addReach(g: Group, h: HandlerView, v: QueryView, sink: string): void {
+  if (!g.entrypoints.includes(h.data.entry)) g.entrypoints.push(h.data.entry);
+  for (const i of h.inputs) g.sources.add(`${i.kind}:${i.name}`);
+  g.sinks.add(sink);
+  if (v.query.location && !g.queryLocations.some((l) => sameRef(l, v.query.location))) {
+    g.queryLocations.push(v.query.location);
+  }
+}
+
+function sameRef(a: FileRef, b: FileRef | undefined): boolean {
+  return b !== undefined && a.file === b.file && a.line === b.line;
+}
+
+function emitGroups(ctx: RuleContext, rule: Rule, groups: Map<string, Group>): Finding[] {
+  const out: Finding[] = [];
+  for (const g of groups.values()) {
+    const reached =
+      g.entrypoints.length > 1 ? ` Reached from ${g.entrypoints.length} entry points.` : "";
+    out.push(
+      finding(ctx, rule, {
+        title: g.title,
+        entrypoints: g.entrypoints,
+        sources: [...g.sources],
+        sinks: [...g.sinks],
+        path: g.path,
+        evidence: [
+          {
+            kind: "rule",
+            summary: g.summary + reached,
+            locations: [...g.queryLocations, ...g.tail],
+            data: g.data,
+          },
+          { kind: "trace", summary: g.path.join(" -> ") },
+        ],
+      }),
+    );
+  }
+  return out;
+}
 
 /** R3. RLS is on, but a policy grants rows without tying them to the caller (e.g. `using (true)`). */
 export const rlsPolicyWithoutCallerPredicate: Rule = {
@@ -244,8 +296,8 @@ export const rlsPolicyWithoutCallerPredicate: Rule = {
   confidence: 0.85,
   cwe: ["CWE-863", "CWE-284"],
   evaluate(ctx) {
-    const out: Finding[] = [];
-    const seen = new Set<string>();
+    // One finding per (table, policy): the defect is the policy, every handler that reaches it is evidence.
+    const groups = new Map<string, Group>();
     for (const h of handlerViews(ctx)) {
       for (const v of queryViews(ctx, h.handler)) {
         const c = v.clientData;
@@ -258,37 +310,23 @@ export const rlsPolicyWithoutCallerPredicate: Rule = {
           if (p.command !== "all" && p.command !== op) continue;
           const expr = op === "insert" ? p.check : p.using;
           if (expr === null || policyScopesToCaller(expr)) continue;
-          const key = `${t.table}:${p.name}:${h.data.entry}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const path = [
-            "HTTP request",
-            h.data.entry,
-            `${c.name} (${c.kind})`,
-            `public.${t.table} policy "${p.name}" ${op === "insert" ? "with check" : "using"} (${expr})`,
-          ];
-          out.push(
-            finding(ctx, this, {
-              title: `RLS policy "${p.name}" on "${t.table}" does not scope rows to the caller`,
-              entrypoints: [h.data.entry],
-              sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
-              sinks: [`supabase.${op}:public.${t.table}`],
-              path,
-              evidence: [
-                {
-                  kind: "rule",
-                  summary: `Policy "${p.name}" for ${p.command} on public.${t.table} uses (${expr}). The table has a scope column (${t.columns.filter(isScopeColumn).join(", ")}) but the policy never compares it to auth.uid() or the caller's tenant, so RLS lets every ${p.roles.join("/") || "authenticated"} user through.`,
-                  locations: locations(v.query.location, p.location),
-                  data: { deterministic: false, ruleId: this.id, policy: p.name },
-                },
-                { kind: "trace", summary: path.join(" -> ") },
-              ],
-            }),
-          );
+          const g = group(groups, `${t.table}:${p.name}:${p.command}`, () => ({
+            path: [
+              "HTTP request",
+              h.data.entry,
+              `${c.name} (${c.kind})`,
+              `public.${t.table} policy "${p.name}" ${op === "insert" ? "with check" : "using"} (${expr})`,
+            ],
+            summary: `Policy "${p.name}" for ${p.command} on public.${t.table} uses (${expr}). The table has a scope column (${t.columns.filter(isScopeColumn).join(", ")}) but the policy never compares it to auth.uid() or the caller's tenant, so RLS lets every ${p.roles.join("/") || "authenticated"} user through.`,
+            title: `RLS policy "${p.name}" on "${t.table}" does not scope rows to the caller`,
+            data: { deterministic: false, ruleId: this.id, policy: p.name },
+            tail: locations(p.location),
+          }));
+          addReach(g, h, v, `supabase.${op}:public.${t.table}`);
         }
       }
     }
-    return out;
+    return emitGroups(ctx, this, groups);
   },
 };
 

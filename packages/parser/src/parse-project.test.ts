@@ -42,6 +42,20 @@ describe("parseSqlForRls", () => {
     });
     expect(into.get("b")).toMatchObject({ rlsEnabled: false, policies: [] });
   });
+
+  it("reads quoted, schema-qualified and multi-line statements (Makerkit, Drizzle output)", () => {
+    const into = new Map<string, RlsTable>();
+    parseSqlForRls(
+      "m.sql",
+      `create table if not exists\n  public.accounts (\n    id uuid primary key,\n    name text\n  );\n\n-- Enable RLS on the accounts table\nalter table "public"."accounts"\n    enable row level security;\n\ncreate table "public"."todo_list" (id int, owner_id uuid);\nalter table "public"."todo_list" enable row level security;\ncreate policy "Users can read own" on "public"."todo_list" for select using (auth.uid() = owner_id);`,
+      into,
+    );
+    expect(into.get("accounts")).toMatchObject({ rlsEnabled: true, columns: ["id", "name"] });
+    expect(into.get("todo_list")).toMatchObject({
+      rlsEnabled: true,
+      policies: ["Users can read own"],
+    });
+  });
 });
 
 describe("client classification", () => {
