@@ -1,0 +1,26 @@
+{
+  "ruleId": "supabase.rls-policy-trusts-user-metadata",
+  "title": "Policy \"notes: admin reads all\" on \"notes\" trusts user_metadata",
+  "severity": "critical",
+  "minConfidence": 0.9,
+  "entrypoints": [
+    "Supabase Data API (PostgREST)"
+  ],
+  "sources": [
+    "jwt:user_metadata"
+  ],
+  "sinks": [
+    "supabase.policy:public.notes"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/supabase/migrations/0001_init.sql"
+  ],
+  "mustNotFlag": [
+    "secure/app/api/notes/route.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "the anon key or a self-granted claim reaches rows it must not",
+    "expectedAfter": "the same request returns nothing and the app's own reads still work"
+  }
+}

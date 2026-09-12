@@ -1,0 +1,26 @@
+{
+  "ruleId": "supabase.anon-write-policy",
+  "title": "Policy \"subscribers: anyone unsubscribes\" lets anyone delete \"subscribers\"",
+  "severity": "high",
+  "minConfidence": 0.85,
+  "entrypoints": [
+    "Supabase Data API (PostgREST)"
+  ],
+  "sources": [
+    "anon-key"
+  ],
+  "sinks": [
+    "supabase.delete:public.subscribers"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/supabase/migrations/0001_init.sql"
+  ],
+  "mustNotFlag": [
+    "secure/app/api/subscribe/route.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "the anon key or a self-granted claim reaches rows it must not",
+    "expectedAfter": "the same request returns nothing and the app's own reads still work"
+  }
+}

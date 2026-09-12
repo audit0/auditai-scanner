@@ -1,0 +1,35 @@
+{
+  "id": "039-anon-write-policy",
+  "vulnerabilityExists": true,
+  "class": [
+    "authorization",
+    "rls",
+    "data-destruction"
+  ],
+  "cwe": [
+    "CWE-284",
+    "CWE-862"
+  ],
+  "severity": "high",
+  "vulnerablePath": [
+    "Anyone holding the public anon key",
+    "PostgREST",
+    "policy \"subscribers: anyone unsubscribes\" (for delete, to anon, using (true))",
+    "every subscriber row can be deleted by a stranger"
+  ],
+  "expectedSecureBehavior": "Subscribing stays open (insert policy with a check the form satisfies); deleting requires proving who you are, so the Data API exposes no open delete.",
+  "acceptableFixes": [
+    "Restrict the delete policy to the row's owner (email = auth.email() or user_id = auth.uid())",
+    "Remove the delete policy and unsubscribe through a server route that verifies a one-time token"
+  ],
+  "unacceptableFixes": [
+    "Keeping `using (true)` and filtering in the application",
+    "Dropping RLS on the table"
+  ],
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "typescript",
+    "postgresql"
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "name": "auditai-scan",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Deterministic security scanner for Next.js + Supabase apps: cross-tenant reads, RLS gaps, service-role misuse, mass assignment. No account, no model, seconds.",
   "license": "Apache-2.0",
   "type": "module",

@@ -22,7 +22,7 @@ describe("audit scan", () => {
       queries: 1,
       tablesKnown: 3,
       tablesWithRls: 3,
-      rules: 11,
+      rules: 14,
     });
     expect(r.findings.map((f) => f.status)).toEqual(["likely"]);
     expect(r.blocking).toBe(false);

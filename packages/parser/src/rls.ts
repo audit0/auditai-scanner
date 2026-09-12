@@ -32,6 +32,13 @@ const CREATE_POLICY = new RegExp(
   String.raw`^create\s+policy\s+("([^"]+)"|\S+)\s+on\s+${QUALIFIED}`,
   "i",
 );
+// `drop policy if exists "Public insert" on suggestions`: a later migration that takes a policy
+// away. Without this the model keeps a policy the database no longer has, and rules judge the
+// schema as it was mid-history instead of as it is (wacrm, pasal).
+const DROP_POLICY = new RegExp(
+  String.raw`^drop\s+policy\s+(?:if\s+exists\s+)?("([^"]+)"|\S+)\s+on\s+${QUALIFIED}`,
+  "i",
+);
 
 /**
  * False for SQL files the migration tool never applies. The Supabase CLI reads only files directly
@@ -69,11 +76,22 @@ function warnDynamicSql(state: SqlSchemaState, rel: string): void {
   if (!state.warnings.includes(w)) state.warnings.push(w);
 }
 
+const ROLE_NAME = '(?:"[A-Za-z_][A-Za-z0-9_]*"|[A-Za-z_][A-Za-z0-9_]*)';
+const ROLES = new RegExp(`\\bto\\s+(${ROLE_NAME}(?:\\s*,\\s*${ROLE_NAME})*)`, "i");
+
+/** Where the policy header ends: the first USING or WITH CHECK, or the whole rest. */
+function headEnd(rest: string): number {
+  const u = /\busing\s*\(/i.exec(rest);
+  const c = /\bwith\s+check\s*\(/i.exec(rest);
+  const ends = [u?.index, c?.index].filter((i): i is number => i !== undefined);
+  return ends.length === 0 ? rest.length : Math.min(...ends);
+}
+
 /** CREATE POLICY goes to the table's policy list; everything else to the schema handlers. */
 function applyStatement(state: SqlSchemaState, stmt: SqlStatement, rel: string): void {
   const cp = CREATE_POLICY.exec(stmt.text);
   if (!cp?.[1] || !cp[4]) {
-    applySchemaStatement(state, stmt, rel);
+    dropPolicy(state, stmt) || applySchemaStatement(state, stmt, rel);
     return;
   }
   const t = ensureTable(
@@ -86,10 +104,14 @@ function applyStatement(state: SqlSchemaState, stmt: SqlStatement, rel: string):
   const rest = stmt.text.slice(cp[0].length);
   const cmdMatch = /\bfor\s+(select|insert|update|delete|all)\b/i.exec(rest);
   const command = (cmdMatch?.[1]?.toLowerCase() as PolicyCommand | undefined) ?? "all";
-  const rolesMatch = /\bto\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)/i.exec(
-    rest,
-  );
-  const roles = rolesMatch?.[1] ? rolesMatch[1].split(/\s*,\s*/).map((r) => r.toLowerCase()) : [];
+  // The TO clause only exists before USING / WITH CHECK; looking further would pick up a column
+  // named `to` inside a predicate. Role names may be quoted (`TO "authenticated"`, what
+  // `supabase db dump` writes), and an empty list means PUBLIC, which includes anon.
+  const head = rest.slice(0, headEnd(rest));
+  const rolesMatch = ROLES.exec(head);
+  const roles = rolesMatch?.[1]
+    ? rolesMatch[1].split(/\s*,\s*/).map((r) => r.replace(/"/g, "").toLowerCase())
+    : [];
   let using: string | null = null;
   let check: string | null = null;
   const u = /\busing\s*\(/i.exec(rest);
@@ -105,6 +127,23 @@ function applyStatement(state: SqlSchemaState, stmt: SqlStatement, rel: string):
     check,
     location: { file: rel, line: stmt.line },
   });
+}
+
+/**
+ * `DROP POLICY [IF EXISTS] name ON table`: removes the policy from a table the model already knows.
+ * Returns true when the statement was a DROP POLICY, so the caller stops. A drop on an unknown
+ * table is still consumed; it creates nothing.
+ */
+function dropPolicy(state: SqlSchemaState, stmt: SqlStatement): boolean {
+  const dp = DROP_POLICY.exec(stmt.text);
+  if (!dp?.[1] || !dp[4]) return false;
+  const name = dp[2] ?? dp[1].replace(/^"|"$/g, "");
+  const t = state.tables.get(qualifiedKey({ schema: dp[3] ?? null, name: dp[4] }));
+  if (t) {
+    t.policies = t.policies.filter((p) => p !== name);
+    t.policyDetails = t.policyDetails.filter((p) => p.name !== name);
+  }
+  return true;
 }
 
 /** Enums, SQL functions and storage buckets accumulated by `parseSqlForRls` calls on `into`. */

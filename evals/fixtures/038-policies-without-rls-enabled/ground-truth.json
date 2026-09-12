@@ -1,0 +1,34 @@
+{
+  "id": "038-policies-without-rls-enabled",
+  "vulnerabilityExists": true,
+  "class": [
+    "authorization",
+    "rls",
+    "configuration"
+  ],
+  "cwe": [
+    "CWE-284"
+  ],
+  "severity": "high",
+  "vulnerablePath": [
+    "Anyone holding the public anon key",
+    "PostgREST",
+    "public.pages: four policies exist, row level security was never enabled",
+    "every page of every workspace is readable and writable"
+  ],
+  "expectedSecureBehavior": "`alter table public.pages enable row level security` in the same migration, so the policies that are already written start applying.",
+  "acceptableFixes": [
+    "Enable row level security on the table",
+    "Revoke the table grants from anon and authenticated if the table is server-only"
+  ],
+  "unacceptableFixes": [
+    "Dropping the policies (the table stays open)",
+    "Relying on the application never querying the table"
+  ],
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "typescript",
+    "postgresql"
+  ]
+}

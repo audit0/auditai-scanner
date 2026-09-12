@@ -351,6 +351,41 @@ describe("DO blocks that loop over a literal list of tables (DeskcommCRM)", () =
     expect(warnings).toEqual([]);
   });
 
+  it("applies drop policy, so a policy a later migration removes is gone", () => {
+    const { tables } = parse(
+      `create table public.suggestions (id uuid primary key, owner_id uuid);
+alter table public.suggestions enable row level security;
+create policy "Public insert suggestions" on suggestions for insert to anon with check (true);
+create policy "owner reads" on public.suggestions for select using (owner_id = auth.uid());`,
+      `drop policy if exists "Public insert suggestions" on suggestions;
+drop policy if exists "never existed" on public.suggestions;
+drop policy if exists "orphan" on public.no_such_table;`,
+    );
+    const t2 = tables.get("suggestions");
+    expect(t2?.policies).toEqual(["owner reads"]);
+    expect(t2?.policyDetails.map((p) => p.name)).toEqual(["owner reads"]);
+    // A drop on a table no migration created must not invent the table.
+    expect(tables.has("no_such_table")).toBe(false);
+  });
+
+  it("reads roles from the TO clause, quoted or bare, and never from the predicate", () => {
+    const { tables } =
+      parse(`create table public.notes (id uuid primary key, owner_id uuid, "to" text);
+alter table public.notes enable row level security;
+create policy "quoted" on "public"."notes" for delete to "authenticated" using (true);
+create policy "two" on public.notes for update to authenticated, "service_role" using (true);
+create policy "none" on public.notes for insert with check (true);
+create policy "column named to" on public.notes for select using ("to" = 'x');`);
+    const byName = Object.fromEntries(
+      (tables.get("notes")?.policyDetails ?? []).map((p) => [p.name, p]),
+    );
+    expect(byName.quoted?.roles).toEqual(["authenticated"]);
+    expect(byName.two?.roles).toEqual(["authenticated", "service_role"]);
+    // No TO clause means PUBLIC in Postgres; an empty list is how the model spells that.
+    expect(byName.none?.roles).toEqual([]);
+    expect(byName["column named to"]?.roles).toEqual([]);
+  });
+
   it("reads select unnest(array[...]), (values (...)) and declared lists, %L and %%, and plain execute strings", () => {
     const { tables, warnings } = parse(`${TABLES}
       do $$ declare t text; r record; v_tables text[] := array['job_queue']; begin

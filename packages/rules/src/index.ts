@@ -1,8 +1,10 @@
 export * from "./packs/supabase-authorization.js";
+export * from "./packs/supabase-sql-policies.js";
 export * from "./packs/supabase-storage-rpc.js";
 export * from "./rule.js";
 
 import { supabaseAuthorizationPack } from "./packs/supabase-authorization.js";
+import { supabaseSqlPoliciesPack } from "./packs/supabase-sql-policies.js";
 import { supabaseStorageRpcPack } from "./packs/supabase-storage-rpc.js";
 import type { Rule } from "./rule.js";
 
@@ -10,4 +12,5 @@ import type { Rule } from "./rule.js";
 export const defaultRules: readonly Rule[] = [
   ...supabaseAuthorizationPack,
   ...supabaseStorageRpcPack,
+  ...supabaseSqlPoliciesPack,
 ];

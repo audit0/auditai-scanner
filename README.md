@@ -59,6 +59,9 @@ fixture that must fire and a secure fixture that must stay silent.
 | `supabase.storage-object-access-without-owner-scope` | critical | Storage download/upload/signed URL/move/remove through the service role on a caller-supplied path that is never tied to the caller's user id |
 | `supabase.storage-policy-without-owner-check` | high | Policy on `storage.objects` that only checks `bucket_id`: every user reads, overwrites or deletes every file in the bucket |
 | `supabase.security-definer-function-without-caller-check` | high, critical if anon can execute | `SECURITY DEFINER` function (RLS skipped inside) that never reads `auth.uid()`, callable through `supabase.rpc()` |
+| `supabase.rls-policy-trusts-user-metadata` | critical | RLS policy decides access from a `user_metadata` claim, which the user writes themselves with `updateUser({ data })` |
+| `supabase.policies-without-rls-enabled` | high | A table carries policies and never got `enable row level security`, so none of them apply |
+| `supabase.anon-write-policy` | high, medium when insert-only | Insert/update/delete policy open to `anon` (or no `TO` clause) whose predicate is `true` |
 
 Findings are reported as `likely`, never `confirmed`: confirmation needs evidence, and evidence
 means a reproduced request. Suppressed findings stay in the output, marked `suppressed`.
@@ -134,7 +137,7 @@ instructions" is just a comment.
 
 ## Eval corpus
 
-Thirty-six fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
+Thirty-nine fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
 rule; the secure twin must produce zero findings. `npm run evals` enforces both on every commit.
 
 | # | Fixture | Rule exercised |
@@ -175,6 +178,13 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 034 | public-table-declaration | service-role-query-without-authentication, read of a table declared in `audit.config.json` `publicTables` is suppressed (visibly), the write path is not |
 | 035 | identity-derived-row-id | service-role-object-access-without-tenant-scope, a row id from the caller's own credential lookup vs one from the query string |
 | 036 | ownership-guard-shapes | service-role-object-access-without-tenant-scope, ownership via the parent row, a comparison in code, or a conditional owner filter |
+| 037 | policy-trusts-user-metadata | rls-policy-trusts-user-metadata, the admin claim read from `user_metadata` vs `app_metadata` |
+| 038 | policies-without-rls-enabled | policies-without-rls-enabled, four policies on a table whose RLS was never switched on |
+| 039 | anon-write-policy | anon-write-policy, an open delete policy for `anon` next to a deliberate public insert |
+
+The last three rules read the migrations only: they need no query from your application, because
+PostgREST exposes the schema to anyone holding the public key. Their findings name the Data API
+as the entry point instead of a route.
 
 Each fixture also carries the `security-test` the hosted product runs in a sandbox: `DENY` tests
 are the security assertion (Alice must not read Bob's row), `ALLOW` tests are the sanity check

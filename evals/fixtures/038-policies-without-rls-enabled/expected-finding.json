@@ -1,0 +1,26 @@
+{
+  "ruleId": "supabase.policies-without-rls-enabled",
+  "title": "Table \"pages\" has policies but RLS is off",
+  "severity": "high",
+  "minConfidence": 0.9,
+  "entrypoints": [
+    "Supabase Data API (PostgREST)"
+  ],
+  "sources": [
+    "anon-key"
+  ],
+  "sinks": [
+    "supabase.select:public.pages"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/supabase/migrations/0001_init.sql"
+  ],
+  "mustNotFlag": [
+    "secure/app/api/pages/route.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "the anon key or a self-granted claim reaches rows it must not",
+    "expectedAfter": "the same request returns nothing and the app's own reads still work"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "037-policy-trusts-user-metadata",
+  "vulnerabilityExists": true,
+  "class": [
+    "authorization",
+    "privilege-escalation",
+    "rls"
+  ],
+  "cwe": [
+    "CWE-602",
+    "CWE-863"
+  ],
+  "severity": "critical",
+  "vulnerablePath": [
+    "Any signed-in user",
+    "supabase.auth.updateUser({ data: { is_admin: true } }) writes user_metadata",
+    "the claim is signed into the next access token",
+    "policy \"notes: admin reads all\" reads it and returns every row"
+  ],
+  "expectedSecureBehavior": "The admin claim comes from app_metadata (service role only) or a roles table, so a user who writes their own user_metadata gains nothing.",
+  "acceptableFixes": [
+    "Read the claim from app_metadata",
+    "Join a roles table on auth.uid() inside the policy",
+    "Set the claim in a custom access token hook that reads a server-owned table"
+  ],
+  "unacceptableFixes": [
+    "Validating user_metadata in application code while the policy still trusts it",
+    "Dropping the admin policy and moving the same claim into a service-role query"
+  ],
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "typescript",
+    "postgresql"
+  ]
+}
