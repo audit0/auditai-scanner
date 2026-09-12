@@ -54,10 +54,19 @@ const TENANT_COLUMNS = [
 /** Roles Supabase exposes through PostgREST. Revoking from PUBLIC alone leaves these in place. */
 const API_ROLES = "public, anon, authenticated";
 
+/** A bare or schema-qualified Postgres identifier: `notes`, `public.notes`, `storage.objects`. */
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$/;
+
+/**
+ * The table the schema actually has under this name, or undefined. Every name that ends up in a
+ * migration comes from here, not from the finding: a finding crosses JSON on its way to the
+ * sandbox, and a name that is not a table of this schema must never be written into SQL.
+ */
 function table(model: ProjectModel, name: string | undefined): RlsTable | undefined {
-  if (!name) return undefined;
-  const key = name.toLowerCase();
-  return model.tables.find((t) => t.table.toLowerCase() === key);
+  if (!name || !IDENTIFIER.test(name)) return undefined;
+  const key = name.toLowerCase().replace(/^public\./, "");
+  const t = model.tables.find((x) => x.table.toLowerCase() === key);
+  return t && IDENTIFIER.test(t.table) ? t : undefined;
 }
 
 /** How a row of this table belongs to someone, as far as its columns tell. */
@@ -85,9 +94,10 @@ function qualified(name: string): string {
 }
 
 function fn(model: ProjectModel, name: string | undefined): SqlFunctionInfo | undefined {
-  if (!name) return undefined;
-  const key = name.toLowerCase();
-  return (model.sqlFunctions ?? []).find((f) => f.name.toLowerCase() === key);
+  if (!name || !IDENTIFIER.test(name)) return undefined;
+  const key = name.toLowerCase().replace(/^public\./, "");
+  const f = (model.sqlFunctions ?? []).find((x) => x.name.toLowerCase() === key);
+  return f && IDENTIFIER.test(f.name) ? f : undefined;
 }
 
 /** `public.f(uuid, text)` — the signature REVOKE needs; without argument types it is ambiguous. */
@@ -95,6 +105,8 @@ function signatureOf(f: SqlFunctionInfo): string {
   const name = f.name.includes(".") ? f.name : `public.${f.name}`;
   return f.args === undefined ? `${name}(...)` : `${name}(${f.args})`;
 }
+
+const COMMANDS = new Set(["select", "insert", "update", "delete", "all"]);
 
 const HEADER = (title: string): string =>
   `-- ${title}\n-- Proposed by Audit AI. Read it, then apply it with the rest of your migrations.\n`;
@@ -126,9 +138,10 @@ function sqlFunctionFix(finding: Finding, model: ProjectModel): SqlFix | null {
 }
 
 function enableRlsFix(finding: Finding, model: ProjectModel, withPolicy: boolean): SqlFix | null {
-  const name = finding.evidence[0]?.data?.table;
-  if (typeof name !== "string") return null;
-  const t = table(model, name);
+  const asked = finding.evidence[0]?.data?.table;
+  const t = table(model, typeof asked === "string" ? asked : undefined);
+  if (!t) return null;
+  const name = t.table;
   const full = qualified(name);
   const own = ownershipOf(t);
   const owner = own.kind === "person" ? own.column : null;
@@ -164,12 +177,14 @@ function enableRlsFix(finding: Finding, model: ProjectModel, withPolicy: boolean
 
 function anonWriteFix(finding: Finding, model: ProjectModel): SqlFix | null {
   const data = finding.evidence[0]?.data ?? {};
-  const name = data.table;
   const policy = data.policy;
   const command = data.command;
-  if (typeof name !== "string" || typeof policy !== "string") return null;
+  const t = table(model, typeof data.table === "string" ? data.table : undefined);
+  if (!t || typeof policy !== "string" || policy.length > 200) return null;
+  if (command !== undefined && !COMMANDS.has(String(command))) return null;
+  const name = t.table;
   const full = qualified(name);
-  const own = ownershipOf(table(model, name));
+  const own = ownershipOf(t);
   const owner = own.kind === "person" ? own.column : null;
   const cmd = typeof command === "string" ? command : "all";
   const safeName = policy.replace(/"/g, '""');
@@ -202,11 +217,12 @@ function anonWriteFix(finding: Finding, model: ProjectModel): SqlFix | null {
   };
 }
 
-function userMetadataFix(finding: Finding): SqlFix | null {
+function userMetadataFix(finding: Finding, model: ProjectModel): SqlFix | null {
   const data = finding.evidence[0]?.data ?? {};
-  const name = data.table;
   const policy = data.policy;
-  if (typeof name !== "string" || typeof policy !== "string") return null;
+  const t = table(model, typeof data.table === "string" ? data.table : undefined);
+  if (!t || typeof policy !== "string" || policy.length > 200) return null;
+  const name = t.table;
   const full = qualified(name);
   return {
     file: `fix_policy_${name.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}_app_metadata.sql`,
@@ -242,7 +258,7 @@ export function sqlFixFor(finding: Finding, model: ProjectModel): SqlFix | null 
     case "supabase.anon-write-policy":
       return anonWriteFix(finding, model);
     case "supabase.rls-policy-trusts-user-metadata":
-      return userMetadataFix(finding);
+      return userMetadataFix(finding, model);
     default:
       return null;
   }

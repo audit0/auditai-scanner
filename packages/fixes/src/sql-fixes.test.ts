@@ -234,3 +234,57 @@ create table public.orgs_notes (id uuid primary key, organization_id uuid not nu
     expect(fix?.rationale).toContain("belong to a tenant through tenant_id");
   });
 });
+
+/**
+ * A finding reaches the sandbox as JSON, so every name a migration contains has to come from the
+ * schema the fixer parsed, never from the finding. These are the cases that would otherwise put a
+ * caller's string into SQL.
+ */
+describe("names come from the schema, not from the finding", () => {
+  it("proposes nothing for a table the migrations do not define", () => {
+    expect(
+      sqlFixFor(finding("supabase.table-without-rls", { table: "ghost" }), model()),
+    ).toBeNull();
+    expect(
+      sqlFixFor(
+        finding("supabase.anon-write-policy", { table: "ghost", policy: "p", command: "update" }),
+        model(),
+      ),
+    ).toBeNull();
+  });
+
+  it("refuses a name that is not an identifier, even if it contains a real table", () => {
+    const evil = "notes; drop table public.notes; --";
+    expect(sqlFixFor(finding("supabase.table-without-rls", { table: evil }), model())).toBeNull();
+    expect(
+      sqlFixFor(
+        finding("supabase.security-definer-function-without-caller-check", {
+          function: "tally(); drop table public.notes; --",
+        }),
+        model(),
+      ),
+    ).toBeNull();
+  });
+
+  it("refuses an unknown policy command", () => {
+    expect(
+      sqlFixFor(
+        finding("supabase.anon-write-policy", {
+          table: "notes",
+          policy: "p",
+          command: "update to anon using (true); drop table notes; --",
+        }),
+        model(),
+      ),
+    ).toBeNull();
+  });
+
+  it("accepts the schema-qualified spelling and writes the schema's own name", () => {
+    const fix = sqlFixFor(
+      finding("supabase.table-without-rls", { table: "public.notes" }),
+      model(),
+    );
+    expect(fix?.sql).toContain("alter table public.notes enable row level security;");
+    expect(fix?.file).toBe("fix_enable_rls_notes.sql");
+  });
+});
