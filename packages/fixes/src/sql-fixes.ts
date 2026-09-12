@@ -30,13 +30,19 @@ export interface SqlFix {
   rationale: string;
 }
 
-/** Columns that tie a row to one person, most specific first. */
-const OWNER_COLUMNS = [
-  "user_id",
-  "owner_id",
-  "profile_id",
-  "author_id",
-  "created_by",
+/**
+ * Columns that hold the id of one signed-in person, so `column = auth.uid()` is the right predicate.
+ * Most specific first.
+ */
+const PERSON_COLUMNS = ["user_id", "owner_id", "profile_id", "author_id", "created_by"];
+
+/**
+ * Columns that hold a tenant, organization or team id. Comparing one of these with `auth.uid()`
+ * is wrong: a tenant id is not a user id, so such a policy locks every member out of their own
+ * rows. The right predicate is a membership lookup that only this schema can say, so for these
+ * tables no policy is proposed and the migration says why.
+ */
+const TENANT_COLUMNS = [
   "account_id",
   "tenant_id",
   "organization_id",
@@ -54,12 +60,23 @@ function table(model: ProjectModel, name: string | undefined): RlsTable | undefi
   return model.tables.find((t) => t.table.toLowerCase() === key);
 }
 
-/** The first owner-like column of the table, or null when nothing ties a row to a person. */
-function ownerColumn(t: RlsTable | undefined): string | null {
-  if (!t) return null;
+/** How a row of this table belongs to someone, as far as its columns tell. */
+type Ownership =
+  | { kind: "person"; column: string }
+  | { kind: "tenant"; column: string }
+  | { kind: "none" };
+
+function ownershipOf(t: RlsTable | undefined): Ownership {
+  if (!t) return { kind: "none" };
   const cols = t.columns.map((c) => c.toLowerCase());
-  for (const candidate of OWNER_COLUMNS) if (cols.includes(candidate)) return candidate;
-  return null;
+  for (const c of PERSON_COLUMNS) if (cols.includes(c)) return { kind: "person", column: c };
+  for (const c of TENANT_COLUMNS) if (cols.includes(c)) return { kind: "tenant", column: c };
+  return { kind: "none" };
+}
+
+/** The comment a migration carries when the table's owner is a tenant, not a person. */
+function tenantNote(full: string, column: string): string {
+  return `-- ${full} belongs to a tenant through ${column}, not to one person. Comparing ${column} with\n-- auth.uid() would lock every member out of their own rows, so no policy is proposed here.\n-- Write one that looks the caller's membership up, for example:\n--   using (${column} in (select ${column} from public.<memberships> where user_id = (select auth.uid())))\n`;
 }
 
 /** `public.orders` for a bare name, `storage.objects` kept as it is. */
@@ -113,18 +130,21 @@ function enableRlsFix(finding: Finding, model: ProjectModel, withPolicy: boolean
   if (typeof name !== "string") return null;
   const t = table(model, name);
   const full = qualified(name);
-  const owner = ownerColumn(t);
+  const own = ownershipOf(t);
+  const owner = own.kind === "person" ? own.column : null;
   const lines = [HEADER(`Turn on row level security for ${full}`)];
   lines.push(`alter table ${full} enable row level security;\n`);
   if (withPolicy) {
-    if (owner) {
+    if (own.kind === "tenant") {
+      lines.push(`\n${tenantNote(full, own.column)}`);
+    } else if (owner) {
       lines.push(
         `\ncreate policy "${name}: owner reads" on ${full}\n  for select to authenticated\n  using (${owner} = (select auth.uid()));\n`,
         `\ncreate policy "${name}: owner writes" on ${full}\n  for all to authenticated\n  using (${owner} = (select auth.uid()))\n  with check (${owner} = (select auth.uid()));\n`,
       );
     } else {
       lines.push(
-        `\n-- No column of ${full} ties a row to a person (looked for ${OWNER_COLUMNS.slice(0, 4).join(", ")}…),\n-- so no policy is proposed: with RLS on and no policy the table is readable only with the\n-- service role, which is the safe default. Add a policy once you decide who owns a row.\n`,
+        `\n-- No column of ${full} ties a row to a person (looked for ${PERSON_COLUMNS.slice(0, 4).join(", ")}…),\n-- so no policy is proposed: with RLS on and no policy the table is readable only with the\n-- service role, which is the safe default. Add a policy once you decide who owns a row.\n`,
       );
     }
   } else {
@@ -149,11 +169,14 @@ function anonWriteFix(finding: Finding, model: ProjectModel): SqlFix | null {
   const command = data.command;
   if (typeof name !== "string" || typeof policy !== "string") return null;
   const full = qualified(name);
-  const owner = ownerColumn(table(model, name));
+  const own = ownershipOf(table(model, name));
+  const owner = own.kind === "person" ? own.column : null;
   const cmd = typeof command === "string" ? command : "all";
   const safeName = policy.replace(/"/g, '""');
   const lines = [HEADER(`Close the open write policy "${policy}" on ${full}`)];
-  if (owner) {
+  if (own.kind === "tenant") {
+    lines.push(`drop policy "${safeName}" on ${full};\n`, `\n${tenantNote(full, own.column)}`);
+  } else if (owner) {
     lines.push(
       `drop policy "${safeName}" on ${full};\n`,
       `\ncreate policy "${safeName}" on ${full}\n  for ${cmd} to authenticated\n`,
@@ -173,7 +196,9 @@ function anonWriteFix(finding: Finding, model: ProjectModel): SqlFix | null {
     summary: `Tie the write policy on ${full} to the caller`,
     rationale: owner
       ? `The policy decides with a tautology and is open to anon, so anyone holding the public key can write ${full} straight through PostgREST. The replacement keeps the same command and ties the row to the signed-in caller through ${owner}. If this table is meant to accept rows from strangers (a contact form, a newsletter), keep the insert open but give it a predicate on the row's shape and a rate limit.`
-      : `The policy decides with a tautology and is open to anon, so anyone holding the public key can write ${full} straight through PostgREST. Nothing in the table identifies an owner, so the honest fix is to remove the policy and write the table from your server after it has checked the caller.`,
+      : own.kind === "tenant"
+        ? `The policy decides with a tautology and is open to anon, so anyone holding the public key can write ${full} straight through PostgREST. Rows belong to a tenant through ${own.column}, and only your schema knows how a user becomes a member, so the migration removes the open policy and shows the shape of the membership check to write instead.`
+        : `The policy decides with a tautology and is open to anon, so anyone holding the public key can write ${full} straight through PostgREST. Nothing in the table identifies an owner, so the honest fix is to remove the policy and write the table from your server after it has checked the caller.`,
   };
 }
 

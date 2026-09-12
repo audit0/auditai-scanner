@@ -194,3 +194,43 @@ describe("as a FixProposal", () => {
     ).toBeNull();
   });
 });
+
+describe("tenant-owned tables", () => {
+  const TENANT_SQL = `create table public.invoices (id uuid primary key, tenant_id uuid not null, total integer);
+create table public.orgs_notes (id uuid primary key, organization_id uuid not null, created_by uuid not null);
+`;
+
+  it("never compares a tenant column with auth.uid() when enabling RLS", () => {
+    const fix = sqlFixFor(
+      finding("supabase.table-without-rls", { table: "invoices" }),
+      model(TENANT_SQL),
+    );
+    expect(fix?.sql).toContain("alter table public.invoices enable row level security;");
+    expect(fix?.sql).not.toContain("tenant_id = (select auth.uid())");
+    expect(fix?.sql).not.toContain("create policy");
+    expect(fix?.sql).toContain("no policy is proposed");
+    expect(fix?.sql).toContain("where user_id = (select auth.uid())");
+  });
+
+  it("prefers the person column when a table has both", () => {
+    const fix = sqlFixFor(
+      finding("supabase.table-without-rls", { table: "orgs_notes" }),
+      model(TENANT_SQL),
+    );
+    expect(fix?.sql).toContain("using (created_by = (select auth.uid()))");
+  });
+
+  it("drops an open write policy on a tenant table without inventing a predicate", () => {
+    const fix = sqlFixFor(
+      finding("supabase.anon-write-policy", {
+        table: "invoices",
+        policy: "open",
+        command: "update",
+      }),
+      model(TENANT_SQL),
+    );
+    expect(fix?.sql).toContain('drop policy "open" on public.invoices;');
+    expect(fix?.sql).not.toContain("create policy");
+    expect(fix?.rationale).toContain("belong to a tenant through tenant_id");
+  });
+});
