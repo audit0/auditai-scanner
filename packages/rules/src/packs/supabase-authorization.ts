@@ -427,7 +427,7 @@ export const tableWithoutRls: Rule = {
           ],
           summary: `public.${t.table} has no "enable row level security" in migrations but is queried with a ${c.kind} client. Anyone holding the public anon key can read every row directly through PostgREST.`,
           title: `Table "${t.table}" is exposed without RLS`,
-          data: { deterministic: true, ruleId: this.id },
+          data: { deterministic: true, ruleId: this.id, table: t.table },
           tail: locations(v.table?.location),
         }));
         addReach(g, h, v, `supabase.${v.data.operation}:public.${t.table}`);

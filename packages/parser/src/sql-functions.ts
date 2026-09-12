@@ -49,6 +49,8 @@ interface FunctionState {
   name: string;
   securityDefiner: boolean;
   returns: string | null;
+  /** Argument types as written (`uuid, integer`), empty for none, null when unreadable. */
+  args: string | null;
   /** Body with comments blanked. */
   body: string;
   directCheck: boolean;
@@ -148,7 +150,9 @@ export function applyCreateFunction(reg: FunctionRegistry, stmt: SqlStatement, f
   if (!isWord(tk[i], "function")) return;
   const q = readQualifiedName(tk, i + 1);
   if (!q || !isPunct(tk[q.next], "(")) return;
-  i = groupEnd(tk, q.next) + 1;
+  const argsEnd = groupEnd(tk, q.next);
+  const args = argumentTypes(stmt, tk, q.next, argsEnd);
+  i = argsEnd + 1;
   let securityDefiner = false;
   let returns: string | null = null;
   let body = "";
@@ -187,12 +191,141 @@ export function applyCreateFunction(reg: FunctionRegistry, stmt: SqlStatement, f
     name: q.name,
     securityDefiner,
     returns,
+    args,
     body: code,
     directCheck: CALLER_CHECKS.some((re) => re.test(code)),
     acl: reg.byKey.get(key)?.acl ?? initialAcl(reg, q.schema),
     location: { file, line: stmt.line },
   };
   reg.byKey.set(key, fn);
+}
+
+/** Words a Postgres type can start with; anything else in first place is a parameter name. */
+const TYPE_WORD = new Set([
+  "anyarray",
+  "anyelement",
+  "bigint",
+  "bigserial",
+  "bit",
+  "bool",
+  "boolean",
+  "box",
+  "bytea",
+  "char",
+  "character",
+  "cidr",
+  "circle",
+  "date",
+  "decimal",
+  "double",
+  "float",
+  "float4",
+  "float8",
+  "inet",
+  "int",
+  "int2",
+  "int4",
+  "int8",
+  "integer",
+  "interval",
+  "json",
+  "jsonb",
+  "line",
+  "lseg",
+  "macaddr",
+  "money",
+  "name",
+  "numeric",
+  "oid",
+  "path",
+  "point",
+  "polygon",
+  "real",
+  "record",
+  "regclass",
+  "serial",
+  "smallint",
+  "smallserial",
+  "text",
+  "time",
+  "timestamp",
+  "timestamptz",
+  "timetz",
+  "trigger",
+  "tsquery",
+  "tsvector",
+  "uuid",
+  "varbit",
+  "varchar",
+  "void",
+  "xml",
+]);
+
+/**
+ * Types of the declared parameters, as GRANT and REVOKE need them: `create function f(p_id uuid,
+ * count integer default 0)` gives `uuid, integer`. Modes (`in`, `out`, `variadic`), names and
+ * defaults are dropped; `out` parameters are not part of the signature. Null when the list holds
+ * something this reader does not understand, so the caller can say so instead of guessing.
+ */
+function argumentTypes(
+  stmt: SqlStatement,
+  tokens: readonly Token[],
+  open: number,
+  close: number,
+): string | null {
+  if (close <= open + 1) return "";
+  const parts: string[] = [];
+  let depth = 0;
+  let start = open + 1;
+  const pieces: Array<[number, number]> = [];
+  for (let i = open + 1; i < close; i++) {
+    const t = tokens[i];
+    if (isPunct(t, "(") || isPunct(t, "[")) depth += 1;
+    else if (isPunct(t, ")") || isPunct(t, "]")) depth -= 1;
+    else if (depth === 0 && isPunct(t, ",")) {
+      pieces.push([start, i]);
+      start = i + 1;
+    }
+  }
+  pieces.push([start, close]);
+  for (const [from, to] of pieces) {
+    const words: Token[] = [];
+    for (let i = from; i < to; i++) {
+      const t = tokens[i];
+      if (!t) continue;
+      if (isWord(t, "default")) break;
+      if (t.kind === "punct" && t.value === "=") break;
+      words.push(t);
+    }
+    if (words.length === 0) return null;
+    let k = 0;
+    if (isWord(words[k], "in") || isWord(words[k], "out") || isWord(words[k], "inout")) {
+      if (isWord(words[k], "out")) continue; // OUT parameters are not part of the signature
+      k += 1;
+    } else if (isWord(words[k], "variadic")) {
+      k += 1;
+    }
+    // A parameter is `[mode] [name] type`, and only a type name tells the two apart: `p_at
+    // timestamp with time zone` has a name, `timestamp with time zone` and `text[]` do not.
+    const firstWord = words[k];
+    const named =
+      firstWord !== undefined &&
+      firstWord.kind === "word" &&
+      !TYPE_WORD.has(firstWord.value.toLowerCase()) &&
+      words.slice(k + 1).some((w) => w.kind === "word");
+    const typeStart = named ? k + 1 : k;
+    const first = words[typeStart];
+    const last = words[words.length - 1];
+    if (!first || !last) return null;
+    parts.push(
+      stmt.text
+        .slice(first.start - stmt.start, last.end - stmt.start)
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase(),
+    );
+  }
+  return parts.join(", ");
 }
 
 /** `name[(args)], name2[(args)]` → keys; `next` is the index after the list. */
@@ -465,6 +598,7 @@ export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
       location: f.location,
     };
     if (f.returns !== null) info.returns = f.returns;
+    if (f.args !== null) info.args = f.args;
     return info;
   });
 }

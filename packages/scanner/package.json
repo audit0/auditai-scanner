@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@auditai/core": "*",
+    "@auditai/fixes": "*",
     "@auditai/graph": "*",
     "@auditai/parser": "*",
     "@auditai/rules": "*"

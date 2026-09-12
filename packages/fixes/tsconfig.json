@@ -13,15 +13,6 @@
     },
     {
       "path": "../parser"
-    },
-    {
-      "path": "../fixes"
-    },
-    {
-      "path": "../graph"
-    },
-    {
-      "path": "../rules"
     }
   ]
 }

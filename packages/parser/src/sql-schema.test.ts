@@ -725,6 +725,8 @@ describe("fixtures", () => {
         grantedTo: ["anon", "authenticated"],
         location: { file: "../supabase/migrations/0001_init.sql", line: 26 },
         returns: "uuid",
+        // Argument types, so a GRANT or REVOKE the fixer writes names the right overload.
+        args: "",
       },
     ]);
     const policy = m.tables.find((t) => t.table === "invoices")?.policyDetails[0];
@@ -896,5 +898,26 @@ describe("malformed SQL", () => {
     const { enums } = parse(`create type "__proto__" as enum ('x');`);
     expect(Object.getPrototypeOf(enums)).toBe(Object.prototype);
     expect(Object.keys(enums)).toEqual(["__proto__"]);
+  });
+});
+
+describe("function argument types (for GRANT and REVOKE)", () => {
+  it("reads names, modes, defaults, arrays and qualified types", () => {
+    const { sqlFunctions } =
+      parse(`create function public.a() returns void language sql as $$ select 1 $$;
+create function public.b(p_id uuid, count integer default 0) returns void language sql as $$ select 1 $$;
+create function public.c(uuid, text[]) returns void language sql as $$ select 1 $$;
+create function public.d(in p_from date, in p_to date, variadic tags text[]) returns void language sql as $$ select 1 $$;
+create function public.e(p_id uuid, out found boolean) returns boolean language sql as $$ select true $$;
+create function public.f(p_at timestamp with time zone, p_num numeric(10, 2)) returns void language sql as $$ select 1 $$;`);
+    const byName = Object.fromEntries(sqlFunctions.map((f) => [f.name, f.args]));
+    expect(byName.a).toBe("");
+    expect(byName.b).toBe("uuid, integer");
+    // A single word per parameter is the type, not a name.
+    expect(byName.c).toBe("uuid, text[]");
+    expect(byName.d).toBe("date, date, text[]");
+    // OUT parameters are not part of the signature Postgres identifies a function by.
+    expect(byName.e).toBe("uuid");
+    expect(byName.f).toBe("timestamp with time zone, numeric(10, 2)");
   });
 });

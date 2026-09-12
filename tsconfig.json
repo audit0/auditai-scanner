@@ -5,6 +5,7 @@
     { "path": "packages/parser" },
     { "path": "packages/graph" },
     { "path": "packages/rules" },
+    { "path": "packages/fixes" },
     { "path": "packages/scanner" }
   ]
 }

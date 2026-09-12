@@ -20,6 +20,14 @@ function where(f: Finding): string {
   return [...seen].join(", ");
 }
 
+/** The added lines of a one-file diff, without the `+`, ready to paste into a migration. */
+function fixBody(diff: string): string[] {
+  return diff
+    .split("\n")
+    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+    .map((l) => l.slice(1));
+}
+
 export function formatFinding(f: Finding): string {
   const why = f.evidence.find((e) => e.kind === "rule")?.summary ?? "";
   const lines = [
@@ -33,6 +41,12 @@ export function formatFinding(f: Finding): string {
   if (f.status === "suppressed") {
     const s = [...f.evidence].reverse().find((e) => e.data?.suppressed === true);
     if (s) lines.push(`  Ignored ${s.summary}`);
+  }
+  // A fix that follows from the schema alone: the migration itself, so it can be copied out of
+  // the terminal. Findings whose fix depends on application code carry none.
+  if (f.fix) {
+    lines.push(`  Fix     ${f.fix.summary} (${f.fix.touchedFiles.join(", ")})`);
+    for (const line of fixBody(f.fix.diff)) lines.push(`          ${line}`);
   }
   return lines.join("\n");
 }

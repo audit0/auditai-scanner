@@ -6,6 +6,7 @@ import {
   renderCoverageStatement,
   summarizeCoverage,
 } from "@auditai/core";
+import { deterministicFix } from "@auditai/fixes";
 import { buildGraph } from "@auditai/graph";
 import { checkIgnoreGlobs, type ProjectModel, parseProject } from "@auditai/parser";
 import { defaultRules, runRules } from "@auditai/rules";
@@ -118,7 +119,16 @@ export function runScan(path: string, opts: ScanOptions = {}): ScanResult {
   // always echoed in the summary so a reviewer sees what it silenced.
   const publicTables = cfg.config.publicTables ?? [];
   const runOpts = { ...(opts.now === undefined ? {} : { now: opts.now }), publicTables };
-  const findings = runRules(defaultRules, model, graph, runOpts);
+  const rulesFindings = runRules(defaultRules, model, graph, runOpts);
+  // A fix that follows from the schema alone is attached right here: no model, no network, and
+  // the same proposal for everyone who scans this repository. Findings whose fix depends on
+  // application code get none, which is deliberate.
+  const migrationsDir = repoDirs.dirs[0] ?? "supabase/migrations";
+  const findings = rulesFindings.map((f) => {
+    if (f.status === "suppressed") return f;
+    const fix = deterministicFix(f, model, migrationsDir);
+    return fix ? { ...f, fix } : f;
+  });
   const coverage = summarizeCoverage(findings);
   const summary = summarize(model, defaultRules.length, publicTables);
   return {

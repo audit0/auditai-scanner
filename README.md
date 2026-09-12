@@ -186,6 +186,12 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 038 | policies-without-rls-enabled | policies-without-rls-enabled, four policies on a table whose RLS was never switched on |
 | 039 | anon-write-policy | anon-write-policy, an open delete policy for `anon` next to a deliberate public insert |
 
+Findings whose fix follows from the schema alone come with that fix: one migration, printed under
+the finding and included in `--json` as `fix`. No model is involved and nothing is applied — it is
+SQL to read and apply yourself. Today that covers the `SECURITY DEFINER`, row-level-security and
+write-policy rules, about a quarter of what the scanner reports on real repositories. A finding
+whose fix lives in application code gets no proposal, on purpose.
+
 The last three rules read the migrations only: they need no query from your application, because
 PostgREST exposes the schema to anyone holding the public key. Their findings name the Data API
 as the entry point instead of a route.

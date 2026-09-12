@@ -257,6 +257,12 @@ export interface SqlFunctionInfo {
   location: FileRef;
   /** Lowercase return type (`uuid`, `setof invoices`, `table`, `void`, `trigger`). Trigger functions cannot be called through PostgREST. */
   returns?: string;
+  /**
+   * Argument types as written, comma separated (`uuid, integer`), empty string for none. Postgres
+   * identifies a function by name and argument types, so GRANT and REVOKE need them. Absent when
+   * the parameter list could not be read; overloads share one entry, and this is the first one seen.
+   */
+  args?: string;
 }
 
 /** A Supabase Storage bucket created by migration SQL (`insert into storage.buckets ...`). */
