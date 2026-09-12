@@ -1,0 +1,32 @@
+{
+  "id": "027-documents-table-without-rls",
+  "vulnerabilityExists": true,
+  "class": [
+    "RLS-missing",
+    "BOLA",
+    "IDOR"
+  ],
+  "cwe": [
+    "CWE-284",
+    "CWE-862"
+  ],
+  "severity": "high",
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "typescript"
+  ],
+  "vulnerablePath": [
+    "GET /api/documents/[id]",
+    "user-scoped client (RLS applies)",
+    "public.documents has RLS disabled",
+    "any row is returned"
+  ],
+  "expectedSecureBehavior": "Alice requesting Bob's document gets 404; direct PostgREST reads with the anon key return no rows.",
+  "acceptableFixes": [
+    "alter table public.documents enable row level security + owner-scoped select policy"
+  ],
+  "unacceptableFixes": [
+    "Filtering in the app layer only while the table stays exposed through PostgREST"
+  ]
+}

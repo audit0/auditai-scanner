@@ -1,0 +1,27 @@
+{
+  "ruleId": "supabase.service-role-object-access-without-tenant-scope",
+  "title": "Cross-tenant delete on \"notes\" via direct database connection",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": [
+    "server action deleteNote"
+  ],
+  "sources": [
+    "action_arg:id"
+  ],
+  "sinks": [
+    "supabase.delete:public.notes"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/app/actions.ts",
+    "vulnerable/lib/prisma.ts"
+  ],
+  "mustNotFlag": [
+    "secure/app/actions.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "note deleted",
+    "expectedAfter": "note intact, 403|404 surfaced by the action"
+  }
+}

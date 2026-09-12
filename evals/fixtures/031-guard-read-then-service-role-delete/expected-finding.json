@@ -1,0 +1,19 @@
+{
+  "ruleId": "supabase.service-role-object-access-without-tenant-scope",
+  "title": "Cross-tenant delete on \"flows\" via service-role client",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": ["DELETE /api/flows/[id]"],
+  "sources": ["route_param:id"],
+  "sinks": ["supabase.delete:public.flows"],
+  "mustMentionFiles": [
+    "vulnerable/app/api/flows/[id]/route.ts",
+    "vulnerable/lib/supabase/admin.ts"
+  ],
+  "mustNotFlag": ["secure/app/api/flows/[id]/route.ts"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200, other tenant's row deleted",
+    "expectedAfter": "HTTP 404, row intact"
+  }
+}

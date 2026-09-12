@@ -1,0 +1,19 @@
+{
+  "ruleId": "supabase.service-role-object-access-without-tenant-scope",
+  "title": "Cross-tenant select on \"projects\" via service-role client",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": ["PAGE /projects/[id]"],
+  "sources": ["route_param:id"],
+  "sinks": ["supabase.select:public.projects"],
+  "mustMentionFiles": [
+    "vulnerable/app/projects/[id]/page.tsx",
+    "vulnerable/lib/supabase/admin.ts"
+  ],
+  "mustNotFlag": ["secure/app/projects/[id]/page.tsx"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "project renders (HTTP 200 with tenant B data)",
+    "expectedAfter": "not-found page"
+  }
+}

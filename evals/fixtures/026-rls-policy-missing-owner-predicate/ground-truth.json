@@ -1,0 +1,35 @@
+{
+  "id": "026-rls-policy-missing-owner-predicate",
+  "vulnerabilityExists": true,
+  "class": [
+    "RLS-incorrect",
+    "BOLA",
+    "IDOR"
+  ],
+  "cwe": [
+    "CWE-863",
+    "CWE-284"
+  ],
+  "severity": "high",
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "supabase-ssr",
+    "typescript"
+  ],
+  "vulnerablePath": [
+    "GET /api/projects/[id]",
+    "cookie-based @supabase/ssr client (RLS applies)",
+    "policy \"projects: authenticated can read\" using (auth.role() = 'authenticated')",
+    "any row is returned"
+  ],
+  "expectedSecureBehavior": "Alice requesting Bob's project gets 404; the policy predicate compares owner_id to auth.uid().",
+  "acceptableFixes": [
+    "Policy predicate that compares owner_id (or another ownership/tenant column) with auth.uid()"
+  ],
+  "unacceptableFixes": [
+    "Dropping the policy without replacement",
+    "Filtering only in the route handler while the PostgREST policy stays role-only",
+    "Switching auth.role() for a stricter role check that still ignores owner_id"
+  ]
+}

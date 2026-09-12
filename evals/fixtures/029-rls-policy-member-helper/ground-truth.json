@@ -1,0 +1,23 @@
+{
+  "id": "029-rls-policy-member-helper",
+  "vulnerabilityExists": true,
+  "class": ["RLS-incorrect", "multi-tenancy", "security-definer"],
+  "cwe": ["CWE-863", "CWE-284"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "postgresql", "typescript"],
+  "vulnerablePath": [
+    "GET /api/notes/[id] (app/api/notes/[id]/route.ts)",
+    "user-scoped client (RLS applies)",
+    "policy \"notes: account members read\" using (public.is_account_member(account_id))",
+    "is_account_member() never compares the membership with auth.uid(), so every account passes"
+  ],
+  "expectedSecureBehavior": "Alice (account A) requesting a note of account B gets 404; her own account's notes stay readable.",
+  "acceptableFixes": [
+    "Helper body that ties the membership to the caller (id = auth.uid() / user_id = auth.uid())",
+    "Policy predicate that compares account_id with the caller's account directly"
+  ],
+  "unacceptableFixes": [
+    "Dropping the policy or RLS on notes",
+    "Filtering only in the route handler"
+  ]
+}

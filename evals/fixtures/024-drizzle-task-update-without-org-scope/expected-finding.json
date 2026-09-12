@@ -1,0 +1,28 @@
+{
+  "ruleId": "supabase.service-role-object-access-without-tenant-scope",
+  "title": "Cross-tenant update on \"tasks\" via direct database connection",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": [
+    "PATCH /api/tasks/[id]"
+  ],
+  "sources": [
+    "route_param:id",
+    "body:body"
+  ],
+  "sinks": [
+    "supabase.update:public.tasks"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/app/api/tasks/[id]/route.ts",
+    "vulnerable/lib/db.ts"
+  ],
+  "mustNotFlag": [
+    "secure/app/api/tasks/[id]/route.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200, status changed",
+    "expectedAfter": "HTTP 403|404"
+  }
+}

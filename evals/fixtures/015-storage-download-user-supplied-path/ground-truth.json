@@ -1,0 +1,23 @@
+{
+  "id": "015-storage-download-user-supplied-path",
+  "vulnerabilityExists": true,
+  "class": ["BOLA", "IDOR", "storage", "service-role-bypass"],
+  "cwe": ["CWE-639", "CWE-284"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "supabase-storage", "typescript"],
+  "vulnerablePath": [
+    "GET /api/documents/download (app/api/documents/download/route.ts)",
+    "searchParams path (user-controlled)",
+    "createServiceRoleClient() (lib/supabase.ts) bypasses storage policies",
+    "supabase.storage.from('documents').download(path)"
+  ],
+  "expectedSecureBehavior": "Alice requesting a file in Bob's folder receives 404 and no file content; her own files still download.",
+  "acceptableFixes": [
+    "Build or check the object path from the session user's id and reject nested paths and traversal",
+    "Download with a per-request client carrying the caller's JWT so the owner-scoped storage policies apply"
+  ],
+  "unacceptableFixes": [
+    "Weakening the storage policies",
+    "Hiding the file name in the response while still returning the content"
+  ]
+}

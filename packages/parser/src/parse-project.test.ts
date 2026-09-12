@@ -103,7 +103,10 @@ describe("parseProject on fixture 001", () => {
     expect(r?.kind).toBe("route");
     expect(r?.method).toBe("GET");
     expect(r?.inputs).toContainEqual(expect.objectContaining({ kind: "route_param", name: "id" }));
-    expect(r?.authChecks).toHaveLength(1);
+    // The call to getUserFromRequest and the auth.getUser inside it: an auth helper is followed
+    // like any other helper since 12 September 2026, so its own evidence is recorded too.
+    expect(r?.authChecks.length).toBeGreaterThanOrEqual(1);
+    expect(r?.authChecks.every((a) => a.kind === "session")).toBe(true);
     expect(r?.queries).toHaveLength(1);
     const q = r?.queries[0];
     expect(q).toMatchObject({
@@ -364,5 +367,26 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
       { method: "eq", column: "id", valueText: "id", inputDerived: true },
     ]);
     expect(qs[2]?.clientLocation?.file).toBe("lib/prisma.ts");
+  });
+});
+
+describe("secret exposures", () => {
+  it("flags real process.env reads of a public secret, not the same text in strings or comments", async () => {
+    const dir = await tempProject({
+      "lib/docs.ts": `// process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY is what the vulnerable example reads
+export const example = 'createClient(url, process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY!)';
+export const template = \`key: process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY\`;
+`,
+      "lib/leak.ts": `export const a = process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY;
+export const b = process.env["NEXT_PUBLIC_STRIPE_SECRET"];
+export const ok = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+`,
+    });
+    const m = parseProject(dir);
+    expect(m.exposures.map((e) => [e.location.file, e.location.line, e.kind])).toEqual([
+      ["lib/leak.ts", 1, "public_env_service_role"],
+      ["lib/leak.ts", 2, "public_env_service_role"],
+    ]);
+    expect(m.exposures[1]?.evidence).toContain("process.env.NEXT_PUBLIC_STRIPE_SECRET");
   });
 });

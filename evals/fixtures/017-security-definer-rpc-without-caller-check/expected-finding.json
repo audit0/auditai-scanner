@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.security-definer-function-without-caller-check",
+  "title": "SECURITY DEFINER function \"get_invoice\" without a caller check",
+  "severity": "high",
+  "minConfidence": 0.75,
+  "entrypoints": ["GET /api/invoices/[id]", "POST /rest/v1/rpc/get_invoice"],
+  "sources": ["route_param:id", "rpc arguments"],
+  "sinks": ["postgres.function:public.get_invoice"],
+  "mustMentionFiles": ["vulnerable/supabase/migrations/0001_init.sql", "vulnerable/app/api/invoices/[id]/route.ts"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200",
+    "expectedAfter": "HTTP 404"
+  }
+}

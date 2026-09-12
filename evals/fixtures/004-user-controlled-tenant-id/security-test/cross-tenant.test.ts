@@ -19,12 +19,12 @@ describe("tenant scoping", () => {
   beforeAll(async () => {
     alice = await tokenFor("alice@tenant-a.test", "alice-password-123");
   });
-  it("Alice asking for Tenant B never gets Tenant B rows", async () => {
+  it("DENY: Alice asking for Tenant B never gets Tenant B rows", async () => {
     const res = await fetch(`${APP_URL}/api/invoices?tenant=${SEED.bob.tenantId}`, { headers: { authorization: `Bearer ${alice}` } });
     const body = (await res.json()) as { invoices?: Array<{ id: string; tenant_id: string }> };
     expect((body.invoices ?? []).some((i) => i.tenant_id === SEED.bob.tenantId)).toBe(false);
   });
-  it("Alice gets her own invoices", async () => {
+  it("ALLOW: Alice gets her own invoices", async () => {
     const res = await fetch(`${APP_URL}/api/invoices?tenant=${SEED.alice.tenantId}`, { headers: { authorization: `Bearer ${alice}` } });
     const body = (await res.json()) as { invoices?: Array<{ id: string }> };
     expect((body.invoices ?? []).map((i) => i.id)).toContain(SEED.alice.invoiceId);

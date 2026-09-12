@@ -1,0 +1,37 @@
+{
+  "id": "024-drizzle-task-update-without-org-scope",
+  "vulnerabilityExists": true,
+  "class": [
+    "BOLA",
+    "IDOR",
+    "multi-tenancy",
+    "direct-db-bypasses-rls"
+  ],
+  "cwe": [
+    "CWE-639",
+    "CWE-284"
+  ],
+  "severity": "critical",
+  "expectedSecureBehavior": "A user from org A updating a task that belongs to org B receives 403 or 404 and the task is left unchanged.",
+  "unacceptableFixes": [
+    "Relying on Supabase RLS while still querying through the direct connection",
+    "Checking org membership in JavaScript after the update already ran"
+  ],
+  "stack": [
+    "nextjs-app-router",
+    "drizzle",
+    "postgres",
+    "supabase-auth",
+    "typescript"
+  ],
+  "vulnerablePath": [
+    "PATCH /api/tasks/[id] (app/api/tasks/[id]/route.ts)",
+    "params.id (user-controlled)",
+    "db (lib/db.ts) direct Postgres connection, RLS does not apply",
+    "db.update(tasks).set({ status }).where(eq(tasks.id, id))"
+  ],
+  "acceptableFixes": [
+    "Scope the update by the caller's org id taken from their membership row",
+    "Run the query under the authenticated role with request.jwt.claims set so RLS applies"
+  ]
+}

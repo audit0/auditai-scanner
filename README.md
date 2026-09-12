@@ -43,8 +43,8 @@ these because they do not understand the framework. This one does nothing else.
 
 ## What it finds
 
-Rule pack `supabase-authorization`. Every rule ships with a vulnerable fixture that must fire and a
-secure fixture that must stay silent.
+Rule packs `supabase-authorization` and `supabase-storage-rpc`. Every rule ships with a vulnerable
+fixture that must fire and a secure fixture that must stay silent.
 
 | Rule | Severity | What it catches |
 |---|---|---|
@@ -56,6 +56,9 @@ secure fixture that must stay silent.
 | `supabase.rls-policy-without-caller-predicate` | high | RLS policy grants rows without referencing the caller (`using (true)` and friends) |
 | `supabase.mass-assignment-from-request-body` | high | Request body written to a table without an allow-list |
 | `supabase.role-check-from-user-metadata` | high | Authorization decided by `user_metadata`, which the user can edit |
+| `supabase.storage-object-access-without-owner-scope` | critical | Storage download/upload/signed URL/move/remove through the service role on a caller-supplied path that is never tied to the caller's user id |
+| `supabase.storage-policy-without-owner-check` | high | Policy on `storage.objects` that only checks `bucket_id`: every user reads, overwrites or deletes every file in the bucket |
+| `supabase.security-definer-function-without-caller-check` | high, critical if anon can execute | `SECURITY DEFINER` function (RLS skipped inside) that never reads `auth.uid()`, callable through `supabase.rpc()` |
 
 Findings are reported as `likely`, never `confirmed`: confirmation needs evidence, and evidence
 means a reproduced request. Suppressed findings stay in the output, marked `suppressed`.
@@ -121,7 +124,7 @@ instructions" is just a comment.
 
 ## Eval corpus
 
-Fourteen fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
+Thirty-two fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
 rule; the secure twin must produce zero findings. `npm run evals` enforces both on every commit.
 
 | # | Fixture | Rule exercised |
@@ -140,6 +143,24 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 012 | wrapped-action-module-client-helper | service-role-object-access-without-tenant-scope, wrapped action and module-level client |
 | 013 | drizzle-direct-db-invoice-read | service-role-object-access-without-tenant-scope, Drizzle direct connection |
 | 014 | prisma-direct-db-invoice-read | service-role-object-access-without-tenant-scope, Prisma direct connection |
+| 015 | storage-download-user-supplied-path | storage-object-access-without-owner-scope |
+| 016 | storage-policy-bucket-only | storage-policy-without-owner-check |
+| 017 | security-definer-rpc-without-caller-check | security-definer-function-without-caller-check, called via `supabase.rpc()` |
+| 018 | security-definer-granted-to-anon | security-definer-function-without-caller-check, executable by anon (critical) |
+| 019 | ssr-cookie-admin-project-read | service-role-object-access-without-tenant-scope, `@supabase/ssr` cookie auth + a separate admin client |
+| 020 | formdata-server-action-delete | service-role-object-access-without-tenant-scope, id read with `formData.get()` into a local const |
+| 021 | dynamic-page-admin-project-read | service-role-object-access-without-tenant-scope, a server-rendered dynamic page as the entry point |
+| 022 | hand-rolled-validator-tenant-scope | user-controlled-tenant-scope, tenant id through a hand-written (no-zod) request validator |
+| 023 | mass-assignment-profile-role-cookie | mass-assignment-from-request-body, survives a correct RLS update policy |
+| 024 | drizzle-task-update-without-org-scope | service-role-object-access-without-tenant-scope, Drizzle direct connection, write path |
+| 025 | prisma-delete-note-without-owner-scope | service-role-object-access-without-tenant-scope, Prisma direct connection, server action |
+| 026 | rls-policy-missing-owner-predicate | rls-policy-without-caller-predicate, role-only predicate |
+| 027 | documents-table-without-rls | table-without-rls |
+| 028 | admin-users-list-role-from-user-metadata | role-check-from-user-metadata |
+| 029 | rls-policy-member-helper | rls-policy-without-caller-predicate, policy scoped through a helper function |
+| 030 | cron-secret-operator-route | service-role-query-without-authentication, secure twin gated by a cron secret instead of a session |
+| 031 | guard-read-then-service-role-delete | service-role-object-access-without-tenant-scope, secure twin checks ownership with an RLS-scoped guard read |
+| 032 | mass-assignment-map-spread-messages | mass-assignment-from-request-body, `.map()` spread of request rows vs explicit fields |
 
 Each fixture also carries the `security-test` the hosted product runs in a sandbox: `DENY` tests
 are the security assertion (Alice must not read Bob's row), `ALLOW` tests are the sanity check
@@ -160,7 +181,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for how to add a rule (always with a fi
 
 ## Roadmap for the open engine
 
-- More of the authorization family: storage bucket policies, RPC functions, realtime channels.
+- More of the authorization family: realtime channels.
 - Rules as data with positive and negative fixtures declared next to them.
 - Better inter-procedural resolution (helpers that wrap `createClient`, shared query builders).
 

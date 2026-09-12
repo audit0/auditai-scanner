@@ -8,7 +8,7 @@ const SEED = JSON.parse(process.env.FIXTURE_SEED_JSON ?? "{}") as Record<"alice"
 const invokeAsBob = process.env.INVOKE_ACTION_AS_BOB; // provided by the sandbox harness: a command that calls deleteInvoice(id) as Bob
 
 describe("deleteInvoice", () => {
-  it("Bob cannot delete Alice's invoice", async () => {
+  it("DENY: Bob cannot delete Alice's invoice", async () => {
     expect(invokeAsBob, "harness must provide INVOKE_ACTION_AS_BOB").toBeTruthy();
     const { execSync } = await import("node:child_process");
     execSync(`${invokeAsBob} ${SEED.alice.invoiceId}`, { stdio: "ignore" });

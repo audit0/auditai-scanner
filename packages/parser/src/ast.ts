@@ -230,6 +230,55 @@ export function classesIn(sf: ts.SourceFile): ClassInfo[] {
   return out;
 }
 
+export function isFunctionLikeNode(n: ts.Node): n is FunctionLike | ts.ConstructorDeclaration {
+  return (
+    ts.isFunctionDeclaration(n) ||
+    ts.isArrowFunction(n) ||
+    ts.isFunctionExpression(n) ||
+    ts.isMethodDeclaration(n) ||
+    ts.isConstructorDeclaration(n)
+  );
+}
+
+/** Walks a function body without entering nested functions (their statements run later, or never). */
+export function walkOwn(body: ts.Node, visit: (n: ts.Node) => void): void {
+  const go = (n: ts.Node): void => {
+    visit(n);
+    n.forEachChild((c) => {
+      if (!isFunctionLikeNode(c)) go(c);
+    });
+  };
+  go(body);
+}
+
+/** What a function itself returns: the arrow expression body, or its own `return` statements. */
+export function ownReturns(fn: FunctionLike): ts.Expression[] {
+  if (!fn.body) return [];
+  if (!ts.isBlock(fn.body)) return [fn.body];
+  const out: ts.Expression[] = [];
+  walkOwn(fn.body, (n) => {
+    if (ts.isReturnStatement(n) && n.expression) out.push(n.expression);
+  });
+  return out;
+}
+
+/** The innermost function around a node, or null at module level. */
+export function enclosingFunction(node: ts.Node): FunctionLike | null {
+  let cur: ts.Node | undefined = node.parent;
+  while (cur) {
+    if (
+      ts.isFunctionDeclaration(cur) ||
+      ts.isArrowFunction(cur) ||
+      ts.isFunctionExpression(cur) ||
+      ts.isMethodDeclaration(cur)
+    ) {
+      return cur;
+    }
+    cur = cur.parent;
+  }
+  return null;
+}
+
 /** Names bound by a destructuring pattern or a plain identifier. */
 export function boundNames(name: ts.BindingName): string[] {
   if (ts.isIdentifier(name)) return [name.text];

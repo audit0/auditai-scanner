@@ -1,0 +1,19 @@
+{
+  "ruleId": "supabase.user-controlled-tenant-scope",
+  "title": "Tenant scope for \"invoices\" comes from the request",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": ["POST /api/invoices"],
+  "sources": ["body:body"],
+  "sinks": ["supabase.select:public.invoices"],
+  "mustMentionFiles": [
+    "vulnerable/app/api/invoices/route.ts",
+    "vulnerable/lib/supabase.ts"
+  ],
+  "mustNotFlag": ["secure/app/api/invoices/route.ts"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200 with Tenant B rows",
+    "expectedAfter": "Tenant A rows only"
+  }
+}

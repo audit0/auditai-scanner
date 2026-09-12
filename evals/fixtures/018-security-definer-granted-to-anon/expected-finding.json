@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.security-definer-function-without-caller-check",
+  "title": "Anonymous-callable SECURITY DEFINER function \"tenant_invoice_totals\" without a caller check",
+  "severity": "critical",
+  "minConfidence": 0.75,
+  "entrypoints": ["POST /rest/v1/rpc/tenant_invoice_totals", "GET /api/tenants/[id]/totals"],
+  "sources": ["route_param:id", "rpc arguments"],
+  "sinks": ["postgres.function:public.tenant_invoice_totals"],
+  "mustMentionFiles": ["vulnerable/supabase/migrations/0001_init.sql"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "rows for any tenant with the anon key",
+    "expectedAfter": "permission denied for anon; zero for another tenant"
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "id": "025-prisma-delete-note-without-owner-scope",
+  "vulnerabilityExists": true,
+  "class": [
+    "BOLA",
+    "IDOR",
+    "direct-db-bypasses-rls",
+    "server-action"
+  ],
+  "cwe": [
+    "CWE-639",
+    "CWE-284"
+  ],
+  "severity": "critical",
+  "expectedSecureBehavior": "A signed-in user invoking deleteNote with another user's note id gets an error and the note is left in place.",
+  "unacceptableFixes": [
+    "Hiding the delete button in the UI for notes the user does not own",
+    "Relying on Supabase RLS while still querying through the Prisma direct connection"
+  ],
+  "stack": [
+    "nextjs-app-router",
+    "prisma",
+    "postgres",
+    "supabase-auth",
+    "typescript",
+    "server-actions"
+  ],
+  "vulnerablePath": [
+    "server action deleteNote(id)",
+    "id (user-controlled argument)",
+    "prisma (lib/prisma.ts) direct Postgres connection, RLS does not apply",
+    "prisma.note.delete({ where: { id } })"
+  ],
+  "acceptableFixes": [
+    "Add the caller's userId to the where clause and treat a zero-row result as not found",
+    "Look the note up scoped to the caller first, then delete by its verified id"
+  ]
+}

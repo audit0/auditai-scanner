@@ -1,0 +1,23 @@
+{
+  "id": "017-security-definer-rpc-without-caller-check",
+  "vulnerabilityExists": true,
+  "class": ["BOLA", "IDOR", "multi-tenancy", "security-definer", "rls-bypass"],
+  "cwe": ["CWE-862", "CWE-250"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "postgresql", "typescript"],
+  "vulnerablePath": [
+    "GET /api/invoices/[id] (app/api/invoices/[id]/route.ts)",
+    "params.id (user-controlled)",
+    "supabase.rpc('get_invoice', { invoice_id: id }) as the caller",
+    "public.get_invoice() SECURITY DEFINER: invoice policies do not apply, no auth.uid() check"
+  ],
+  "expectedSecureBehavior": "Alice requesting Bob's invoice receives 404 through the app, and calling get_invoice directly returns no row.",
+  "acceptableFixes": [
+    "Scope the function body to the caller (owner_id = auth.uid() or tenant_id = current_tenant_id())",
+    "Make the function SECURITY INVOKER so the invoice policies apply"
+  ],
+  "unacceptableFixes": [
+    "Checking ownership only in the route handler while the function stays callable through PostgREST",
+    "Dropping the invoice RLS policies"
+  ]
+}

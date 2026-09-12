@@ -1,0 +1,27 @@
+{
+  "ruleId": "supabase.rls-policy-without-caller-predicate",
+  "title": "RLS policy \"projects: authenticated can read\" on \"projects\" does not scope rows to the caller",
+  "severity": "high",
+  "minConfidence": 0.85,
+  "entrypoints": [
+    "GET /api/projects/[id]"
+  ],
+  "sources": [
+    "route_param:id"
+  ],
+  "sinks": [
+    "supabase.select:public.projects"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/app/api/projects/[id]/route.ts",
+    "vulnerable/supabase/migrations/0001_init.sql"
+  ],
+  "mustNotFlag": [
+    "secure/supabase/migrations/0001_init.sql"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200",
+    "expectedAfter": "HTTP 404"
+  }
+}

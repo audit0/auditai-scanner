@@ -1,0 +1,24 @@
+{
+  "id": "022-hand-rolled-validator-tenant-scope",
+  "vulnerabilityExists": true,
+  "class": ["multi-tenancy", "BOLA"],
+  "cwe": ["CWE-639", "CWE-566"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": [
+    "POST /api/invoices",
+    "req.json() -> parseInvoiceSearch(body) (lib/validate.ts, hand-rolled, no schema library)",
+    "query.tenantId (validated shape, still user-controlled)",
+    "createServiceRoleClient() bypasses RLS",
+    "invoices.select().eq('tenant_id', query.tenantId)"
+  ],
+  "expectedSecureBehavior": "Alice posting any tenantId in the body only ever receives Tenant A invoices.",
+  "acceptableFixes": [
+    "Derive tenant_id from the authenticated user's profile or JWT claim, ignore the body's tenantId",
+    "Use a user-scoped client so RLS enforces the tenant regardless of the request body"
+  ],
+  "unacceptableFixes": [
+    "Validating that tenantId is a well-formed UUID without checking it belongs to the caller",
+    "Restricting the validator's accepted keys while still trusting tenantId's value"
+  ]
+}

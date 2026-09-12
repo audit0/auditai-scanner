@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.storage-policy-without-owner-check",
+  "title": "Storage policy \"documents: authenticated read\" lets any authenticated user read every object in bucket \"documents\"",
+  "severity": "high",
+  "minConfidence": 0.8,
+  "entrypoints": ["GET /api/documents/download", "Storage API: bucket \"documents\""],
+  "sources": ["query:path", "storage API (caller's own session)"],
+  "sinks": ["storage.objects:documents"],
+  "mustMentionFiles": ["vulnerable/supabase/migrations/0001_init.sql", "vulnerable/app/api/documents/download/route.ts"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200",
+    "expectedAfter": "HTTP 404"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "ruleId": "supabase.role-check-from-user-metadata",
+  "title": "Role check reads user_metadata in GET /api/admin/users",
+  "severity": "high",
+  "minConfidence": 0.85,
+  "entrypoints": [
+    "GET /api/admin/users"
+  ],
+  "sources": [
+    "auth.user_metadata (editable by the user)"
+  ],
+  "sinks": [
+    "GET /api/admin/users"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/app/api/admin/users/route.ts"
+  ],
+  "mustNotFlag": [
+    "secure/app/api/admin/users/route.ts"
+  ],
+  "verification": {
+    "strategy": "privilege-escalation",
+    "expectedBefore": "HTTP 200 with every tenant's users after self-promotion",
+    "expectedAfter": "HTTP 403"
+  }
+}

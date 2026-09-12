@@ -9,7 +9,7 @@ const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 const SEED = JSON.parse(process.env.FIXTURE_SEED_JSON ?? "{}") as Record<"alice" | "bob", { userId: string; tenantId: string }>;
 
 describe("PATCH /api/profile", () => {
-  it("cannot change role or tenant", async () => {
+  it("DENY: a user cannot change their own role or tenant", async () => {
     const sb = createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } });
     const { data, error } = await sb.auth.signInWithPassword({ email: "alice@tenant-a.test", password: "alice-password-123" });
     if (error || !data.session) throw error ?? new Error("no session");

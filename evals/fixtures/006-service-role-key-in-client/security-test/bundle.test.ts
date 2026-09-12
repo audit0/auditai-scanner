@@ -16,7 +16,7 @@ function walk(dir: string, out: string[] = []): string[] {
 }
 
 describe("client bundle", () => {
-  it("does not contain the service-role key", () => {
+  it("DENY: the client bundle does not contain the service-role key", () => {
     expect(SERVICE_KEY.length).toBeGreaterThan(10);
     const leaks = walk(STATIC_DIR).filter((f) => readFileSync(f, "utf8").includes(SERVICE_KEY));
     expect(leaks).toEqual([]);

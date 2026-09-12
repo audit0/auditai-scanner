@@ -6,8 +6,9 @@ import type {
   QueryNodeData,
   TableNodeData,
 } from "@auditai/graph";
-import type { FileRef, InputSource, QueryFilter } from "@auditai/parser";
+import type { FileRef, InputSource, QueryFilter, QueryGuard } from "@auditai/parser";
 import type { Rule, RuleContext } from "../rule.js";
+import { callerCheckingFunctions, callsFunctionIn } from "./sql-functions.js";
 
 const SCOPE_COLUMNS = new Set([
   "tenant_id",
@@ -69,6 +70,19 @@ interface HandlerView {
   data: HandlerNodeData;
   inputs: InputSource[];
   authenticated: boolean;
+  /**
+   * Every auth check is a comparison with a server secret (cron secret, admin password, env API key,
+   * webhook signature): the caller is the operator or a machine, not a tenant user, so there is no
+   * caller-owned row to scope to.
+   */
+  operatorOnly: boolean;
+}
+
+/** Kinds of the auth checks behind a handler (`session` for checks recorded without a kind). */
+function authKinds(ctx: RuleContext, handler: GraphNode): string[] {
+  return ctx.graph
+    .out(handler.id, "AUTHENTICATED_BY")
+    .map((a) => (typeof a.data.kind === "string" ? a.data.kind : "session"));
 }
 
 interface QueryView {
@@ -83,11 +97,13 @@ interface QueryView {
 function handlerViews(ctx: RuleContext): HandlerView[] {
   return ctx.graph.nodesOfKind("Handler").map((handler) => {
     const data = handler.data as unknown as HandlerNodeData;
+    const kinds = authKinds(ctx, handler);
     return {
       handler,
       data,
       inputs: (data.inputs as InputSource[] | undefined) ?? [],
-      authenticated: ctx.graph.out(handler.id, "AUTHENTICATED_BY").length > 0,
+      authenticated: kinds.length > 0,
+      operatorOnly: kinds.length > 0 && kinds.every((k) => k === "secret"),
     };
   });
 }
@@ -145,6 +161,48 @@ function finding(ctx: RuleContext, rule: Rule, partial: Partial): Finding {
   };
 }
 
+/**
+ * Does an earlier read of the same row tie it to the caller? Either RLS was in force for that read
+ * (a user-scoped client on a table whose select policies all scope to the caller), or the read itself
+ * filtered by a scope column with a value the caller does not control (`account_id = ctx.accountId`).
+ */
+function guardTiesRowToCaller(
+  guard: QueryGuard,
+  table: TableNodeData | undefined,
+  callerFns: ReadonlySet<string>,
+): { tied: boolean; how: string; why: string } {
+  const callerFilter = guard.filters.find((f) => isScopeColumn(f.column) && !f.inputDerived);
+  if (callerFilter) {
+    return {
+      tied: true,
+      how: `filtered by ${callerFilter.column} = ${callerFilter.valueText}`,
+      why: "",
+    };
+  }
+  if (guard.client !== "user_scoped") {
+    return {
+      tied: false,
+      how: `through ${guard.clientName ?? "a client"} (${guard.client})`,
+      why: `the read runs with a ${guard.client === "anon" ? "public anon" : "privileged"} client and filters by no owner column, so it returns the row for anyone`,
+    };
+  }
+  const reads = (table?.policyDetails ?? []).filter(
+    (p) => p.command === "select" || p.command === "all",
+  );
+  const scoped =
+    table?.known === true &&
+    table.rlsEnabled &&
+    reads.length > 0 &&
+    reads.every((p) => policyScopesToCaller(p.using) || callsFunctionIn(p.using ?? "", callerFns));
+  return {
+    tied: scoped,
+    how: `through ${guard.clientName ?? "a user-scoped client"}, so RLS applied`,
+    why: scoped
+      ? ""
+      : `the select policies on public.${guard.table} could not be shown to tie rows to the caller`,
+  };
+}
+
 function coveredByObjectAccessRule(q: QueryNodeData): boolean {
   const idFilter = q.filters.find((f) => f.inputDerived && isObjectIdColumn(f.column));
   return idFilter !== undefined && !q.filters.some((f) => isScopeColumn(f.column));
@@ -165,7 +223,10 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
   cwe: ["CWE-639", "CWE-284"],
   evaluate(ctx) {
     const out: Finding[] = [];
+    const callerFns = callerCheckingFunctions(ctx.model);
     for (const h of handlerViews(ctx)) {
+      // An operator endpoint (cron secret, admin password) has no tenant user to scope rows to.
+      if (h.operatorOnly) continue;
       for (const v of queryViews(ctx, h.handler)) {
         const q = v.data;
         if (!bypassesRls(v.clientData?.kind)) continue;
@@ -173,6 +234,14 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
         const filters: QueryFilter[] = q.filters;
         const idFilter = filters.find((f) => f.inputDerived && isObjectIdColumn(f.column));
         if (!idFilter || filters.some((f) => isScopeColumn(f.column))) continue;
+        // Ownership can be checked by an earlier read of the same row rather than by this query's filters.
+        const guard = q.guard;
+        const tied = guard ? guardTiesRowToCaller(guard, v.tableData, callerFns) : null;
+        if (guard && tied?.tied && guard.exitsWhenMissing) continue;
+        const guardNote =
+          guard && tied && (tied.tied || guard.client === "user_scoped")
+            ? ` An earlier read of the same "${guard.column}" at ${guard.location.file}:${guard.location.line} (${tied.how}) could be an ownership check, but ${tied.tied ? "the entry point does not stop when it finds no row" : tied.why}.`
+            : "";
         const tableName = v.tableData?.table ?? q.table;
         const authNote = h.authenticated
           ? "The handler authenticates the caller but never checks that the row belongs to them."
@@ -181,13 +250,16 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
           h.data.kind === "server_action" ? "Server action call" : "HTTP request",
           h.data.entry,
           `${idFilter.column} ${idFilter.method} ${idFilter.valueText} (user-controlled)`,
+          ...(guardNote
+            ? [`guard read at ${guard?.location.file}:${guard?.location.line} (not conclusive)`]
+            : []),
           clientLabel(v.clientData),
           `public.${tableName}.${q.operation}`,
         ];
         const evidence: Evidence[] = [
           {
             kind: "rule",
-            summary: `${q.operation} on public.${tableName} filtered by user-controlled "${idFilter.column}" through a ${clientNoun(v.clientData)}, with no tenant/owner scoping. ${authNote} ${rlsNote(v.tableData, tableName, v.clientData?.kind)}${viaNote(q)}`,
+            summary: `${q.operation} on public.${tableName} filtered by user-controlled "${idFilter.column}" through a ${clientNoun(v.clientData)}, with no tenant/owner scoping. ${authNote} ${rlsNote(v.tableData, tableName, v.clientData?.kind)}${viaNote(q)}${guardNote}`,
             locations: locations(h.handler.location, v.query.location, v.client?.location),
             data: {
               deterministic: false,
@@ -329,6 +401,9 @@ export const rlsPolicyWithoutCallerPredicate: Rule = {
   evaluate(ctx) {
     // One finding per (table, policy): the defect is the policy, every handler that reaches it is evidence.
     const groups = new Map<string, Group>();
+    // A helper such as is_account_member(account_id) ties rows to the caller when a migration
+    // defines it and its body reads auth.uid()/auth.jwt(); unknown helpers prove nothing.
+    const callerFns = callerCheckingFunctions(ctx.model);
     for (const h of handlerViews(ctx)) {
       for (const v of queryViews(ctx, h.handler)) {
         const c = v.clientData;
@@ -340,7 +415,9 @@ export const rlsPolicyWithoutCallerPredicate: Rule = {
         for (const p of t.policyDetails) {
           if (p.command !== "all" && p.command !== op) continue;
           const expr = op === "insert" ? p.check : p.using;
-          if (expr === null || policyScopesToCaller(expr)) continue;
+          if (expr === null || policyScopesToCaller(expr) || callsFunctionIn(expr, callerFns)) {
+            continue;
+          }
           const g = group(groups, `${t.table}:${p.name}:${p.command}`, () => ({
             path: [
               "HTTP request",
@@ -373,6 +450,8 @@ export const userControlledTenantScope: Rule = {
   evaluate(ctx) {
     const out: Finding[] = [];
     for (const h of handlerViews(ctx)) {
+      // The operator (cron job, admin password) picks the tenant on purpose; there is no tenant user.
+      if (h.operatorOnly) continue;
       for (const v of queryViews(ctx, h.handler)) {
         if (!bypassesRls(v.clientData?.kind)) continue;
         const scope = v.data.filters.find((f) => isScopeColumn(f.column) && f.inputDerived);
@@ -409,6 +488,23 @@ export const userControlledTenantScope: Rule = {
   },
 };
 
+const AUTHZ_FIELD = /role|admin|permission|plan|tier|scope|is_/i;
+
+/** The property read from user_metadata: `role` in `ctx.user.user_metadata?.role`. */
+export function metadataField(m: { path: string; field?: string }): string {
+  if (m.field !== undefined) return m.field;
+  const hit = /user_metadata\s*\??\.\s*([A-Za-z_$][\w$]*)/.exec(m.path);
+  return hit?.[1] ?? "";
+}
+
+/**
+ * Only the metadata field decides whether this is an authorization read: `adminCtx.user.user_metadata.full_name`
+ * is a display name, even though the variable holding the user is called `adminCtx`.
+ */
+export function isAuthzMetadataRead(m: { path: string; field?: string }): boolean {
+  return AUTHZ_FIELD.test(metadataField(m));
+}
+
 /** R5. Authorization decided by user_metadata, which the end user can edit through supabase.auth.updateUser(). */
 export const roleFromUserMetadata: Rule = {
   id: "supabase.role-check-from-user-metadata",
@@ -422,8 +518,7 @@ export const roleFromUserMetadata: Rule = {
     const out: Finding[] = [];
     for (const h of handlerViews(ctx)) {
       const hits = h.data.metadataAccesses.filter(
-        (m) =>
-          m.bucket === "user_metadata" && /role|admin|permission|plan|tier|scope|is_/i.test(m.path),
+        (m) => m.bucket === "user_metadata" && isAuthzMetadataRead(m),
       );
       const first = hits[0];
       if (!first) continue;
@@ -536,7 +631,7 @@ export const serviceRoleQueryWithoutAuthentication: Rule = {
           evidence: [
             {
               kind: "rule",
-              summary: `${h.data.entry} runs ${views.length} privileged quer${views.length === 1 ? "y" : "ies"} (${tables.join(", ")}; RLS does not protect them) and contains no auth.getUser/getSession/getClaims call or auth helper. If this is a webhook or cron endpoint, it needs signature verification, which was not detected either.`,
+              summary: `${h.data.entry} runs ${views.length} privileged quer${views.length === 1 ? "y" : "ies"} (${tables.join(", ")}; RLS does not protect them) and establishes no caller: no auth.getUser/getSession/getClaims call, no session from an auth library, no auth helper, no comparison of a request credential with a server secret (cron secret, API key, signature) and no API-key lookup was found, directly or in the helpers it calls.`,
               locations: locations(h.handler.location, ...views.map((x) => x.query.location)),
               data: { deterministic: false, ruleId: this.id },
             },

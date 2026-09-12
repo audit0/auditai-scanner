@@ -1,0 +1,23 @@
+{
+  "id": "018-security-definer-granted-to-anon",
+  "vulnerabilityExists": true,
+  "class": ["broken-function-level-authorization", "multi-tenancy", "security-definer", "rls-bypass"],
+  "cwe": ["CWE-862", "CWE-250"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "postgresql", "typescript"],
+  "vulnerablePath": [
+    "POST /rest/v1/rpc/tenant_invoice_totals with the public anon key (or GET /api/tenants/[id]/totals)",
+    "p_tenant_id (caller-controlled)",
+    "public.tenant_invoice_totals() SECURITY DEFINER: invoice policies do not apply, no auth.uid() check",
+    "EXECUTE granted to anon"
+  ],
+  "expectedSecureBehavior": "Anonymous callers are refused; a member of tenant A asking for tenant B's totals gets zero or 404.",
+  "acceptableFixes": [
+    "SECURITY INVOKER so the invoice policies apply, with EXECUTE revoked from public and anon",
+    "Keep SECURITY DEFINER but derive the tenant from auth.uid() inside the function and revoke EXECUTE from anon"
+  ],
+  "unacceptableFixes": [
+    "Revoking anon while any signed-in user can still read any tenant's totals",
+    "Checking the tenant only in the route handler while the function stays callable through PostgREST"
+  ]
+}

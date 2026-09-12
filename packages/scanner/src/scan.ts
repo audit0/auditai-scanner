@@ -1,5 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   type CoverageSummary,
   type Finding,
@@ -8,39 +6,22 @@ import {
   summarizeCoverage,
 } from "@auditai/core";
 import { buildGraph } from "@auditai/graph";
-import { type ProjectModel, parseProject } from "@auditai/parser";
+import { checkIgnoreGlobs, type ProjectModel, parseProject } from "@auditai/parser";
 import { defaultRules, runRules } from "@auditai/rules";
+import { loadAuditConfig, repoMigrationDirs } from "./config.js";
+
+export { type AuditConfig, readAuditConfig } from "./config.js";
 
 export interface ScanOptions {
   now?: string;
-  /** Extra directories with migration SQL, absolute or relative to the scanned path. */
+  /**
+   * Extra directories with migration SQL, absolute or relative to the scanned path. Trusted as given
+   * (CLI flags, API options); `migrations` from the repository's own audit.config.json must stay
+   * inside the project.
+   */
   sqlDirs?: readonly string[];
   /** Glob patterns to leave out of the scan; merged with `audit.config.json` in the project. */
   ignore?: readonly string[];
-}
-
-/** Optional per-project settings, read from `<project>/audit.config.json`. */
-export interface AuditConfig {
-  ignore?: string[];
-  migrations?: string[];
-}
-
-export function readAuditConfig(root: string): AuditConfig {
-  const p = join(root, "audit.config.json");
-  if (!existsSync(p)) return {};
-  try {
-    const raw = JSON.parse(readFileSync(p, "utf8")) as AuditConfig;
-    return {
-      ...(Array.isArray(raw.ignore)
-        ? { ignore: raw.ignore.filter((x): x is string => typeof x === "string") }
-        : {}),
-      ...(Array.isArray(raw.migrations)
-        ? { migrations: raw.migrations.filter((x): x is string => typeof x === "string") }
-        : {}),
-    };
-  } catch {
-    return {};
-  }
 }
 
 export interface ScanSummary {
@@ -63,13 +44,16 @@ export interface ScanResult {
 }
 
 export function summarize(model: ProjectModel, rules: number): ScanSummary {
+  // RLS coverage counts the Data API tables only: keys of other schemas are qualified
+  // (`storage.objects`) and their RLS is managed by Supabase, not by the project's migrations.
+  const apiTables = model.tables.filter((t) => !t.table.includes("."));
   return {
     root: model.root,
     files: model.files.length,
     routes: model.routes.length,
     queries: model.routes.reduce((n, r) => n + r.queries.length, 0),
-    tablesKnown: model.tables.length,
-    tablesWithRls: model.tables.filter((t) => t.rlsEnabled).length,
+    tablesKnown: apiTables.length,
+    tablesWithRls: apiTables.filter((t) => t.rlsEnabled).length,
     rules,
     warnings: model.warnings,
   };
@@ -77,19 +61,33 @@ export function summarize(model: ProjectModel, rules: number): ScanSummary {
 
 /** Deterministic pipeline: parse -> graph -> rules -> coverage. No model calls, no network. */
 export function runScan(path: string, opts: ScanOptions = {}): ScanResult {
-  const cfg = readAuditConfig(path);
-  const sqlDirs = [...(cfg.migrations ?? []), ...(opts.sqlDirs ?? [])];
-  const ignore = [...(cfg.ignore ?? []), ...(opts.ignore ?? [])];
+  const cfg = loadAuditConfig(path);
+  // The repository names its own migration folders, but only inside itself; the caller's are trusted.
+  const repoDirs = repoMigrationDirs(path, cfg.config.migrations ?? []);
+  const sqlDirs = [...repoDirs.dirs, ...(opts.sqlDirs ?? [])];
+  const ignore = checkIgnoreGlobs([...(cfg.config.ignore ?? []), ...(opts.ignore ?? [])]);
   const model = parseProject(path, {
     ...(sqlDirs.length > 0 ? { sqlDirs } : {}),
-    ...(ignore.length > 0 ? { ignore } : {}),
+    ...(ignore.globs.length > 0 ? { ignore: ignore.globs } : {}),
   });
   const graph = buildGraph(model);
   const runOpts = opts.now === undefined ? {} : { now: opts.now };
   const findings = runRules(defaultRules, model, graph, runOpts);
   const coverage = summarizeCoverage(findings);
+  const summary = summarize(model, defaultRules.length);
   return {
-    summary: summarize(model, defaultRules.length),
+    summary: {
+      ...summary,
+      // The parser repeats discovery warnings in the model; report each one once.
+      warnings: [
+        ...new Set([
+          ...cfg.warnings,
+          ...repoDirs.warnings,
+          ...ignore.warnings,
+          ...summary.warnings,
+        ]),
+      ],
+    },
     findings,
     coverage,
     coverageStatement: renderCoverageStatement(coverage),

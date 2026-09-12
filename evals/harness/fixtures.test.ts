@@ -51,3 +51,35 @@ describe.each(fixtures)("fixture %s", (name) => {
     expect(r.blocking).toBe(false);
   });
 });
+
+/**
+ * Sandbox integrity: the verifier reads DENY titles as security assertions and ALLOW titles as sanity
+ * checks. An unlabeled test counts as a security assertion, so a merely broken app could look like a
+ * reproduced vulnerability. Every fixture test is labeled, and every file asserts at least one DENY.
+ */
+const TEST_TITLE = /^\s*(?:it|test)(?:\.\w+)?\(\s*(["'`])((?:\\.|(?!\1).)*)\1/gm;
+
+describe.each(fixtures.filter((d) => existsSync(join(FIXTURES, d, "security-test"))))(
+  "fixture %s security tests",
+  (name) => {
+    it("label every test DENY or ALLOW and assert at least one DENY", () => {
+      const dir = join(FIXTURES, name, "security-test");
+      const files = readdirSync(dir).filter((f) => f.endsWith(".test.ts"));
+      expect(files.length).toBeGreaterThan(0);
+      for (const file of files) {
+        const titles = [...readFileSync(join(dir, file), "utf8").matchAll(TEST_TITLE)].map(
+          (m) => m[2] ?? "",
+        );
+        expect(titles.length, file).toBeGreaterThan(0);
+        expect(
+          titles.filter((t) => !/\b(DENY|ALLOW)\b/.test(t)),
+          `${file}: unlabeled tests`,
+        ).toEqual([]);
+        expect(
+          titles.some((t) => /\bDENY\b/.test(t)),
+          `${file}: no DENY test`,
+        ).toBe(true);
+      }
+    });
+  },
+);

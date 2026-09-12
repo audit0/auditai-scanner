@@ -9,6 +9,7 @@ import {
   topLevelFunctions,
   unwrap,
 } from "./ast.js";
+import { nextAuthSessionNames } from "./auth-evidence.js";
 import type { AuthHelper, ClientFactory, ClientKind } from "./model.js";
 import { clientCreatingOperand, DRIZZLE_TABLE_FNS } from "./orm.js";
 
@@ -114,6 +115,8 @@ export interface ModuleFacts {
   reexports: Reexport[];
   /** Local name behind `export default`, when it is a named function or identifier. */
   defaultExport: string | null;
+  /** Session functions that are not function declarations: `export const { auth } = NextAuth(config)`. */
+  authVars: Map<string, { helper: AuthHelper; exported: boolean }>;
 }
 
 function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
@@ -207,6 +210,25 @@ export function analyzeModule(rel: string, sf: ts.SourceFile): ModuleFacts {
 
   const clientFactories: ClientFactory[] = [];
   const authHelpers: AuthHelper[] = [];
+  const authVars = new Map<string, { helper: AuthHelper; exported: boolean }>();
+  const nextAuthLocal = new Set(
+    [...imports].filter(([, r]) => /^next-auth$/.test(r.spec)).map(([local]) => local),
+  );
+  if (nextAuthLocal.size > 0) {
+    for (const stmt of sf.statements) {
+      if (!ts.isVariableStatement(stmt)) continue;
+      const exported = hasModifier(stmt, ts.SyntaxKind.ExportKeyword);
+      for (const name of nextAuthSessionNames(stmt, nextAuthLocal)) {
+        const helper: AuthHelper = {
+          name,
+          location: { file: rel, line: lineOf(sf, stmt) },
+          evidence: "Auth.js session function returned by NextAuth()",
+        };
+        authHelpers.push(helper);
+        authVars.set(name, { helper, exported: exported || exportedNames.has(name) });
+      }
+    }
+  }
   for (const f of functions.values()) {
     const text = f.fn.getText(sf);
     const location = { file: rel, line: lineOf(sf, f.node) };
@@ -236,5 +258,6 @@ export function analyzeModule(rel: string, sf: ts.SourceFile): ModuleFacts {
     drizzleTables,
     reexports,
     defaultExport,
+    authVars,
   };
 }

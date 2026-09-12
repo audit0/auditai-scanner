@@ -9,7 +9,6 @@ import {
   exportedFunctions,
   type FunctionLike,
   flattenChain,
-  identifiersIn,
   isChainTail,
   lineOf,
   parseIgnoreDirectives,
@@ -18,8 +17,11 @@ import {
   unwrap,
   walk,
 } from "./ast.js";
+import { isCredentialColumn, isSessionProviderImport, secretChecksIn } from "./auth-evidence.js";
 import { discoverFiles } from "./discover.js";
+import { callResultChecked, compareOrder, missingRowExit } from "./guards.js";
 import type {
+  AuthCheck,
   AuthHelper,
   ClientFactory,
   ClientKind,
@@ -61,13 +63,23 @@ import {
   prismaWhereFilters,
 } from "./orm.js";
 import { Resolver } from "./resolve.js";
-import { parseSqlForRls } from "./rls.js";
+import { parseSqlForRls, sqlSchemaFor } from "./rls.js";
+import {
+  bucketName,
+  CallerScope,
+  STORAGE_OPS,
+  type StorageCall,
+  storageAccessOf,
+  storageBindingsIn,
+  storageCallOf,
+} from "./storage.js";
 import {
   analyzeModule,
   classifyCreateClientCall,
   isCreateClientCall,
   type ModuleFacts,
 } from "./supabase.js";
+import { isWholeInput, type WholeContext, wholeParamNames } from "./whole-input.js";
 
 const FILTER_METHODS = new Set([
   "eq",
@@ -90,7 +102,7 @@ const FILTER_METHODS = new Set([
 ]);
 const WRITE_OPERATIONS = new Set<QueryOperation>(["insert", "update", "upsert"]);
 const OPERATIONS = new Set<QueryOperation>(["select", "insert", "update", "delete", "upsert"]);
-const PUBLIC_SECRET_ENV = /process\.env\.NEXT_PUBLIC_[A-Z0-9_]*(?:SERVICE_ROLE|SECRET)[A-Z0-9_]*/g;
+const PUBLIC_SECRET_ENV = /^NEXT_PUBLIC_[A-Z0-9_]*(?:SERVICE_ROLE|SECRET)[A-Z0-9_]*$/;
 /** How many helper calls deep a handler is followed: handler -> helper -> helper -> helper. */
 const MAX_DEPTH = 3;
 /** Wrappers that authenticate the caller before invoking the wrapped handler (Makerkit, next-safe-action, custom). */
@@ -115,14 +127,22 @@ interface ArgBinding {
   client: ClientBinding | null;
   instance: InstanceBinding | null;
   tainted: boolean;
+  /** The argument is an entire request input object (see whole-input.ts), not just derived from one. */
+  whole: boolean;
   isRequest: boolean;
 }
 
-const NO_ARG: ArgBinding = { client: null, instance: null, tainted: false, isRequest: false };
+const NO_ARG: ArgBinding = {
+  client: null,
+  instance: null,
+  tainted: false,
+  whole: false,
+  isRequest: false,
+};
 
 type Sym =
   | { kind: "factory"; factory: ClientFactory }
-  | { kind: "auth"; helper: AuthHelper }
+  | { kind: "auth"; helper: AuthHelper; fn?: FunctionLike; facts?: ModuleFacts }
   | { kind: "function"; name: string; fn: FunctionLike; facts: ModuleFacts }
   | { kind: "class"; cls: ClassInfo; facts: ModuleFacts }
   | { kind: "var"; name: string; init: ts.Expression; facts: ModuleFacts }
@@ -153,20 +173,42 @@ interface Frame {
   via: string[];
   /** Identifiers holding user-controlled data. */
   inputNames: Set<string>;
+  /** Identifiers holding an entire request input object (a subset of inputNames). */
+  wholeNames: Set<string>;
+  /** Objects only some of whose properties are user input: name -> those property names. */
+  partialInputs: Map<string, Set<string>>;
   /** Identifiers holding the incoming Request object. */
   reqNames: Set<string>;
   clients: Map<string, ClientBinding>;
   instances: Map<string, InstanceBinding>;
   cls: ClassInfo | null;
   thisProps: Map<string, ArgBinding>;
+  /** Names this frame's local values in value keys (`h` for the entry point itself). */
+  key: string;
+  /** Parameter (or `param.prop`) -> the caller's value key for the argument bound to it. */
+  aliases: Map<string, string>;
+  /** Source positions of the calls from the entry point down to this frame. */
+  pathPos: number[];
+  /** A `return` in this frame ends the entry point: every call site up to it checks the result. */
+  exitPropagates: boolean;
+}
+
+/** A query as a possible guard: the value keys of its filters, its place in the call order, its stop. */
+interface GuardableRead {
+  query: SupabaseQuery;
+  keys: Array<string | null>;
+  order: number[];
+  /** A missing row stops the entry point. */
+  exits: boolean;
 }
 
 interface Acc {
   inputs: InputSource[];
-  authChecks: FileRef[];
+  authChecks: AuthCheck[];
   queries: SupabaseQuery[];
   metadataAccesses: MetadataAccess[];
   visited: Set<string>;
+  reads: GuardableRead[];
 }
 
 export interface ParseOptions {
@@ -183,7 +225,7 @@ function ownFunctionSym(facts: ModuleFacts, name: string, fn: FunctionLike): Sym
   const factory = facts.clientFactories.find((c) => c.name === name);
   if (factory) return { kind: "factory", factory };
   const helper = facts.authHelpers.find((a) => a.name === name);
-  if (helper) return { kind: "auth", helper };
+  if (helper) return { kind: "auth", helper, fn, facts };
   return { kind: "function", name, fn, facts };
 }
 
@@ -197,6 +239,8 @@ function exportedSym(p: Project, tf: ModuleFacts, name: string, depth: number): 
   if (v?.exported) return { kind: "var", name, init: v.init, facts: tf };
   const dt = tf.drizzleTables.get(name);
   if (dt !== undefined) return { kind: "table", table: dt };
+  const av = tf.authVars.get(name);
+  if (av?.exported) return { kind: "auth", helper: av.helper };
   if (name === "default" && tf.defaultExport) {
     const local = tf.defaultExport;
     const lf = tf.functions.get(local);
@@ -232,6 +276,7 @@ function scopeOf(p: Project, facts: ModuleFacts): Map<string, Sym> {
     scope.set(name, { kind: "var", name, init: v.init, facts });
   }
   for (const [name, table] of facts.drizzleTables) scope.set(name, { kind: "table", table });
+  for (const [name, v] of facts.authVars) scope.set(name, { kind: "auth", helper: v.helper });
   for (const [local, ref] of facts.imports) {
     const target = p.resolver.resolve(ref.spec, facts.file);
     const tf = target ? p.registry.get(target) : undefined;
@@ -241,6 +286,18 @@ function scopeOf(p: Project, facts: ModuleFacts): Map<string, Sym> {
         const sym = exportedSym(p, tf, ref.imported, 0);
         if (sym) scope.set(local, sym);
       }
+      continue;
+    }
+    if (isSessionProviderImport(ref.spec, ref.imported)) {
+      // `getServerSession` (next-auth), `auth()`/`currentUser()` (Clerk) return the caller's session.
+      scope.set(local, {
+        kind: "auth",
+        helper: {
+          name: local,
+          location: { file: facts.file, line: 1 },
+          evidence: `${ref.imported} from ${ref.spec}`,
+        },
+      });
       continue;
     }
     if (!/^[.~]|^@\//.test(ref.spec)) continue;
@@ -308,9 +365,11 @@ function classifyCall(
   call: ts.CallExpression,
   sf: ts.SourceFile,
   scope: Map<string, Sym>,
-  _frame: Frame | null,
+  frame: Frame | null,
   depth: number,
 ): ClientBinding | null {
+  const extended = prismaExtensionBase(p, call, sf, scope, frame, depth);
+  if (extended) return extended;
   const sym = symOfCallee(p, call.expression, scope);
   if (sym?.kind === "factory") {
     return { kind: sym.factory.kind, name: sym.factory.name, location: sym.factory.location };
@@ -335,6 +394,37 @@ function classifyCall(
     };
   }
   return null;
+}
+
+/**
+ * A Prisma client extension is still the same direct connection: `prisma.$extends(ext)`,
+ * `new PrismaClient().$extends(a).$extends(b)` (expense.fyi exports only the extended client).
+ */
+function prismaExtensionBase(
+  p: Project,
+  call: ts.CallExpression,
+  sf: ts.SourceFile,
+  scope: Map<string, Sym>,
+  frame: Frame | null,
+  depth: number,
+): ClientBinding | null {
+  const callee = call.expression;
+  if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== "$extends") return null;
+  if (depth > 5) return null;
+  const base = unwrap(callee.expression);
+  if (isPrismaNew(base)) {
+    return {
+      kind: "direct_db",
+      name: "PrismaClient",
+      location: { file: sf.fileName, line: lineOf(sf, call) },
+    };
+  }
+  if (ts.isCallExpression(base)) return classifyCall(p, base, sf, scope, frame, depth + 1);
+  if (!ts.isIdentifier(base)) return null;
+  const bound = frame?.clients.get(base.text);
+  if (bound) return bound;
+  const sym = scope.get(base.text);
+  return sym?.kind === "var" ? varBinding(p, sym).client : null;
 }
 
 /** `createAccountsApi(client)` -> the class instance it returns, with constructor arguments bound from the call site. */
@@ -386,6 +476,7 @@ function varBinding(p: Project, sym: Extract<Sym, { kind: "var" }>): ArgBinding 
       },
       instance: null,
       tainted: false,
+      whole: false,
       isRequest: false,
     };
   } else if (ts.isCallExpression(init)) {
@@ -399,7 +490,7 @@ function varBinding(p: Project, sym: Extract<Sym, { kind: "var" }>): ArgBinding 
         }
       : null;
     const instance = client ? null : instanceOfCall(p, init, null, scope);
-    out = { client, instance, tainted: false, isRequest: false };
+    out = { client, instance, tainted: false, whole: false, isRequest: false };
   } else if (ts.isNewExpression(init) && ts.isIdentifier(init.expression)) {
     const cs = scope.get(init.expression.text);
     if (cs?.kind === "class") {
@@ -407,6 +498,7 @@ function varBinding(p: Project, sym: Extract<Sym, { kind: "var" }>): ArgBinding 
         client: null,
         instance: { cls: cs.cls, facts: cs.facts, ctorArgs: [] },
         tainted: false,
+        whole: false,
         isRequest: false,
       };
     }
@@ -420,9 +512,150 @@ function isQueryChain(call: ts.CallExpression): boolean {
 }
 
 function derivedIn(frame: Frame, e: ts.Node): boolean {
-  for (const id of identifiersIn(e)) if (frame.inputNames.has(id)) return true;
+  if (usesInput(frame, e)) return true;
   // In the handler itself, `params.x` / `body.x` are user input even before we saw the binding.
   return frame.depth === 0 && /^(params|body|query|searchParams)\b/.test(e.getText(frame.sf));
+}
+
+/**
+ * Variables read by `e` that hold user input. A partially tainted object (`input` bound to
+ * `{ accountId, contactId: body.contact_id }`) taints `input.contactId` and the bare `input`, but not
+ * `input.accountId`, which came from the session.
+ */
+function usesInput(frame: Frame, e: ts.Node): boolean {
+  let hit = false;
+  walk(e, (n) => {
+    if (hit) return false;
+    if (ts.isCallExpression(n) && handsOverRequest(frame, n)) {
+      hit = true;
+      return false;
+    }
+    if (!ts.isIdentifier(n)) return undefined;
+    const parent = n.parent;
+    if (parent && ts.isPropertyAccessExpression(parent) && parent.name === n) return undefined;
+    if (parent && ts.isPropertyAssignment(parent) && parent.name === n) return undefined;
+    const member = parent && ts.isPropertyAccessExpression(parent) && parent.expression === n;
+    if (frame.inputNames.has(n.text)) hit = true;
+    else if (member && frame.reqNames.has(n.text) && REQUEST_MEMBER.test(parent.name.text)) {
+      hit = true;
+    }
+    const partial = frame.partialInputs.get(n.text);
+    if (partial && (!member || partial.has(parent.name.text))) hit = true;
+    return undefined;
+  });
+  return hit;
+}
+
+/** What the caller controls on a Request: body readers, headers, cookies, URL (not `req.auth`, a session). */
+const REQUEST_MEMBER =
+  /^(json|formData|text|arrayBuffer|blob|body|headers|cookies|url|nextUrl|query|params|ip|geo)$/;
+/** Helpers handed the request that build a client, not data. */
+const REQUEST_CLIENT_CALLEE = /client|supabase|prisma|drizzle/i;
+
+/** `readJsonWithLimit(req)` nested in an argument: a helper handed the request returns its input. */
+function handsOverRequest(frame: Frame, call: ts.CallExpression): boolean {
+  if (frame.reqNames.size === 0) return false;
+  const callee = calleePath(call.expression);
+  if (IDENTITY_CALLEE.test(callee) || REQUEST_CLIENT_CALLEE.test(callee)) return false;
+  return call.arguments.some((a) => {
+    const u = unwrap(a);
+    return ts.isIdentifier(u) && frame.reqNames.has(u.text);
+  });
+}
+
+function propertyKeyOf(name: ts.PropertyName | ts.BindingName | undefined): string | null {
+  if (name && (ts.isIdentifier(name) || ts.isStringLiteral(name))) return name.text;
+  return null;
+}
+
+/** Property names of an object literal whose values carry user input, or null when a spread does. */
+function taintedProperties(frame: Frame, lit: ts.ObjectLiteralExpression): Set<string> | null {
+  const out = new Set<string>();
+  for (const pr of lit.properties) {
+    if (ts.isSpreadAssignment(pr)) {
+      if (derivedIn(frame, pr.expression)) return null;
+      continue;
+    }
+    const key = propertyKeyOf(pr.name);
+    if (key === null) continue;
+    if (ts.isPropertyAssignment(pr) && derivedIn(frame, pr.initializer)) out.add(key);
+    else if (ts.isShorthandPropertyAssignment(pr) && derivedIn(frame, pr.name)) out.add(key);
+  }
+  return out;
+}
+
+/**
+ * Binds user input into a callee parameter. An object literal argument keeps its per-property taint:
+ * `run({ accountId, contactId: body.contact_id })` taints `input.contactId` (or the destructured
+ * `contactId`), never the session-derived `accountId`.
+ */
+function bindParamTaint(
+  child: Frame,
+  param: ts.BindingName,
+  arg: ts.Expression | undefined,
+  frame: Frame,
+): void {
+  const u = arg ? unwrap(arg) : undefined;
+  let props: Set<string> | null = null;
+  if (u && ts.isObjectLiteralExpression(u)) props = taintedProperties(frame, u);
+  else if (u && ts.isIdentifier(u) && !frame.inputNames.has(u.text)) {
+    props = frame.partialInputs.get(u.text) ?? null;
+  }
+  if (props === null) {
+    for (const nm of boundNames(param)) child.inputNames.add(nm);
+    return;
+  }
+  if (ts.isIdentifier(param)) {
+    child.partialInputs.set(param.text, new Set(props));
+    return;
+  }
+  bindPatternFrom(child, param, props);
+}
+
+/** `const { accountId, contactId } = input` (or a destructured parameter) from a partially tainted object. */
+function bindPatternFrom(child: Frame, pattern: ts.BindingName, props: ReadonlySet<string>): void {
+  if (!ts.isObjectBindingPattern(pattern)) {
+    if (props.size > 0) for (const nm of boundNames(pattern)) child.inputNames.add(nm);
+    return;
+  }
+  for (const el of pattern.elements) {
+    const key = propertyKeyOf(el.propertyName ?? el.name);
+    if (el.dotDotDotToken ? props.size > 0 : key !== null && props.has(key)) {
+      for (const nm of boundNames(el.name)) child.inputNames.add(nm);
+    }
+  }
+}
+
+/** `req.json()` / `req.formData()` / `req.text()` on the incoming request, at any depth. */
+function isRequestBodyCall(frame: Frame, call: ts.CallExpression): boolean {
+  const callee = call.expression;
+  if (!ts.isPropertyAccessExpression(callee) || !/^(json|formData|text)$/.test(callee.name.text)) {
+    return false;
+  }
+  const recv = unwrap(callee.expression);
+  if (!ts.isIdentifier(recv)) return false;
+  if (frame.reqNames.has(recv.text)) return true;
+  return frame.depth === 0 && frame.reqNames.size === 0 && REQUEST_NAME.test(recv.text);
+}
+
+function wholeContext(frame: Frame): WholeContext {
+  return {
+    wholeName: (n) => frame.wholeNames.has(n),
+    requestBody: (c) => isRequestBodyCall(frame, c),
+    requestName: (n) => frame.reqNames.has(n),
+  };
+}
+
+/**
+ * A method called on user-controlled data returns user-controlled data: `formData.get("id")`,
+ * `url.searchParams.get("id")`, `ids.map(...)`, and anything read off the incoming request
+ * (`req.headers.get(...)`, `req.json()`).
+ */
+function receiverTainted(frame: Frame, call: ts.CallExpression): boolean {
+  const callee = call.expression;
+  if (!ts.isPropertyAccessExpression(callee) && !ts.isElementAccessExpression(callee)) return false;
+  // The callee, not only its receiver: `req.json` reads the body, `req.auth` would be the session.
+  return derivedIn(frame, callee);
 }
 
 function argBinding(p: Project, arg: ts.Expression | undefined, frame: Frame): ArgBinding {
@@ -470,7 +703,13 @@ function argBinding(p: Project, arg: ts.Expression | undefined, frame: Frame): A
       };
     }
   }
-  return { client, instance, tainted: derivedIn(frame, arg), isRequest };
+  return {
+    client,
+    instance,
+    tainted: derivedIn(frame, arg),
+    whole: isWholeInput(arg, wholeContext(frame)),
+    isRequest,
+  };
 }
 
 interface CallTarget {
@@ -502,6 +741,17 @@ function callTarget(
     if (sym?.kind === "function") {
       return { fn: sym.fn, facts: sym.facts, name: sym.name, cls: null, thisProps: new Map() };
     }
+    // An auth helper is still a function: its own queries (an ownership read, a profile lookup)
+    // belong to the entry point that calls it.
+    if (sym?.kind === "auth" && sym.fn && sym.facts) {
+      return {
+        fn: sym.fn,
+        facts: sym.facts,
+        name: sym.helper.name,
+        cls: null,
+        thisProps: new Map(),
+      };
+    }
     return null;
   }
   if (!ts.isPropertyAccessExpression(callee)) return null;
@@ -515,6 +765,9 @@ function callTarget(
       const s = exportedSym(p, sym.facts, method, 0);
       if (s?.kind === "function") {
         return { fn: s.fn, facts: s.facts, name: s.name, cls: null, thisProps: new Map() };
+      }
+      if (s?.kind === "auth" && s.fn && s.facts) {
+        return { fn: s.fn, facts: s.facts, name: s.helper.name, cls: null, thisProps: new Map() };
       }
     } else if (sym?.kind === "var") {
       const vb = varBinding(p, sym);
@@ -568,6 +821,17 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     for (const r of frame.reqNames) if (text.startsWith(`${r}.`)) return true;
     return frame.reqNames.size === 0 && /^(req|request)\./.test(text);
   };
+  /** Binds names to user input; `whole` when the value is the caller's entire object. */
+  const bindInput = (names: string[], whole: boolean): void => {
+    for (const nm of names) {
+      frame.inputNames.add(nm);
+      if (whole) frame.wholeNames.add(nm);
+    }
+  };
+  const handlerInput = (kind: InputKind, names: string[], decl: ts.VariableDeclaration): void => {
+    for (const nm of names) addInput(kind, nm, decl, true);
+    bindInput(names, true);
+  };
 
   // Declarations in source order: inputs, client bindings, service instances, taint propagation.
   for (const decl of collect(body, ts.isVariableDeclaration)) {
@@ -575,42 +839,47 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     const init = clientCreatingOperand(decl.initializer);
     const names = boundNames(decl.name);
     const text = init.getText(sf);
-    if (frame.depth === 0) {
+    aliasLocal(frame, decl.name, init);
+    // A client first: `createClient(url, anon, { global: { headers: { Authorization:
+    // req.headers.get(…) } } })` reads a header, but what it binds is a client, not input.
+    const client = ts.isCallExpression(init) ? classifyCall(p, init, sf, scope, frame, 0) : null;
+    if (client && ts.isIdentifier(decl.name)) {
+      frame.clients.set(decl.name.text, client);
+      continue;
+    }
+    // Rows returned by a query are data, not input, even when the query filters by a request value.
+    const rowsOfQuery = ts.isCallExpression(init) && (isQueryChain(init) || isDbChain(init, frame));
+    if (frame.depth === 0 && !rowsOfQuery) {
       if (/^(params|context\.params|ctx\.params|props\.params)$/.test(text)) {
-        for (const nm of names) addInput("route_param", nm, decl, true);
+        handlerInput("route_param", names, decl);
         continue;
       }
       if (ts.isCallExpression(init) && isRequestCall(text)) {
-        for (const nm of names) addInput("body", nm, decl, true);
+        handlerInput("body", names, decl);
         continue;
       }
       if (/searchParams\.get\(|\.searchParams$|^new URL\(/.test(text)) {
-        for (const nm of names) addInput("query", nm, decl, true);
+        handlerInput("query", names, decl);
         continue;
       }
       if (/headers\.get\(/.test(text)) {
-        for (const nm of names) addInput("header", nm, decl, true);
+        handlerInput("header", names, decl);
         continue;
       }
     }
     if (ts.isCallExpression(init)) {
-      const client = classifyCall(p, init, sf, scope, frame, 0);
-      if (client && ts.isIdentifier(decl.name)) {
-        frame.clients.set(decl.name.text, client);
-        continue;
-      }
       const inst = instanceOfCall(p, init, frame, scope);
       if (inst && ts.isIdentifier(decl.name)) {
         frame.instances.set(decl.name.text, inst);
         continue;
       }
-      if (isQueryChain(init) || isDbChain(init, frame)) continue;
+      if (rowsOfQuery) continue;
       // What a helper returns from user input is user input (`const body = await parseBody(req)`),
       // unless the helper establishes identity (`const user = await getUserFromRequest(req)`).
-      if (returnsIdentity(p, init, sf, scope)) continue;
+      if (returnsIdentity(p, init, scope)) continue;
       const args = init.arguments.map((a) => argBinding(p, a, frame));
-      if (args.some((a) => a.tainted || a.isRequest)) {
-        for (const nm of names) frame.inputNames.add(nm);
+      if (args.some((a) => a.tainted || a.isRequest) || receiverTainted(frame, init)) {
+        bindInput(names, isWholeInput(init, wholeContext(frame)));
       }
     } else if (isPrismaNew(init) && ts.isIdentifier(decl.name)) {
       frame.clients.set(decl.name.text, {
@@ -618,7 +887,11 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
         name: decl.name.text,
         location: loc(init),
       });
-    } else if (ts.isNewExpression(init) && ts.isIdentifier(init.expression)) {
+    } else if (
+      ts.isNewExpression(init) &&
+      ts.isIdentifier(init.expression) &&
+      scope.get(init.expression.text)?.kind === "class"
+    ) {
       const cs = scope.get(init.expression.text);
       if (cs?.kind === "class" && ts.isIdentifier(decl.name)) {
         frame.instances.set(decl.name.text, {
@@ -634,13 +907,16 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       if (i && ts.isIdentifier(decl.name)) frame.instances.set(decl.name.text, i);
       if (frame.inputNames.has(init.text)) {
         // `const payload = body;` keeps the taint (and stays a named input in the handler itself).
-        for (const nm of names) {
-          if (frame.depth === 0) addInput("body", nm, decl, true);
-          else frame.inputNames.add(nm);
-        }
+        if (frame.depth === 0) for (const nm of names) addInput("body", nm, decl, true);
+        bindInput(names, frame.wholeNames.has(init.text));
+      } else {
+        const partial = frame.partialInputs.get(init.text);
+        if (partial && ts.isIdentifier(decl.name)) {
+          frame.partialInputs.set(decl.name.text, new Set(partial));
+        } else if (partial) bindPatternFrom(frame, decl.name, partial);
       }
     } else if (!isChainWithQuery(init) && derivedIn(frame, init)) {
-      for (const nm of names) frame.inputNames.add(nm);
+      bindInput(names, isWholeInput(init, wholeContext(frame)));
     }
   }
   if (frame.depth === 0) {
@@ -655,20 +931,6 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       return undefined;
     });
   }
-
-  const isWholeInput = (e: ts.Expression): boolean => {
-    const u = unwrap(e);
-    if (ts.isIdentifier(u)) return frame.inputNames.has(u.text);
-    if (ts.isObjectLiteralExpression(u)) {
-      return u.properties.some(
-        (pr) =>
-          ts.isSpreadAssignment(pr) &&
-          ts.isIdentifier(unwrap(pr.expression)) &&
-          frame.inputNames.has((unwrap(pr.expression) as ts.Identifier).text),
-      );
-    }
-    return false;
-  };
 
   // `db.transaction(async (tx) => …)` / `prisma.$transaction(async (tx) => …)`: the callback's client is the outer one.
   for (const call of collect(body, ts.isCallExpression)) {
@@ -688,9 +950,16 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
   // Auth checks.
   for (const call of collect(body, ts.isCallExpression)) {
     const calleeText = call.expression.getText(sf);
-    if (/\.auth\.(getUser|getSession|getClaims)$/.test(calleeText)) acc.authChecks.push(loc(call));
-    else if (symOfCallee(p, call.expression, scope)?.kind === "auth")
-      acc.authChecks.push(loc(call));
+    if (
+      /\.auth\.(getUser|getSession|getClaims)$/.test(calleeText) ||
+      symOfCallee(p, call.expression, scope)?.kind === "auth"
+    ) {
+      acc.authChecks.push({ ...loc(call), kind: "session" });
+    }
+  }
+  // A request credential compared with (or verified by) a server secret, deciding the request's fate.
+  for (const check of secretChecksIn(fn, sf)) {
+    acc.authChecks.push({ ...loc(check.node), kind: "secret" });
   }
 
   // Metadata accesses: user_metadata is end-user editable, app_metadata is not.
@@ -703,6 +972,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       acc.metadataAccesses.push({
         path: pa.getText(sf),
         bucket: inner.name.text,
+        field: pa.name.text,
         location: loc(pa),
       });
     }
@@ -744,18 +1014,28 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     }
     return null;
   };
-  const toFilter = (f: OrmFilter): QueryFilter => ({
-    method: f.method,
-    column: f.column,
-    valueText: f.value ? f.value.getText(sf) : f.text,
-    inputDerived: f.value ? derivedIn(frame, f.value) : false,
-  });
+  // The expression behind each filter value, for matching a guard read to the query it guards.
+  const filterValues = new WeakMap<QueryFilter, ts.Expression>();
+  const valued = (f: QueryFilter, v: ts.Expression | null | undefined): QueryFilter => {
+    if (v) filterValues.set(f, v);
+    return f;
+  };
+  const toFilter = (f: OrmFilter): QueryFilter =>
+    valued(
+      {
+        method: f.method,
+        column: f.column,
+        valueText: f.value ? f.value.getText(sf) : f.text,
+        inputDerived: f.value ? derivedIn(frame, f.value) : false,
+      },
+      f.value,
+    );
   const payloadOf = (arg: ts.Expression | null | undefined): QueryPayload | null =>
     arg
       ? {
           text: arg.getText(sf).replace(/\s+/g, " ").slice(0, 200),
           inputDerived: derivedIn(frame, arg),
-          wholeInput: isWholeInput(arg),
+          wholeInput: isWholeInput(arg, wholeContext(frame)),
         }
       : null;
   interface Parsed {
@@ -766,9 +1046,41 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     payload: QueryPayload | null;
     clientRoot: ts.Expression;
   }
+  // Supabase Storage: client.storage.from(bucket).download(path) and friends, rows of storage.objects.
+  const storageHandles = storageBindingsIn(body);
+  let callerScope: CallerScope | null = null;
+  const pushStorage = (st: StorageCall, call: ts.CallExpression): void => {
+    const op = st.op;
+    if (!op || seen.has(op.node.pos)) return;
+    seen.add(op.node.pos);
+    callerScope ??= new CallerScope(body, frame.inputNames);
+    const { binding, name: clientName } = clientOf(st.clientRoot);
+    const query: SupabaseQuery = {
+      table: "storage.objects",
+      operation: STORAGE_OPS[op.name] ?? "unknown",
+      client: binding?.kind ?? "unknown",
+      clientName: binding?.name ?? clientName,
+      clientLocation: binding?.location ?? null,
+      filters: [],
+      payload: null,
+      location: loc(op.node),
+      text: call.getText(sf).replace(/\s+/g, " ").slice(0, 200),
+      storage: storageAccessOf(op, bucketName(st.bucketArg, sf), sf, callerScope, (e) =>
+        derivedIn(frame, e),
+      ),
+    };
+    if (frame.via.length > 0) query.via = frame.via;
+    acc.queries.push(query);
+  };
   for (const call of collect(body, ts.isCallExpression)) {
     if (!isChainTail(call)) continue;
     const chain = flattenChain(call);
+    const storageCall = storageCallOf(chain, storageHandles);
+    if (storageCall) {
+      // A storage chain is never a PostgREST query, even when it is not an object access (getPublicUrl).
+      pushStorage(storageCall, call);
+      continue;
+    }
     const root = unwrap(chain.root);
     const first = chain.segments[0];
     const fromIdx = chain.segments.findIndex((s) => s.name === "from");
@@ -805,23 +1117,25 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
         if (s.name === "match" && firstArg && ts.isObjectLiteralExpression(firstArg)) {
           for (const pr of firstArg.properties) {
             if (ts.isPropertyAssignment(pr)) {
-              filters.push({
+              const f: QueryFilter = {
                 method: "match",
                 column: pr.name.getText(sf).replace(/['"]/g, ""),
                 valueText: pr.initializer.getText(sf),
                 inputDerived: derivedIn(frame, pr.initializer),
-              });
+              };
+              filters.push(valued(f, pr.initializer));
             }
           }
           continue;
         }
         const val = s.args[1];
-        filters.push({
+        const f: QueryFilter = {
           method: s.name,
           column: stringLiteralValue(firstArg),
           valueText: val ? val.getText(sf) : "",
           inputDerived: val ? derivedIn(frame, val) : false,
-        });
+        };
+        filters.push(valued(f, val));
       }
       parsed = {
         anchor: anchor.node,
@@ -907,7 +1221,26 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       text: call.getText(sf).replace(/\s+/g, " ").slice(0, 200),
     };
     if (frame.via.length > 0) query.via = frame.via;
-    acc.queries.push(query);
+    if (pushQuery(acc, query) === query) {
+      const rowExit = missingRowExit(
+        call,
+        chain.segments.map((s) => s.name),
+      );
+      acc.reads.push({
+        query,
+        keys: query.filters.map((f) => {
+          const v = filterValues.get(f);
+          return v ? valueKey(frame, v) : null;
+        }),
+        order: [...frame.pathPos, parsed.anchor.getStart(sf)],
+        exits: rowExit === "throw" || (rowExit === "return" && frame.exitPropagates),
+      });
+    }
+    // Looking the caller up by a request credential (`api_keys.key_hash = sha256(bearer)`) is the
+    // authentication step itself.
+    if (query.filters.some((f) => f.inputDerived && isCredentialColumn(f.column))) {
+      acc.authChecks.push({ ...query.location, kind: "credential" });
+    }
   }
 
   // Follow calls into helpers, services and methods of this repository.
@@ -925,14 +1258,22 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       depth: frame.depth + 1,
       via: [...frame.via, `${target.name} (${target.facts.file}:${lineOf(tsf, target.fn)})`],
       inputNames: new Set(),
+      wholeNames: new Set(),
+      partialInputs: new Map(),
       reqNames: new Set(),
       clients: new Map(),
       instances: new Map(),
       cls: target.cls,
       thisProps: target.thisProps,
+      key: `${target.facts.file}#${target.name}@${call.getStart(frame.sf)}`,
+      aliases: new Map(),
+      pathPos: [...frame.pathPos, call.getStart(frame.sf)],
+      exitPropagates: frame.exitPropagates && callResultChecked(call),
     };
+    const cx = wholeContext(frame);
     target.fn.parameters.forEach((param, i) => {
-      const ab = argBinding(p, call.arguments[i], frame);
+      const arg = call.arguments[i];
+      const ab = argBinding(p, arg, frame);
       const names = boundNames(param.name);
       const head = names[0];
       if (ab.client && head !== undefined && ts.isIdentifier(param.name)) {
@@ -941,22 +1282,188 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       if (ab.instance && head !== undefined && ts.isIdentifier(param.name)) {
         child.instances.set(head, ab.instance);
       }
-      for (const nm of names) {
-        if (ab.isRequest) child.reqNames.add(nm);
-        if (ab.tainted) child.inputNames.add(nm);
+      for (const nm of names) if (ab.isRequest) child.reqNames.add(nm);
+      if (ab.tainted) {
+        bindParamTaint(child, param.name, arg, frame);
+        for (const nm of wholeParamNames(param.name, arg, cx)) {
+          child.inputNames.add(nm);
+          child.wholeNames.add(nm);
+        }
+        // Only user-controlled values can be a guarded id, so only they are named across frames.
+        aliasParam(child, param.name, arg, frame);
       }
     });
     // Same helper, same bindings: analysed once per handler.
     const signature = [
       ...[...child.clients].map(([n, c]) => `${n}=${c.kind}`),
-      ...[...child.inputNames].map((n) => `${n}!`),
+      ...[...child.inputNames].map((n) => `${n}!${child.wholeNames.has(n) ? "*" : ""}`),
+      ...[...child.partialInputs].map(([n, s]) => `${n}.{${[...s].sort().join("|")}}`),
       ...[...child.reqNames].map((n) => `${n}?`),
       ...[...child.thisProps].map(([n, b]) => `this.${n}=${b.client?.kind ?? "-"}`),
+      ...[...child.aliases].map(([n, k]) => `${n}~${k}`),
+      `exit=${child.exitPropagates}`,
     ].sort();
     const key = `${target.facts.file}#${target.name}#${signature.join(",")}`;
     if (acc.visited.has(key)) continue;
     acc.visited.add(key);
     analyzeFrame(p, child, acc);
+  }
+}
+
+/**
+ * One query, one entry per handler. A helper reached through two call paths with different bindings
+ * is analysed twice; its query is kept once, user-controlled wherever any path made it so.
+ */
+function pushQuery(acc: Acc, q: SupabaseQuery): SupabaseQuery {
+  const same = acc.queries.find(
+    (x) =>
+      x.location.file === q.location.file &&
+      x.location.line === q.location.line &&
+      x.text === q.text &&
+      x.client === q.client &&
+      x.clientName === q.clientName &&
+      x.filters.length === q.filters.length,
+  );
+  if (!same) {
+    acc.queries.push(q);
+    return q;
+  }
+  q.filters.forEach((f, i) => {
+    const mine = same.filters[i];
+    if (mine && f.inputDerived) mine.inputDerived = true;
+  });
+  if (same.payload && q.payload) {
+    same.payload.inputDerived ||= q.payload.inputDerived;
+    same.payload.wholeInput ||= q.payload.wholeInput;
+  }
+  return same;
+}
+
+/** `input.contactId` -> "input.contactId"; null for anything but identifiers and property reads. */
+function dottedPath(e: ts.Expression): string | null {
+  const u = unwrap(e);
+  if (ts.isIdentifier(u)) return u.text;
+  if (ts.isPropertyAccessExpression(u)) {
+    const base = dottedPath(u.expression);
+    return base === null ? null : `${base}.${u.name.text}`;
+  }
+  return null;
+}
+
+/**
+ * The value an expression holds, named the same in every frame: a helper parameter is named by the
+ * caller's argument (`flowId` in `requireOwnership(flowId)` called with `id` is the handler's `id`).
+ */
+function valueKey(frame: Frame, e: ts.Expression): string | null {
+  const path = dottedPath(e);
+  if (path === null) return null;
+  const parts = path.split(".");
+  for (let i = parts.length; i > 0; i--) {
+    const alias = frame.aliases.get(parts.slice(0, i).join("."));
+    if (alias !== undefined) return [alias, ...parts.slice(i)].join(".");
+  }
+  return `${frame.key}:${path}`;
+}
+
+/** `const flowId = id`, `const { id } = await params`: the new name holds the same value. */
+function aliasLocal(frame: Frame, name: ts.BindingName, init: ts.Expression): void {
+  const key = valueKey(frame, init);
+  if (key === null) return;
+  if (ts.isIdentifier(name)) {
+    frame.aliases.set(name.text, key);
+    return;
+  }
+  if (!ts.isObjectBindingPattern(name)) return;
+  for (const el of name.elements) {
+    const k = propertyKeyOf(el.propertyName ?? el.name);
+    if (k !== null && !el.dotDotDotToken && ts.isIdentifier(el.name)) {
+      frame.aliases.set(el.name.text, `${key}.${k}`);
+    }
+  }
+}
+
+/** Names a callee parameter by the caller's argument, property by property for object literals. */
+function aliasParam(
+  child: Frame,
+  param: ts.BindingName,
+  arg: ts.Expression | undefined,
+  frame: Frame,
+): void {
+  if (!arg) return;
+  const u = unwrap(arg);
+  if (ts.isIdentifier(param)) {
+    const key = valueKey(frame, arg);
+    if (key !== null) child.aliases.set(param.text, key);
+    else if (ts.isObjectLiteralExpression(u)) {
+      for (const pr of u.properties) {
+        const k = propertyKeyOf(pr.name);
+        const v = ts.isPropertyAssignment(pr)
+          ? pr.initializer
+          : ts.isShorthandPropertyAssignment(pr)
+            ? pr.name
+            : undefined;
+        const vk = k !== null && v ? valueKey(frame, v) : null;
+        if (k !== null && vk !== null) child.aliases.set(`${param.text}.${k}`, vk);
+      }
+    }
+    return;
+  }
+  if (!ts.isObjectBindingPattern(param)) return;
+  const base = valueKey(frame, arg);
+  for (const el of param.elements) {
+    const k = propertyKeyOf(el.propertyName ?? el.name);
+    if (k === null || el.dotDotDotToken || !ts.isIdentifier(el.name)) continue;
+    if (base !== null) {
+      child.aliases.set(el.name.text, `${base}.${k}`);
+      continue;
+    }
+    if (!ts.isObjectLiteralExpression(u)) continue;
+    const pr = u.properties.find((x) => propertyKeyOf(x.name) === k);
+    const v =
+      pr && ts.isPropertyAssignment(pr)
+        ? pr.initializer
+        : pr && ts.isShorthandPropertyAssignment(pr)
+          ? pr.name
+          : undefined;
+    const vk = v ? valueKey(frame, v) : null;
+    if (vk !== null) child.aliases.set(el.name.text, vk);
+  }
+}
+
+/**
+ * Links each query to an earlier read of the same table by the same value (the guard), preferring a
+ * read whose missing row stops the entry point. Rules decide whether the guard ties the row to the caller.
+ */
+function linkGuards(reads: readonly GuardableRead[]): void {
+  const col = (c: string | null): string => (c ?? "").toLowerCase().replace(/_/g, "");
+  for (const q of reads) {
+    let best: { read: GuardableRead; column: string } | null = null;
+    for (const g of reads) {
+      if (g === q || !["select", "unknown"].includes(g.query.operation)) continue;
+      if (g.query.table.toLowerCase() !== q.query.table.toLowerCase()) continue;
+      if (compareOrder(g.order, q.order) >= 0) continue;
+      const shared = q.query.filters.findIndex((f, i) => {
+        const k = q.keys[i];
+        if (!f.inputDerived || k === null || k === undefined) return false;
+        return g.query.filters.some((gf, j) => g.keys[j] === k && col(gf.column) === col(f.column));
+      });
+      const column = q.query.filters[shared]?.column;
+      if (shared < 0 || !column) continue;
+      if (!best || (g.exits && !best.read.exits)) best = { read: g, column };
+    }
+    if (!best) continue;
+    const g = best.read.query;
+    q.query.guard = {
+      location: g.location,
+      table: g.table,
+      client: g.client,
+      clientName: g.clientName,
+      filters: g.filters,
+      column: best.column,
+      exitsWhenMissing: best.read.exits,
+      text: g.text,
+      ...(g.via ? { via: g.via } : {}),
+    };
   }
 }
 
@@ -975,14 +1482,22 @@ function isDbChain(call: ts.CallExpression, frame: Frame): boolean {
 const IDENTITY_CALLEE = /\.auth\.|user|session|claims|auth|principal|viewer/i;
 
 /** Calls that resolve who the caller is: their result is trusted identity, not attacker input. */
-function returnsIdentity(
-  p: Project,
-  call: ts.CallExpression,
-  sf: ts.SourceFile,
-  scope: Map<string, Sym>,
-): boolean {
+function returnsIdentity(p: Project, call: ts.CallExpression, scope: Map<string, Sym>): boolean {
   if (symOfCallee(p, call.expression, scope)?.kind === "auth") return true;
-  return IDENTITY_CALLEE.test(call.expression.getText(sf));
+  return IDENTITY_CALLEE.test(calleePath(call.expression));
+}
+
+/**
+ * The names a callee is made of, without call arguments: `request.headers.get()?.slice` for
+ * `request.headers.get("authorization")?.slice`, so a string argument never reads as a name.
+ */
+function calleePath(e: ts.Expression): string {
+  const u = unwrap(e);
+  if (ts.isIdentifier(u)) return u.text;
+  if (ts.isPropertyAccessExpression(u)) return `${calleePath(u.expression)}.${u.name.text}`;
+  if (ts.isCallExpression(u)) return `${calleePath(u.expression)}()`;
+  if (ts.isElementAccessExpression(u)) return `${calleePath(u.expression)}[]`;
+  return "";
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1009,6 +1524,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     queries: [],
     metadataAccesses: [],
     visited: new Set(),
+    reads: [],
   };
   const frame: Frame = {
     rel,
@@ -1018,11 +1534,19 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     depth: 0,
     via: [],
     inputNames: new Set(["params", "searchParams"]),
+    // The implicit `params`/`searchParams` names are not whole objects: a callback parameter that
+    // happens to be called `params` (an AI tool's arguments) is not the request.
+    wholeNames: new Set(),
+    partialInputs: new Map(),
     reqNames: new Set(),
     clients: new Map(),
     instances: new Map(),
     cls: null,
     thisProps: new Map(),
+    key: "h",
+    aliases: new Map(),
+    pathPos: [],
+    exitPropagates: true,
   };
   const first = fn.parameters[0];
   if (h.kind === "route" && first) {
@@ -1039,11 +1563,15 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
           acc.inputs.push({ kind: "action_arg", name: nm, location: loc(prm) });
         }
         frame.inputNames.add(nm);
+        frame.wholeNames.add(nm);
       }
     }
   }
-  if (h.wrapper && WRAPPER_AUTH.test(h.wrapper)) acc.authChecks.push(loc(h.node));
+  if (h.wrapper && WRAPPER_AUTH.test(h.wrapper)) {
+    acc.authChecks.push({ ...loc(h.node), kind: "session" });
+  }
   analyzeFrame(p, frame, acc);
+  linkGuards(acc.reads);
 
   const entry =
     h.kind === "route"
@@ -1071,15 +1599,40 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
   };
 }
 
+/** `process.env.NEXT_PUBLIC_…SECRET…` and `process.env["NEXT_PUBLIC_…"]` reads, in source order. */
+function publicSecretEnvReads(sf: ts.SourceFile): Array<{ name: string; node: ts.Node }> {
+  const isProcessEnv = (e: ts.Expression): boolean =>
+    ts.isPropertyAccessExpression(e) &&
+    e.name.text === "env" &&
+    ts.isIdentifier(e.expression) &&
+    e.expression.text === "process";
+  const out: Array<{ name: string; node: ts.Node }> = [];
+  const visit = (n: ts.Node): void => {
+    if (ts.isPropertyAccessExpression(n) && isProcessEnv(n.expression)) {
+      if (PUBLIC_SECRET_ENV.test(n.name.text)) out.push({ name: n.name.text, node: n });
+    } else if (
+      ts.isElementAccessExpression(n) &&
+      isProcessEnv(n.expression) &&
+      ts.isStringLiteralLike(n.argumentExpression) &&
+      PUBLIC_SECRET_ENV.test(n.argumentExpression.text)
+    ) {
+      out.push({ name: n.argumentExpression.text, node: n });
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return out;
+}
+
 function findExposures(rel: string, sf: ts.SourceFile): SecretExposure[] {
   const out: SecretExposure[] = [];
-  const text = sf.text;
-  for (const m of text.matchAll(PUBLIC_SECRET_ENV)) {
-    const line = sf.getLineAndCharacterOfPosition(m.index ?? 0).line + 1;
+  // Only real reads count: Next.js inlines `process.env.NEXT_PUBLIC_X` member expressions, not the same
+  // text inside a string, a template or a comment (documentation pages quote the vulnerable line).
+  for (const name of publicSecretEnvReads(sf)) {
     out.push({
       kind: "public_env_service_role",
-      location: { file: rel, line },
-      evidence: `${m[0]} is inlined into the browser bundle by Next.js because of the NEXT_PUBLIC_ prefix`,
+      location: { file: rel, line: lineOf(sf, name.node) },
+      evidence: `process.env.${name.name} is inlined into the browser bundle by Next.js because of the NEXT_PUBLIC_ prefix`,
     });
   }
   if (isClientComponentFile(sf)) {
@@ -1106,12 +1659,10 @@ function findExposures(rel: string, sf: ts.SourceFile): SecretExposure[] {
 /** Parses a Next.js + Supabase project directory into a ProjectModel. Never throws on malformed input. */
 export function parseProject(rootInput: string, opts: ParseOptions = {}): ProjectModel {
   const root = resolve(rootInput);
-  const { source, sql, manifests, tsconfigs, prisma } = discoverFiles(
-    root,
-    opts.sqlDirs ?? [],
-    opts.ignore ?? [],
-  );
-  const warnings: string[] = [];
+  const discovered = discoverFiles(root, opts.sqlDirs ?? [], opts.ignore ?? []);
+  const { source, sql, manifests, tsconfigs, prisma } = discovered;
+  // Rejected ignore globs and unreadable directories belong in the model, not only in runScan.
+  const warnings: string[] = [...discovered.warnings];
   const sources = new Map<string, ts.SourceFile>();
   for (const rel of source) {
     try {
@@ -1227,6 +1778,7 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
   routes.sort((a, b) => a.entry.localeCompare(b.entry));
 
   const all = [...registry.values()];
+  const schema = sqlSchemaFor(tables);
   return {
     root,
     files: [...source, ...sql],
@@ -1237,5 +1789,8 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     exposures,
     fileIgnores,
     warnings,
+    enums: schema.enums,
+    sqlFunctions: schema.sqlFunctions,
+    storageBuckets: schema.storageBuckets,
   };
 }

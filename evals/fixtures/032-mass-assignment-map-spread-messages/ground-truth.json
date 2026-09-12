@@ -1,0 +1,20 @@
+{
+  "id": "032-mass-assignment-map-spread-messages",
+  "vulnerabilityExists": true,
+  "class": ["mass-assignment", "over-posting"],
+  "cwe": ["CWE-915"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "supabase-ssr", "typescript"],
+  "vulnerablePath": [
+    "POST /api/chats/[id]/messages",
+    "messages.map((m) => ({ ...m, chat_id, user_id })) keeps every field the caller sent",
+    "createAdminClient() bypasses RLS",
+    "messages.insert(rows) writes pinned, cost_cents and any other named column"
+  ],
+  "expectedSecureBehavior": "A posted message with pinned: true and cost_cents: 0 is stored unpinned with the server-computed cost; content and role are stored.",
+  "acceptableFixes": [
+    "Build each row from explicit fields (role, content) and server values (chat_id, user_id)",
+    "Validate the array with a schema that strips unknown keys"
+  ],
+  "unacceptableFixes": ["Deleting known-dangerous keys from each element (a deny-list)"]
+}

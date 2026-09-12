@@ -4,7 +4,9 @@ import type {
   PolicyDetail,
   ProjectModel,
   QueryFilter,
+  QueryGuard,
   QueryPayload,
+  StorageAccess,
 } from "@auditai/parser";
 
 export type NodeKind =
@@ -15,7 +17,8 @@ export type NodeKind =
   | "Client"
   | "Query"
   | "Table"
-  | "RLSPolicy";
+  | "RLSPolicy"
+  | "Bucket";
 export type EdgeKind =
   | "HANDLES"
   | "READS"
@@ -23,7 +26,8 @@ export type EdgeKind =
   | "CALLS"
   | "USES_CLIENT"
   | "TARGETS"
-  | "GUARDED_BY";
+  | "GUARDED_BY"
+  | "IN_BUCKET";
 
 export interface GraphNode {
   id: string;
@@ -87,6 +91,15 @@ export interface QueryNodeData {
   table: string;
   /** Helper calls between the handler and the query, when the query lives outside the handler body. */
   via?: string[];
+  /** Supabase Storage call; such a query points at a Bucket node (IN_BUCKET) instead of a Table. */
+  storage?: StorageAccess;
+  /** An earlier read of the same row by the same id value, in this entry point. */
+  guard?: QueryGuard;
+}
+
+export interface BucketNodeData {
+  /** Bucket id, or `(dynamic)` when the code does not name it with a literal. */
+  bucket: string;
 }
 
 export interface HandlerNodeData {
@@ -184,12 +197,13 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
       g.addEdge(handler.id, s.id, "READS");
     }
     for (const a of h.authChecks) {
+      const kind = a.kind ?? "session";
       const an = g.addNode({
-        id: `auth:${a.file}:${a.line}`,
+        id: `auth:${a.file}:${a.line}:${kind}`,
         kind: "AuthCheck",
-        label: "auth check",
-        data: {},
-        location: a,
+        label: `auth check (${kind})`,
+        data: { kind },
+        location: { file: a.file, line: a.line },
       });
       g.addEdge(handler.id, an.id, "AUTHENTICATED_BY");
     }
@@ -201,9 +215,13 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
         text: q.text,
         table: q.table,
         ...(q.via && q.via.length > 0 ? { via: q.via } : {}),
+        ...(q.storage ? { storage: q.storage } : {}),
+        ...(q.guard ? { guard: q.guard } : {}),
       };
       const qn = g.addNode({
-        id: `query:${q.location.file}:${q.location.line}:${i}`,
+        // Per handler: the same helper query reached from two entry points carries different
+        // taint, filters and guards, so the nodes must not be shared.
+        id: `query:${handler.id}:${q.location.file}:${q.location.line}:${i}`,
         kind: "Query",
         label: `${q.table}.${q.operation}`,
         data: { ...qd },
@@ -228,7 +246,19 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
             },
       );
       g.addEdge(qn.id, cn.id, "USES_CLIENT");
-      g.addEdge(qn.id, tableNode(q.table).id, "TARGETS");
+      if (q.storage) {
+        // Storage objects are governed by storage.objects policies, not by the table rules of a public table.
+        const bd: BucketNodeData = { bucket: q.storage.bucket ?? "(dynamic)" };
+        const bn = g.addNode({
+          id: `bucket:${bd.bucket}`,
+          kind: "Bucket",
+          label: `storage bucket ${bd.bucket}`,
+          data: { ...bd },
+        });
+        g.addEdge(qn.id, bn.id, "IN_BUCKET");
+      } else {
+        g.addEdge(qn.id, tableNode(q.table).id, "TARGETS");
+      }
     });
   }
   return g;

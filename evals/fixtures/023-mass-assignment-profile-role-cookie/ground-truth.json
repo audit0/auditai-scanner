@@ -1,0 +1,23 @@
+{
+  "id": "023-mass-assignment-profile-role-cookie",
+  "vulnerabilityExists": true,
+  "class": ["mass-assignment", "property-level-authorization"],
+  "cwe": ["CWE-915"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "supabase-ssr", "typescript"],
+  "vulnerablePath": [
+    "PATCH /api/profile",
+    "req.json() (user-controlled object)",
+    "profiles.update(body).eq('id', user.id) (RLS correctly scopes the row)",
+    "role overwritten on the caller's own row"
+  ],
+  "expectedSecureBehavior": "Sending role in the body leaves the column unchanged; only display_name is ever written.",
+  "acceptableFixes": [
+    "Copy only allow-listed fields into the update payload",
+    "Validate the body with a schema that rejects unknown keys"
+  ],
+  "unacceptableFixes": [
+    "Relying on the RLS update policy alone, since it scopes rows, not columns",
+    "Deleting role from the body but leaving other sensitive columns writable"
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "id": "028-admin-users-list-role-from-user-metadata",
+  "vulnerabilityExists": true,
+  "class": [
+    "role-bypass",
+    "function-level-authorization",
+    "multi-tenancy"
+  ],
+  "cwe": [
+    "CWE-602",
+    "CWE-863"
+  ],
+  "severity": "high",
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "typescript"
+  ],
+  "vulnerablePath": [
+    "GET /api/admin/users",
+    "user.user_metadata.role (self-editable)",
+    "admin gate passes",
+    "service-role select of profiles across all tenants"
+  ],
+  "expectedSecureBehavior": "A member who sets user_metadata.role = 'admin' still receives 403 and no other tenant's users are returned.",
+  "acceptableFixes": [
+    "Read the role from app_metadata",
+    "Read the role from a profiles table the user cannot update"
+  ],
+  "unacceptableFixes": [
+    "Validating the value of user_metadata.role more strictly",
+    "Hiding the admin UI while the API route stays reachable"
+  ]
+}

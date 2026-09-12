@@ -1,0 +1,22 @@
+{
+  "id": "016-storage-policy-bucket-only",
+  "vulnerabilityExists": true,
+  "class": ["storage", "RLS-incorrect", "IDOR"],
+  "cwe": ["CWE-863", "CWE-284"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "supabase-storage", "typescript"],
+  "vulnerablePath": [
+    "GET /api/documents/download (app/api/documents/download/route.ts)",
+    "user-scoped client (storage policies apply)",
+    "policy \"documents: authenticated read\" on storage.objects using (bucket_id = 'documents')",
+    "any object in the private bucket is returned"
+  ],
+  "expectedSecureBehavior": "Alice requesting a file in Bob's folder receives 404; the Storage API refuses the same download with her session.",
+  "acceptableFixes": [
+    "Policy that ties the object to the caller: (storage.foldername(name))[1] = auth.uid()::text, or owner_id = auth.uid()::text"
+  ],
+  "unacceptableFixes": [
+    "Filtering only in the route handler while the policy stays bucket-only (the Storage API is still open)",
+    "Making the bucket public"
+  ]
+}

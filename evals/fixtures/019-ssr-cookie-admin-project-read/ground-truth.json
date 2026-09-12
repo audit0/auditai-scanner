@@ -1,0 +1,24 @@
+{
+  "id": "019-ssr-cookie-admin-project-read",
+  "vulnerabilityExists": true,
+  "class": ["BOLA", "IDOR", "multi-tenancy", "service-role-bypass"],
+  "cwe": ["CWE-639", "CWE-284"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "supabase-ssr", "typescript"],
+  "vulnerablePath": [
+    "GET /api/projects/[id] (app/api/projects/[id]/route.ts)",
+    "createServerSupabaseClient().auth.getUser() authenticates the caller",
+    "params.id (user-controlled)",
+    "createAdminClient() (lib/supabase/admin.ts) bypasses RLS",
+    "admin.from('projects').select('*').eq('id', id).single()"
+  ],
+  "expectedSecureBehavior": "A user from tenant A requesting a project that belongs to tenant B receives 403 or 404 and no project data.",
+  "acceptableFixes": [
+    "Read with the cookie client (createServerSupabaseClient) so RLS applies, and additionally scope by tenant_id",
+    "Keep the admin client but add an explicit tenant/ownership check before returning data"
+  ],
+  "unacceptableFixes": [
+    "Weakening or dropping the RLS policy on projects",
+    "Returning 200 with an empty body while still reading the row through the admin client"
+  ]
+}

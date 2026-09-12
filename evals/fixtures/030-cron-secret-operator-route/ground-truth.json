@@ -1,0 +1,20 @@
+{
+  "id": "030-cron-secret-operator-route",
+  "vulnerabilityExists": true,
+  "class": ["missing-authentication", "operator-endpoint"],
+  "cwe": ["CWE-306", "CWE-284"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript", "cron"],
+  "vulnerablePath": [
+    "POST /api/cron/purge",
+    "no check of any kind",
+    "createServiceRoleClient() bypasses RLS",
+    "jobs.delete() across every tenant"
+  ],
+  "expectedSecureBehavior": "A request without the scheduler's secret gets 401 and deletes nothing; a request carrying the secret runs the purge.",
+  "acceptableFixes": [
+    "Compare a request header with a server secret (CRON_SECRET) and return 401 on mismatch, ideally in constant time",
+    "Verify a signature over the request with a server secret"
+  ],
+  "unacceptableFixes": ["An obscure URL", "Checking that the header is present without comparing it to anything"]
+}

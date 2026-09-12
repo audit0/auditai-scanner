@@ -1,0 +1,27 @@
+{
+  "ruleId": "supabase.table-without-rls",
+  "title": "Table \"documents\" is exposed without RLS",
+  "severity": "high",
+  "minConfidence": 0.9,
+  "entrypoints": [
+    "GET /api/documents/[id]"
+  ],
+  "sources": [
+    "route_param:id"
+  ],
+  "sinks": [
+    "supabase.select:public.documents"
+  ],
+  "mustMentionFiles": [
+    "vulnerable/app/api/documents/[id]/route.ts",
+    "vulnerable/supabase/migrations/0001_init.sql"
+  ],
+  "mustNotFlag": [
+    "secure/app/api/documents/[id]/route.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200",
+    "expectedAfter": "HTTP 404"
+  }
+}

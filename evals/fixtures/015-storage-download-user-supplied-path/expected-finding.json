@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.storage-object-access-without-owner-scope",
+  "title": "Cross-user storage download in bucket \"documents\" via service-role client",
+  "severity": "critical",
+  "minConfidence": 0.8,
+  "entrypoints": ["GET /api/documents/download"],
+  "sources": ["query:path"],
+  "sinks": ["supabase.storage.download:documents"],
+  "mustMentionFiles": ["vulnerable/app/api/documents/download/route.ts", "vulnerable/lib/supabase.ts"],
+  "mustNotFlag": ["secure/app/api/documents/download/route.ts"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200",
+    "expectedAfter": "HTTP 404"
+  }
+}

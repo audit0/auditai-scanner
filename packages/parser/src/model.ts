@@ -71,6 +71,46 @@ export interface QueryPayload {
   wholeInput: boolean;
 }
 
+/**
+ * A Supabase Storage call `<client>.storage.from(bucket).<op>(path, …)`. Storage objects are rows of
+ * `storage.objects`, so storage policies apply to anon/user-scoped clients and the service role skips them.
+ */
+export interface StorageAccess {
+  /** Bucket id, or null when it is not a literal (or a same-file string constant). */
+  bucket: string | null;
+  /** download, upload, update, move, copy, remove, list, createSignedUrl, createSignedUrls, createSignedUploadUrl. */
+  op: string;
+  /** Source text of the path argument(s); both paths for move/copy. */
+  pathText: string;
+  /** True when a path argument is derived from user-controlled input of the entry point. */
+  pathInputDerived: boolean;
+  /**
+   * True when every user-controlled path argument contains the caller's user or tenant id from the session
+   * (`${user.id}/${name}`), or is checked against it (`path.startsWith(`${user.id}/`)`).
+   */
+  pathScopedToCaller: boolean;
+}
+
+/**
+ * An earlier read of the same row, in the same entry point (or a helper it calls), filtered by the same
+ * id value: `requireOwnership(id)` selecting `flows.id = id` through RLS before a service-role delete of
+ * `flows.id = id`. Whether it ties the row to the caller is the rules' call (RLS policies, scope filters).
+ */
+export interface QueryGuard {
+  location: FileRef;
+  table: string;
+  client: ClientKind;
+  clientName: string | null;
+  /** Every filter of the guard read; a scope column filtered by a session value ties it to the caller. */
+  filters: QueryFilter[];
+  /** The column the guard and the guarded query both filter by the same value. */
+  column: string;
+  /** A missing row stops the entry point: a throw or redirect, or a return every caller up to the entry point checks. */
+  exitsWhenMissing: boolean;
+  text: string;
+  via?: string[];
+}
+
 export interface SupabaseQuery {
   table: string;
   operation: QueryOperation;
@@ -83,6 +123,10 @@ export interface SupabaseQuery {
   text: string;
   /** Helper calls between the entry point and the query, e.g. `loadInvoice (packages/invoices/src/server.ts:12)`. */
   via?: string[];
+  /** Set for Supabase Storage calls; `table` is then `storage.objects` and `filters`/`payload` stay empty. */
+  storage?: StorageAccess;
+  /** An earlier read of the same row by the same id value (see QueryGuard). */
+  guard?: QueryGuard;
 }
 
 /** `// auditai:ignore <ruleId|*> -- reason` placed above a handler (or at the top of a file). */
@@ -99,7 +143,22 @@ export type EntryKind = "route" | "server_action" | "page";
 export interface MetadataAccess {
   path: string;
   bucket: "user_metadata" | "app_metadata";
+  /** The property read from the metadata object (`role` in `ctx.user.user_metadata?.role`). */
+  field?: string;
   location: FileRef;
+}
+
+/**
+ * How the caller was authenticated. `session`: a user identity (Supabase auth, an auth library's session,
+ * an auth wrapper); `secret`: a request credential compared with a server secret (cron secret, admin
+ * password, env API key, webhook signature), i.e. an operator or a machine, not a tenant user;
+ * `credential`: a per-account credential looked up by its hash (API keys), which identifies an account.
+ */
+export type AuthCheckKind = "session" | "secret" | "credential";
+
+export interface AuthCheck extends FileRef {
+  /** Absent in models written before 12 September 2026; read it as `session`. */
+  kind?: AuthCheckKind;
 }
 
 export interface RouteHandler {
@@ -111,7 +170,7 @@ export interface RouteHandler {
   entry: string;
   location: FileRef;
   inputs: InputSource[];
-  authChecks: FileRef[];
+  authChecks: AuthCheck[];
   queries: SupabaseQuery[];
   metadataAccesses: MetadataAccess[];
   ignores: IgnoreDirective[];
@@ -128,13 +187,69 @@ export interface PolicyDetail {
   location: FileRef;
 }
 
+/**
+ * One column of a table, as the migrations leave it (CREATE TABLE plus later ALTER TABLE statements).
+ * Enough to seed rows automatically: what to fill, with which type, and which parent row it needs.
+ */
+export interface ColumnInfo {
+  /** Lowercase name, identical to the entry at the same index of `RlsTable.columns`. */
+  name: string;
+  /**
+   * Lowercase canonical type with its modifiers and one `[]` per array dimension: `uuid`, `text`,
+   * `varchar(80)`, `numeric(10,2)`, `integer`, `bigint`, `boolean`, `timestamptz`, `timestamp(3)`,
+   * `jsonb`, `text[]`. Aliases are canonicalized (`character varying` -> `varchar`, `int4` -> `integer`,
+   * `timestamp with time zone` -> `timestamptz`, `serial` -> `integer`). User-defined types (enums)
+   * appear by bare lowercase name without schema, matching the keys of `ProjectModel.enums`.
+   * `unknown` when the definition carries no type.
+   */
+  type: string;
+  /** False for NOT NULL, PRIMARY KEY, serial and identity columns. */
+  nullable: boolean;
+  /** True when an insert may omit the column: DEFAULT <non-null expression>, serial, identity, GENERATED ... STORED. */
+  hasDefault: boolean;
+  /** Foreign-key target. Public tables by bare lowercase name, other schemas qualified (`auth.users`). */
+  references: { table: string; column: string } | null;
+  /** Identifier exactly as Postgres stores it, present only when it differs from `name` (quoted mixed case, e.g. Prisma's `"tenantId"`). */
+  sqlName?: string;
+}
+
+/** A SQL function defined by the migrations, for judging what `supabase.rpc()` can reach. */
+export interface SqlFunctionInfo {
+  /** Lowercase name; the `public` schema is stripped, other schemas stay qualified (`private.fn`). Overloads share one entry. */
+  name: string;
+  securityDefiner: boolean;
+  /**
+   * The body, or a migration function it calls, reads the caller's identity: `auth.uid()`, `auth.jwt()`,
+   * `auth.email()` or `current_setting('request.jwt...')`. `auth.role()` alone is not a caller check.
+   */
+  checksCaller: boolean;
+  /** Roles that can execute it after all GRANT/REVOKE statements (see `sql-functions.ts` for the Supabase defaults assumed). */
+  grantedTo: string[];
+  location: FileRef;
+  /** Lowercase return type (`uuid`, `setof invoices`, `table`, `void`, `trigger`). Trigger functions cannot be called through PostgREST. */
+  returns?: string;
+}
+
+/** A Supabase Storage bucket created by migration SQL (`insert into storage.buckets ...`). */
+export interface StorageBucket {
+  id: string;
+  /** Public buckets serve every object without authorization. False unless the SQL sets a literal true. */
+  public: boolean;
+  location: FileRef;
+}
+
 export interface RlsTable {
+  /** Table key: bare lowercase name in schema public, `schema.table` elsewhere (`storage.objects`). */
   table: string;
   rlsEnabled: boolean;
   /** Policy names, kept for quick counts. */
   policies: string[];
   policyDetails: PolicyDetail[];
   columns: string[];
+  /** Column details, index-aligned with `columns`. Present for tables parsed from migration SQL. */
+  columnInfo?: ColumnInfo[];
+  /** Table name exactly as Postgres stores it, present only when it differs from `table` (quoted mixed case, e.g. Prisma's `"Invoice"`). */
+  sqlName?: string;
   location: FileRef;
 }
 
@@ -158,4 +273,10 @@ export interface ProjectModel {
   /** File-level ignore directives (comment before the first statement), keyed by file. */
   fileIgnores: Record<string, IgnoreDirective[]>;
   warnings: string[];
+  /** Enum types from migration SQL: bare lowercase type name -> labels in declaration order. */
+  enums?: Record<string, string[]>;
+  /** Functions from migration SQL, in definition order. */
+  sqlFunctions?: SqlFunctionInfo[];
+  /** Storage buckets created by migration SQL, in creation order. */
+  storageBuckets?: StorageBucket[];
 }

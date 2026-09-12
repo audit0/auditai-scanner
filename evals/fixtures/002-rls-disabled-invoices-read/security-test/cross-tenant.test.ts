@@ -22,7 +22,7 @@ describe("invoices RLS", () => {
   });
   it("Alice reads her own invoice: ALLOW", async () => expect((await get(alice, SEED.alice.invoiceId)).status).toBe(200));
   it("Alice reads Bob's invoice: DENY", async () => expect((await get(alice, SEED.bob.invoiceId)).status).toBe(404));
-  it("anon key reads nothing through PostgREST directly", async () => {
+  it("anon key reads nothing through PostgREST directly: DENY", async () => {
     const sb = createClient(SUPABASE_URL, ANON_KEY);
     const { data } = await sb.from("invoices").select("id");
     expect(data ?? []).toHaveLength(0);

@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.mass-assignment-from-request-body",
+  "title": "Mass assignment into \"messages\" from the request body",
+  "severity": "high",
+  "minConfidence": 0.85,
+  "entrypoints": ["POST /api/chats/[id]/messages"],
+  "sources": ["route_param:id", "body:messages"],
+  "sinks": ["supabase.insert:public.messages"],
+  "mustMentionFiles": ["vulnerable/app/api/chats/[id]/messages/route.ts"],
+  "mustNotFlag": ["secure/app/api/chats/[id]/messages/route.ts"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "a posted message with pinned: true is stored pinned",
+    "expectedAfter": "the same post is stored unpinned"
+  }
+}
