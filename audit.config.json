@@ -1,0 +1,4 @@
+{
+  "$comment": "evals/fixtures holds deliberately vulnerable demo apps: every rule ships with one app that must fire and a secure twin that must stay silent. Scanning this repository as a project would report those demos as findings, which says nothing about the scanner itself, so they are excluded here. The eval gate scans each fixture directly and is unaffected by this file. No migrations key: this repository has no database of its own.",
+  "ignore": ["evals/**"]
+}

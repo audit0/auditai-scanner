@@ -97,6 +97,10 @@ Project config in `audit.config.json` at the scanned root:
 }
 ```
 
+This repository carries its own `audit.config.json` that excludes `evals/**`: the fixtures are
+deliberately vulnerable demo apps, so scanning the repository as a project would report them as
+findings. The eval gate scans each fixture directly and is not affected by that file.
+
 `publicTables` names tables that are public by design (a catalogue, a blog). A service-role read of
 such a table is still listed, as `suppressed` with the declaration printed next to it, so the choice
 stays visible in every report; writes to the table are never covered by the declaration.
