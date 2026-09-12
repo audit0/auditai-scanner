@@ -94,3 +94,13 @@ Never:
 - remove difficult fixture;
 - weaken security assertion;
 - leak expected answer into model context.
+
+## Real-world labeled sample
+
+Fixtures measure recall on bugs we planted. Precision on code nobody planted is measured separately: a scan over public Next.js + Supabase repositories found through GitHub search, after which a person reads the code behind every finding and gives it one label.
+
+- `real`: an attacker in one tenant or user can reach another's data or a privileged action, or the finding names a control that is genuinely missing (for example a SECURITY DEFINER function that anon can execute).
+- `false_positive`: a control exists that the rule missed (an ownership check in code, RLS enabled through dynamic SQL, a credential check the rule does not recognize), or the data is public by design and the code or policy says so.
+- `unsure`: reading the code cannot settle it; the reason says what is missing.
+
+Precision is `real / (real + false_positive)`, per rule and overall; unsure labels are reported as a share but never enter the figure. The sample is not random (GitHub search), the labels come from reading code rather than running attacks, and a label can be wrong. The repositories, the findings and the labels stay in the private repository: they name third-party projects and some findings may be real vulnerabilities. Only the per-rule counts are published, on https://auditai.sh/stats under "Hand-labeled sample".
