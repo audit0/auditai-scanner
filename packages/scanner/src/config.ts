@@ -5,7 +5,17 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 export interface AuditConfig {
   ignore?: string[];
   migrations?: string[];
+  /**
+   * Tables whose rows are public by design (a catalogue, a price list). Read-only findings of the
+   * unauthenticated-query and policy rules on them are suppressed with the declaration named in
+   * the report (ADR-002). Lowercase bare table names; write paths are never covered.
+   */
+  publicTables?: string[];
 }
+
+/** A declaration longer than this is a mistake, not a catalogue. */
+const MAX_PUBLIC_TABLES = 64;
+const TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface LoadedAuditConfig {
   config: AuditConfig;
@@ -23,7 +33,7 @@ function shown(value: string): string {
   return JSON.stringify(value.length > 120 ? `${value.slice(0, 120)}...` : value);
 }
 
-function errorCode(e: unknown): string {
+export function errorCode(e: unknown): string {
   if (e instanceof Error && "code" in e && typeof e.code === "string") return e.code;
   return e instanceof Error ? e.message : String(e);
 }
@@ -48,13 +58,43 @@ export function loadAuditConfig(root: string): LoadedAuditConfig {
   const obj = raw as Record<string, unknown>;
   const ignore = strings(obj.ignore);
   const migrations = strings(obj.migrations);
+  const publicTables = publicTableNames(obj.publicTables);
   return {
     config: {
       ...(ignore ? { ignore } : {}),
       ...(migrations ? { migrations } : {}),
+      ...(publicTables.tables ? { publicTables: publicTables.tables } : {}),
     },
-    warnings: [],
+    warnings: publicTables.warnings,
   };
+}
+
+/** Validated, lowercased, de-duplicated `publicTables`; anything that is not a bare table name is dropped with a warning. */
+function publicTableNames(value: unknown): { tables?: string[]; warnings: string[] } {
+  const warnings: string[] = [];
+  if (value === undefined) return { warnings };
+  if (!Array.isArray(value)) {
+    return { warnings: ["audit.config.json: publicTables ignored (not an array of table names)"] };
+  }
+  const tables: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !TABLE_NAME.test(entry.trim())) {
+      warnings.push(
+        `audit.config.json: ignored publicTables entry ${shown(String(entry))} (not a table name)`,
+      );
+      continue;
+    }
+    const name = entry.trim().toLowerCase();
+    if (tables.includes(name)) continue;
+    if (tables.length >= MAX_PUBLIC_TABLES) {
+      warnings.push(
+        `audit.config.json: ignored publicTables entry ${shown(entry)} (at most ${MAX_PUBLIC_TABLES} tables)`,
+      );
+      continue;
+    }
+    tables.push(name);
+  }
+  return { tables, warnings };
 }
 
 export function readAuditConfig(root: string): AuditConfig {

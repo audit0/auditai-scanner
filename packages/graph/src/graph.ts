@@ -6,6 +6,7 @@ import type {
   QueryFilter,
   QueryGuard,
   QueryPayload,
+  RoleCheck,
   StorageAccess,
 } from "@auditai/parser";
 
@@ -95,6 +96,8 @@ export interface QueryNodeData {
   storage?: StorageAccess;
   /** An earlier read of the same row by the same id value, in this entry point. */
   guard?: QueryGuard;
+  /** Comparisons of this read's own row made in code, each stopping the entry point. */
+  ownerChecks?: QueryFilter[];
 }
 
 export interface BucketNodeData {
@@ -109,6 +112,8 @@ export interface HandlerNodeData {
   route: string;
   inputs: unknown[];
   metadataAccesses: MetadataAccess[];
+  /** Role/claim predicates of the session that stop the handler (ADR-001). */
+  roleChecks: RoleCheck[];
 }
 
 export interface TableNodeData {
@@ -177,6 +182,7 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
       route: h.route,
       inputs: h.inputs,
       metadataAccesses: h.metadataAccesses,
+      roleChecks: h.roleChecks ?? [],
     };
     const handler = g.addNode({
       id: `handler:${h.location.file}:${h.location.line}`,
@@ -217,6 +223,7 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
         ...(q.via && q.via.length > 0 ? { via: q.via } : {}),
         ...(q.storage ? { storage: q.storage } : {}),
         ...(q.guard ? { guard: q.guard } : {}),
+        ...(q.ownerChecks ? { ownerChecks: q.ownerChecks } : {}),
       };
       const qn = g.addNode({
         // Per handler: the same helper query reached from two entry points carries different

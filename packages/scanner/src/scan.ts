@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import {
   type CoverageSummary,
   type Finding,
@@ -8,9 +9,40 @@ import {
 import { buildGraph } from "@auditai/graph";
 import { checkIgnoreGlobs, type ProjectModel, parseProject } from "@auditai/parser";
 import { defaultRules, runRules } from "@auditai/rules";
-import { loadAuditConfig, repoMigrationDirs } from "./config.js";
+import { errorCode, loadAuditConfig, repoMigrationDirs } from "./config.js";
 
 export { type AuditConfig, readAuditConfig } from "./config.js";
+
+/** Why a scan could not start. `path_not_found`: the path is missing or is not a directory. */
+export type ScanErrorCode = "path_not_found";
+
+/** A scan that never started. `message` is one line, ready for stderr. */
+export class ScanError extends Error {
+  override readonly name = "ScanError";
+  constructor(
+    readonly code: ScanErrorCode,
+    readonly path: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * The scanned path must be a directory. Walking a missing one would otherwise yield an empty model
+ * and an honest-looking "No findings" summary for a project that was never looked at.
+ */
+function ensureDirectory(path: string): void {
+  let isDirectory: boolean;
+  try {
+    isDirectory = statSync(path).isDirectory();
+  } catch (e) {
+    const code = errorCode(e);
+    const why = code === "ENOENT" ? "no such file or directory" : code;
+    throw new ScanError("path_not_found", path, `${path} is not a directory (${why})`);
+  }
+  if (!isDirectory) throw new ScanError("path_not_found", path, `${path} is not a directory`);
+}
 
 export interface ScanOptions {
   now?: string;
@@ -33,6 +65,8 @@ export interface ScanSummary {
   tablesWithRls: number;
   rules: number;
   warnings: string[];
+  /** Tables the repository's audit.config.json declares public (ADR-002); always shown in the report. */
+  publicTables: string[];
 }
 
 export interface ScanResult {
@@ -43,7 +77,11 @@ export interface ScanResult {
   blocking: boolean;
 }
 
-export function summarize(model: ProjectModel, rules: number): ScanSummary {
+export function summarize(
+  model: ProjectModel,
+  rules: number,
+  publicTables: readonly string[] = [],
+): ScanSummary {
   // RLS coverage counts the Data API tables only: keys of other schemas are qualified
   // (`storage.objects`) and their RLS is managed by Supabase, not by the project's migrations.
   const apiTables = model.tables.filter((t) => !t.table.includes("."));
@@ -56,11 +94,16 @@ export function summarize(model: ProjectModel, rules: number): ScanSummary {
     tablesWithRls: apiTables.filter((t) => t.rlsEnabled).length,
     rules,
     warnings: model.warnings,
+    publicTables: [...publicTables],
   };
 }
 
-/** Deterministic pipeline: parse -> graph -> rules -> coverage. No model calls, no network. */
+/**
+ * Deterministic pipeline: parse -> graph -> rules -> coverage. No model calls, no network.
+ * Throws ScanError (`path_not_found`) when `path` is not a directory.
+ */
 export function runScan(path: string, opts: ScanOptions = {}): ScanResult {
+  ensureDirectory(path);
   const cfg = loadAuditConfig(path);
   // The repository names its own migration folders, but only inside itself; the caller's are trusted.
   const repoDirs = repoMigrationDirs(path, cfg.config.migrations ?? []);
@@ -71,10 +114,13 @@ export function runScan(path: string, opts: ScanOptions = {}): ScanResult {
     ...(ignore.globs.length > 0 ? { ignore: ignore.globs } : {}),
   });
   const graph = buildGraph(model);
-  const runOpts = opts.now === undefined ? {} : { now: opts.now };
+  // The repository's own declaration of public tables: untrusted, validated in loadAuditConfig,
+  // always echoed in the summary so a reviewer sees what it silenced.
+  const publicTables = cfg.config.publicTables ?? [];
+  const runOpts = { ...(opts.now === undefined ? {} : { now: opts.now }), publicTables };
   const findings = runRules(defaultRules, model, graph, runOpts);
   const coverage = summarizeCoverage(findings);
-  const summary = summarize(model, defaultRules.length);
+  const summary = summarize(model, defaultRules.length, publicTables);
   return {
     summary: {
       ...summary,

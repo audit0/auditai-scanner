@@ -1,4 +1,4 @@
-import type { Evidence, Finding } from "@auditai/core";
+import type { Evidence, Finding, Severity } from "@auditai/core";
 import type {
   ClientNodeData,
   GraphNode,
@@ -6,7 +6,14 @@ import type {
   QueryNodeData,
   TableNodeData,
 } from "@auditai/graph";
-import type { FileRef, InputSource, QueryFilter, QueryGuard } from "@auditai/parser";
+import type {
+  FileRef,
+  InputSource,
+  PolicyDetail,
+  QueryFilter,
+  QueryGuard,
+  RoleCheck,
+} from "@auditai/parser";
 import type { Rule, RuleContext } from "../rule.js";
 import { callerCheckingFunctions, callsFunctionIn } from "./sql-functions.js";
 
@@ -76,6 +83,8 @@ interface HandlerView {
    * caller-owned row to scope to.
    */
   operatorOnly: boolean;
+  /** Role/claim predicates of the session that stop the handler (ADR-001). */
+  roleChecks: RoleCheck[];
 }
 
 /** Kinds of the auth checks behind a handler (`session` for checks recorded without a kind). */
@@ -104,6 +113,7 @@ function handlerViews(ctx: RuleContext): HandlerView[] {
       inputs: (data.inputs as InputSource[] | undefined) ?? [],
       authenticated: kinds.length > 0,
       operatorOnly: kinds.length > 0 && kinds.every((k) => k === "secret"),
+      roleChecks: data.roleChecks ?? [],
     };
   });
 }
@@ -147,12 +157,12 @@ type Partial = Omit<
   "id" | "ruleId" | "status" | "severity" | "confidence" | "cwe" | "createdAt" | "updatedAt"
 >;
 
-function finding(ctx: RuleContext, rule: Rule, partial: Partial): Finding {
+function finding(ctx: RuleContext, rule: Rule, partial: Partial, severity?: Severity): Finding {
   return {
     id: ctx.nextId(),
     ruleId: rule.id,
     status: "likely",
-    severity: rule.severity,
+    severity: severity ?? rule.severity,
     confidence: rule.confidence,
     cwe: rule.cwe,
     createdAt: ctx.now,
@@ -162,9 +172,76 @@ function finding(ctx: RuleContext, rule: Rule, partial: Partial): Finding {
 }
 
 /**
- * Does an earlier read of the same row tie it to the caller? Either RLS was in force for that read
- * (a user-scoped client on a table whose select policies all scope to the caller), or the read itself
- * filtered by a scope column with a value the caller does not control (`account_id = ctx.accountId`).
+ * A select policy that lets the anon role read every row: `for select using (true)` with no `to`
+ * clause (every role), or one naming anon/public. A service-role read of such a table in a public
+ * handler leaks nothing beyond what the anon key already returns (ADR-002, evidence path).
+ */
+export function anonReadPolicy(t: TableNodeData | undefined): PolicyDetail | undefined {
+  if (!t?.known || !t.rlsEnabled) return undefined;
+  return t.policyDetails.find(
+    (p) =>
+      (p.command === "select" || p.command === "all") &&
+      (p.using ?? "").replace(/[\s()]/g, "").toLowerCase() === "true" &&
+      (p.roles.length === 0 || p.roles.some((r) => r === "anon" || r === "public")),
+  );
+}
+
+function publicReadNote(p: PolicyDetail, table: string): string {
+  return ` public.${table} is readable by the anon role through RLS policy "${p.name}" (${p.location.file}:${p.location.line}), so this read leaks nothing beyond what the anon key already returns; the repository may not have intended that policy, so the finding stays at medium.`;
+}
+
+/**
+ * ADR-001: a single-tenant admin console. The handler is gated by a role or claim of the session
+ * (never user_metadata) and the table has no tenant or owner column, so the row is shared site
+ * content rather than a tenant's. Never for a cross-tenant table, never without a role predicate.
+ */
+function adminOnly(
+  ctx: RuleContext,
+  h: HandlerView,
+  t: TableNodeData | undefined,
+): RoleCheck | undefined {
+  const check = h.roleChecks[0];
+  if (!check || !t?.known || !singleTenantTable(ctx, t.table)) return undefined;
+  return check;
+}
+
+/**
+ * No tenant or owner column on the table, and none on a table it belongs to through a required
+ * foreign key (`broadcast_recipients.broadcast_id not null -> broadcasts.account_id` is a tenant's
+ * row one hop away). An optional reference (`suggestions.revision_id -> revisions.created_by`)
+ * links rows, it does not own them.
+ */
+function singleTenantTable(ctx: RuleContext, table: string): boolean {
+  const info = ctx.model.tables.find((x) => x.table === table.toLowerCase());
+  if (!info || info.columns.some((c) => isScopeColumn(c))) return false;
+  for (const col of info.columnInfo ?? []) {
+    if (!col.references || col.nullable) continue;
+    const parent = ctx.model.tables.find((x) => x.table === col.references?.table);
+    if (parent?.columns.some((c) => isScopeColumn(c))) return false;
+  }
+  return true;
+}
+
+function adminOnlyNote(check: RoleCheck, table: string): string {
+  return ` Admin-only: the handler stops unless ${check.source} passes the role check at ${check.file}:${check.line} (${check.text}), and public.${table} has no tenant or owner column, so the row is shared site content rather than a tenant's; verify the admin check cannot be self-granted.`;
+}
+
+/** The table node of the graph for a table name, when some query targets it. */
+function tableDataOf(ctx: RuleContext, table: string): TableNodeData | undefined {
+  return ctx.graph.nodes.get(`table:${table}`)?.data as TableNodeData | undefined;
+}
+
+/** A comparison in code that ties the row to the caller: `row.user_id !== user.id` with an exit. */
+function callerCheck(checks: readonly QueryFilter[] | undefined): QueryFilter | undefined {
+  return checks?.find((c) => isScopeColumn(c.column) && !c.inputDerived);
+}
+
+/**
+ * Does an earlier read of the same row (or of its parent row) tie it to the caller? Either the read
+ * filtered by a scope column with a value the caller does not control (`account_id = ctx.accountId`),
+ * the row's owner column was compared with the caller in code before continuing
+ * (`existing.user_id !== user.id` -> 404), or RLS was in force for that read (a user-scoped client on
+ * a table whose select policies all scope to the caller).
  */
 function guardTiesRowToCaller(
   guard: QueryGuard,
@@ -176,6 +253,14 @@ function guardTiesRowToCaller(
     return {
       tied: true,
       how: `filtered by ${callerFilter.column} = ${callerFilter.valueText}`,
+      why: "",
+    };
+  }
+  const compared = callerCheck(guard.checks);
+  if (compared) {
+    return {
+      tied: true,
+      how: `its ${compared.column} compared with ${compared.valueText} in code, stopping otherwise`,
       why: "",
     };
   }
@@ -234,18 +319,33 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
         const filters: QueryFilter[] = q.filters;
         const idFilter = filters.find((f) => f.inputDerived && isObjectIdColumn(f.column));
         if (!idFilter || filters.some((f) => isScopeColumn(f.column))) continue;
-        // Ownership can be checked by an earlier read of the same row rather than by this query's filters.
+        // A read whose own row is compared with the caller before anything continues is the
+        // ownership check itself (`existing.user_id !== user.id` -> 404).
+        if (q.operation === "select" && callerCheck(q.ownerChecks)) continue;
+        // Ownership can be checked by an earlier read of the same row, or of its parent row, rather
+        // than by this query's filters.
         const guard = q.guard;
-        const tied = guard ? guardTiesRowToCaller(guard, v.tableData, callerFns) : null;
+        const guardTable = guard?.parent ? tableDataOf(ctx, guard.table) : v.tableData;
+        const tied = guard ? guardTiesRowToCaller(guard, guardTable, callerFns) : null;
         if (guard && tied?.tied && guard.exitsWhenMissing) continue;
+        const guardWhat = guard?.parent
+          ? `the parent row ${guard.parent.table}.${guard.parent.column} (${q.table}.${guard.column} refers to it by ${guard.parent.how})`
+          : `the same "${guard?.column}"`;
         const guardNote =
           guard && tied && (tied.tied || guard.client === "user_scoped")
-            ? ` An earlier read of the same "${guard.column}" at ${guard.location.file}:${guard.location.line} (${tied.how}) could be an ownership check, but ${tied.tied ? "the entry point does not stop when it finds no row" : tied.why}.`
+            ? ` An earlier read of ${guardWhat} at ${guard.location.file}:${guard.location.line} (${tied.how}) could be an ownership check, but ${tied.tied ? "the entry point does not stop when it finds no row" : tied.why}.`
             : "";
         const tableName = v.tableData?.table ?? q.table;
         const authNote = h.authenticated
           ? "The handler authenticates the caller but never checks that the row belongs to them."
           : "The handler does not authenticate the caller at all.";
+        // ADR-001 and the ADR-002 evidence path lower the impact, never hide the finding.
+        const admin = adminOnly(ctx, h, v.tableData);
+        const anonPolicy = q.operation === "select" ? anonReadPolicy(v.tableData) : undefined;
+        const downgrade = admin || anonPolicy ? "medium" : undefined;
+        const downgradeNote =
+          (admin ? adminOnlyNote(admin, tableName) : "") +
+          (anonPolicy ? publicReadNote(anonPolicy, tableName) : "");
         const path = [
           h.data.kind === "server_action" ? "Server action call" : "HTTP request",
           h.data.entry,
@@ -259,26 +359,40 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
         const evidence: Evidence[] = [
           {
             kind: "rule",
-            summary: `${q.operation} on public.${tableName} filtered by user-controlled "${idFilter.column}" through a ${clientNoun(v.clientData)}, with no tenant/owner scoping. ${authNote} ${rlsNote(v.tableData, tableName, v.clientData?.kind)}${viaNote(q)}${guardNote}`,
-            locations: locations(h.handler.location, v.query.location, v.client?.location),
+            summary: `${q.operation} on public.${tableName} filtered by user-controlled "${idFilter.column}" through a ${clientNoun(v.clientData)}, with no tenant/owner scoping. ${authNote} ${rlsNote(v.tableData, tableName, v.clientData?.kind)}${viaNote(q)}${guardNote}${downgradeNote}`,
+            locations: locations(
+              h.handler.location,
+              v.query.location,
+              v.client?.location,
+              admin ? { file: admin.file, line: admin.line } : undefined,
+              anonPolicy?.location,
+            ),
             data: {
               deterministic: false,
               ruleId: this.id,
               authenticated: h.authenticated,
               query: q.text,
+              ...(admin ? { adminOnly: true, roleCheck: admin.source } : {}),
+              ...(anonPolicy ? { anonReadPolicy: anonPolicy.name } : {}),
             },
           },
           { kind: "trace", summary: path.join(" -> ") },
         ];
+        const who = admin ? "Admin-only" : h.authenticated ? "Cross-tenant" : "Unauthenticated";
         out.push(
-          finding(ctx, this, {
-            title: `${h.authenticated ? "Cross-tenant" : "Unauthenticated"} ${q.operation} on "${tableName}" via ${clientNoun(v.clientData)}`,
-            entrypoints: [h.data.entry],
-            sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
-            sinks: [`supabase.${q.operation}:public.${tableName}`],
-            path,
-            evidence,
-          }),
+          finding(
+            ctx,
+            this,
+            {
+              title: `${who} ${q.operation} on "${tableName}" via ${clientNoun(v.clientData)}${admin ? " (verify the admin check)" : ""}`,
+              entrypoints: [h.data.entry],
+              sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
+              sinks: [`supabase.${q.operation}:public.${tableName}`],
+              path,
+              evidence,
+            },
+            downgrade,
+          ),
         );
       }
     }
@@ -427,7 +541,13 @@ export const rlsPolicyWithoutCallerPredicate: Rule = {
             ],
             summary: `Policy "${p.name}" for ${p.command} on public.${t.table} uses (${expr}). The table has a scope column (${t.columns.filter(isScopeColumn).join(", ")}) but the policy never compares it to auth.uid() or the caller's tenant, so RLS lets every ${p.roles.join("/") || "authenticated"} user through.`,
             title: `RLS policy "${p.name}" on "${t.table}" does not scope rows to the caller`,
-            data: { deterministic: false, ruleId: this.id, policy: p.name },
+            data: {
+              deterministic: false,
+              ruleId: this.id,
+              policy: p.name,
+              command: p.command,
+              table: t.table,
+            },
             tail: locations(p.location),
           }));
           addReach(g, h, v, `supabase.${op}:public.${t.table}`);
@@ -612,6 +732,19 @@ export const serviceRoleQueryWithoutAuthentication: Rule = {
       const v = views[0];
       if (!v) continue;
       const tables = [...new Set(views.map((x) => x.tableData?.table ?? x.data.table))];
+      // ADR-002 evidence path: every query is a read of a table anon can already read in full.
+      const anonPolicies = views.map((x) =>
+        x.data.operation === "select" ? anonReadPolicy(x.tableData) : undefined,
+      );
+      const allPublicReads = anonPolicies.every((x) => x !== undefined);
+      const publicNote = allPublicReads
+        ? views
+            .map((x, i) => {
+              const pol = anonPolicies[i];
+              return pol ? publicReadNote(pol, x.tableData?.table ?? x.data.table) : "";
+            })
+            .join("")
+        : "";
       const path = [
         h.data.kind === "server_action" ? "Server action call" : "HTTP request",
         h.data.entry,
@@ -620,24 +753,39 @@ export const serviceRoleQueryWithoutAuthentication: Rule = {
         `public.${tables.join(", public.")}`,
       ];
       out.push(
-        finding(ctx, this, {
-          title: `Unauthenticated ${views.some((v) => v.clientData?.kind === "direct_db") ? "database" : "service-role"} access to "${tables.join('", "')}" in ${h.data.entry}`,
-          entrypoints: [h.data.entry],
-          sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
-          sinks: views.map(
-            (x) => `supabase.${x.data.operation}:public.${x.tableData?.table ?? x.data.table}`,
-          ),
-          path,
-          evidence: [
-            {
-              kind: "rule",
-              summary: `${h.data.entry} runs ${views.length} privileged quer${views.length === 1 ? "y" : "ies"} (${tables.join(", ")}; RLS does not protect them) and establishes no caller: no auth.getUser/getSession/getClaims call, no session from an auth library, no auth helper, no comparison of a request credential with a server secret (cron secret, API key, signature) and no API-key lookup was found, directly or in the helpers it calls.`,
-              locations: locations(h.handler.location, ...views.map((x) => x.query.location)),
-              data: { deterministic: false, ruleId: this.id },
-            },
-            { kind: "trace", summary: path.join(" -> ") },
-          ],
-        }),
+        finding(
+          ctx,
+          this,
+          {
+            title: `Unauthenticated ${views.some((v) => v.clientData?.kind === "direct_db") ? "database" : "service-role"} access to "${tables.join('", "')}" in ${h.data.entry}`,
+            entrypoints: [h.data.entry],
+            sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
+            sinks: views.map(
+              (x) => `supabase.${x.data.operation}:public.${x.tableData?.table ?? x.data.table}`,
+            ),
+            path,
+            evidence: [
+              {
+                kind: "rule",
+                summary: `${h.data.entry} runs ${views.length} privileged quer${views.length === 1 ? "y" : "ies"} (${tables.join(", ")}; RLS does not protect them) and establishes no caller: no auth.getUser/getSession/getClaims call, no session from an auth library, no auth helper, no comparison of a request credential with a server secret (cron secret, API key, signature) and no API-key lookup was found, directly or in the helpers it calls.${publicNote}`,
+                locations: locations(
+                  h.handler.location,
+                  ...views.map((x) => x.query.location),
+                  ...anonPolicies.map((x) => x?.location),
+                ),
+                data: {
+                  deterministic: false,
+                  ruleId: this.id,
+                  ...(allPublicReads
+                    ? { anonReadPolicies: anonPolicies.map((x) => x?.name ?? "") }
+                    : {}),
+                },
+              },
+              { kind: "trace", summary: path.join(" -> ") },
+            ],
+          },
+          allPublicReads ? "medium" : undefined,
+        ),
       );
     }
     return out;

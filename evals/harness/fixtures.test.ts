@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Finding } from "@auditai/core";
 import { runScan } from "@auditai/scanner";
 import { describe, expect, it } from "vitest";
 
@@ -14,14 +15,23 @@ interface Expected {
   ruleId: string;
   severity: string;
   minConfidence: number;
+  /** Every entry point listed must be flagged by the rule (a fixture may hold several routes). */
   entrypoints: string[];
   mustMentionFiles: string[];
   mustNotFlag: string[];
+  /**
+   * When set, the secure variant still produces a finding of the rule, but suppressed with a reason
+   * containing this text (a declaration in audit.config.json, shown in the report). Suppressed
+   * findings never block and are the only ones the secure variant may carry.
+   */
+  secureSuppressedReason?: string;
 }
 
 const fixtures = readdirSync(FIXTURES).filter((d) =>
   existsSync(join(FIXTURES, d, "expected-finding.json")),
 );
+
+const reported = (f: Finding): boolean => f.status !== "suppressed";
 
 describe.each(fixtures)("fixture %s", (name) => {
   const expected = JSON.parse(
@@ -32,12 +42,24 @@ describe.each(fixtures)("fixture %s", (name) => {
     const r = runScan(join(FIXTURES, name, "vulnerable"), {
       sqlDirs: [join(FIXTURES, name, "supabase")],
     });
-    const hit = r.findings.find((f) => f.ruleId === expected.ruleId);
-    expect(hit, `expected rule ${expected.ruleId} to fire`).toBeDefined();
-    expect(hit?.severity).toBe(expected.severity);
-    expect(hit?.confidence ?? 0).toBeGreaterThanOrEqual(expected.minConfidence);
-    for (const entry of expected.entrypoints) expect(hit?.entrypoints).toContain(entry);
-    const mentioned = new Set(hit?.evidence.flatMap((e) => e.locations?.map((l) => l.file) ?? []));
+    const hits = r.findings.filter((f) => f.ruleId === expected.ruleId && reported(f));
+    expect(hits.length, `expected rule ${expected.ruleId} to fire`).toBeGreaterThan(0);
+    const strong = hits.filter(
+      (h) => h.severity === expected.severity && h.confidence >= expected.minConfidence,
+    );
+    expect(
+      strong.length,
+      `expected a ${expected.severity} finding with confidence >= ${expected.minConfidence}`,
+    ).toBeGreaterThan(0);
+    for (const entry of expected.entrypoints) {
+      expect(
+        strong.some((h) => h.entrypoints.includes(entry)),
+        `entry point ${entry} must be flagged`,
+      ).toBe(true);
+    }
+    const mentioned = new Set(
+      strong.flatMap((h) => h.evidence.flatMap((e) => e.locations?.map((l) => l.file) ?? [])),
+    );
     for (const file of expected.mustMentionFiles) {
       expect([...mentioned], `must mention ${file}`).toContain(file.replace(/^vulnerable\//, ""));
     }
@@ -47,8 +69,18 @@ describe.each(fixtures)("fixture %s", (name) => {
     const r = runScan(join(FIXTURES, name, "secure"), {
       sqlDirs: [join(FIXTURES, name, "supabase")],
     });
-    expect(r.findings.filter((f) => f.ruleId === expected.ruleId)).toEqual([]);
+    const ofRule = r.findings.filter((f) => f.ruleId === expected.ruleId);
+    expect(ofRule.filter(reported)).toEqual([]);
     expect(r.blocking).toBe(false);
+    if (expected.secureSuppressedReason !== undefined) {
+      const reason = expected.secureSuppressedReason;
+      expect(
+        ofRule.some((f) => f.evidence.some((e) => e.summary.includes(reason))),
+        `secure variant must carry a suppressed finding mentioning "${reason}"`,
+      ).toBe(true);
+    } else {
+      expect(ofRule).toEqual([]);
+    }
   });
 });
 

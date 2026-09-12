@@ -1,0 +1,12 @@
+{
+  "ruleId": "supabase.table-without-rls",
+  "title": "Table \"notes\" is exposed without RLS",
+  "severity": "high",
+  "minConfidence": 0.9,
+  "entrypoints": ["GET /api/notes/[id]"],
+  "sources": ["route_param:id"],
+  "sinks": ["supabase.select:public.notes"],
+  "mustMentionFiles": ["vulnerable/app/api/notes/[id]/route.ts", "vulnerable/supabase/migrations/0001_init.sql"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": { "strategy": "identity-matrix", "expectedBefore": "HTTP 200", "expectedAfter": "HTTP 404" }
+}

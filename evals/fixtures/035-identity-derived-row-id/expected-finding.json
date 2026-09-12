@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.service-role-object-access-without-tenant-scope",
+  "title": "Cross-tenant select on \"api_keys\" via service-role client",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": ["GET /api/v1/me"],
+  "sources": ["query:keyId"],
+  "sinks": ["supabase.select:public.api_keys"],
+  "mustMentionFiles": ["vulnerable/app/api/v1/me/route.ts", "vulnerable/lib/supabase.ts"],
+  "mustNotFlag": ["secure/app/api/v1/me/route.ts", "secure/lib/api-keys.ts"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200 with the other tenant's key row",
+    "expectedAfter": "the caller's own key row only; the query-string id is ignored"
+  }
+}

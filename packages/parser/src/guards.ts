@@ -1,5 +1,5 @@
 import ts from "typescript";
-import { boundNames, enclosingFunction, identifiersIn, unwrap, walkOwn } from "./ast.js";
+import { boundNames, enclosingFunction, identifiersIn, unwrap, walk, walkOwn } from "./ast.js";
 import { exitKind } from "./auth-evidence.js";
 
 /**
@@ -11,7 +11,7 @@ import { exitKind } from "./auth-evidence.js";
 export type ExitKind = "throw" | "return";
 
 /** Walks up from an expression through `await`, parentheses, casts and `!`. */
-function outerOf(node: ts.Node): { node: ts.Node; parent: ts.Node | undefined } {
+export function outerOf(node: ts.Node): { node: ts.Node; parent: ts.Node | undefined } {
   let cur: ts.Node = node;
   let parent = cur.parent;
   while (
@@ -137,6 +137,51 @@ export function missingRowExit(
     if (kind) return kind;
   }
   return null;
+}
+
+export interface RowComparison {
+  /** The row's property compared (`user_id` in `existing.user_id !== user.id`). */
+  column: string;
+  /** The other operand. */
+  value: ts.Expression;
+  exit: ExitKind;
+}
+
+const INEQUALITY = new Set([
+  ts.SyntaxKind.ExclamationEqualsEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsToken,
+]);
+
+/**
+ * Ownership checked in code after a read: `if (!existing || existing.user_id !== user.id) return 404`,
+ * `if (scoutError || !scout || scout.user_id !== user.id) return 403`. Every `!==` whose one side is
+ * a property of the row, inside an `if` that returns or throws.
+ */
+export function rowComparisons(tail: ts.CallExpression): RowComparison[] {
+  const { parent } = outerOf(tail);
+  if (!parent || !ts.isVariableDeclaration(parent)) return [];
+  const { data } = resultNames(parent.name);
+  const out: RowComparison[] = [];
+  for (const s of ifsAfter(parent)) {
+    const exit = exitKind(s.thenStatement);
+    if (!exit) continue;
+    walk(s.expression, (n) => {
+      if (!ts.isBinaryExpression(n) || !INEQUALITY.has(n.operatorToken.kind)) return undefined;
+      for (const [a, b] of [
+        [n.left, n.right],
+        [n.right, n.left],
+      ] as const) {
+        const ua = unwrap(a);
+        if (!ts.isPropertyAccessExpression(ua)) continue;
+        const r = rootName(ua.expression);
+        if (r === null || !data.has(r)) continue;
+        out.push({ column: ua.name.text, value: b, exit });
+        break;
+      }
+      return undefined;
+    });
+  }
+  return out;
 }
 
 /**

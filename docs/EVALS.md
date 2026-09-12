@@ -104,3 +104,5 @@ Fixtures measure recall on bugs we planted. Precision on code nobody planted is 
 - `unsure`: reading the code cannot settle it; the reason says what is missing.
 
 Precision is `real / (real + false_positive)`, per rule and overall; unsure labels are reported as a share but never enter the figure. The sample is not random (GitHub search), the labels come from reading code rather than running attacks, and a label can be wrong. The repositories, the findings and the labels stay in the private repository: they name third-party projects and some findings may be real vulnerabilities. Only the per-rule counts are published, on https://auditai.sh/stats under "Hand-labeled sample".
+
+When the scanner changes, the labels stay fixed and the published figures cover only the labeled findings the new build still reports (`node evals/realworld/summarize.mjs --results <dir> --commit <sha> --date <day>`); the sample records the results directory it is based on, and a finding labeled real must never disappear. Because those fixes were made while looking at the labels, such a figure is not a blind measurement; a fresh, unlabeled sample is required for that.

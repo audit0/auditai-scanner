@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import ts from "typescript";
 import {
   boundNames,
+  type ChainSegment,
   type ClassInfo,
   collect,
   enclosingStatement,
@@ -10,7 +11,9 @@ import {
   type FunctionLike,
   flattenChain,
   isChainTail,
+  isFunctionLikeNode,
   lineOf,
+  ownReturns,
   parseIgnoreDirectives,
   parseSource,
   stringLiteralValue,
@@ -19,7 +22,13 @@ import {
 } from "./ast.js";
 import { isCredentialColumn, isSessionProviderImport, secretChecksIn } from "./auth-evidence.js";
 import { discoverFiles } from "./discover.js";
-import { callResultChecked, compareOrder, missingRowExit } from "./guards.js";
+import {
+  callResultChecked,
+  compareOrder,
+  missingRowExit,
+  outerOf,
+  rowComparisons,
+} from "./guards.js";
 import type {
   AuthCheck,
   AuthHelper,
@@ -34,9 +43,11 @@ import type {
   MetadataAccess,
   ProjectModel,
   QueryFilter,
+  QueryGuard,
   QueryOperation,
   QueryPayload,
   RlsTable,
+  RoleCheck,
   RouteHandler,
   SecretExposure,
   SupabaseQuery,
@@ -64,6 +75,7 @@ import {
 } from "./orm.js";
 import { Resolver } from "./resolve.js";
 import { parseSqlForRls, sqlSchemaFor } from "./rls.js";
+import { roleGatesIn, sessionNamesIn } from "./role-gates.js";
 import {
   bucketName,
   CallerScope,
@@ -160,6 +172,10 @@ interface Project {
   drizzleTablesByExport: Map<string, string>;
   /** Prisma model accessor (`prisma.invoice`) -> table. */
   prismaModels: Map<string, string>;
+  /** Memo of returnTaint by helper and bindings; null marks a helper being analysed (recursion). */
+  returnTaints: Map<string, ReturnTaint | null>;
+  /** Tables from the migrations, for foreign keys between a guard read and the row it guards. */
+  tables: ReadonlyMap<string, RlsTable>;
   warnings: string[];
 }
 
@@ -200,11 +216,14 @@ interface GuardableRead {
   order: number[];
   /** A missing row stops the entry point. */
   exits: boolean;
+  /** Comparisons of the row in code that stop the entry point (`existing.user_id !== user.id`). */
+  checks: QueryFilter[];
 }
 
 interface Acc {
   inputs: InputSource[];
   authChecks: AuthCheck[];
+  roleChecks: RoleCheck[];
   queries: SupabaseQuery[];
   metadataAccesses: MetadataAccess[];
   visited: Set<string>;
@@ -796,7 +815,13 @@ function callTarget(
 // ---------------------------------------------------------------------------------------------
 // Frame analysis.
 
-function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
+/**
+ * Declarations of one function in source order: request inputs (handler only), client bindings,
+ * service instances and taint propagation into locals. Runs for the entry point and for every
+ * helper frame, and again on a callee when a caller needs to know what its result carries
+ * (see returnTaint).
+ */
+function bindDeclarations(p: Project, frame: Frame, acc: Acc): void {
   const { rel, sf, fn } = frame;
   const scope = scopeOf(p, frame.facts);
   const loc = (n: ts.Node): FileRef => ({ file: rel, line: lineOf(sf, n) });
@@ -879,7 +904,16 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       if (returnsIdentity(p, init, scope)) continue;
       const args = init.arguments.map((a) => argBinding(p, a, frame));
       if (args.some((a) => a.tainted || a.isRequest) || receiverTainted(frame, init)) {
-        bindInput(names, isWholeInput(init, wholeContext(frame)));
+        // A helper of this repository returns what its body shows: rows of a query, identity, or
+        // an object whose tainted properties are known. Anything unresolved returns its input.
+        const rt = returnTaint(p, init, frame, scope, 0);
+        if (rt === null || (rt.tainted && rt.props === null)) {
+          bindInput(names, isWholeInput(init, wholeContext(frame)));
+        } else if (rt.tainted && rt.props !== null) {
+          if (ts.isIdentifier(decl.name))
+            frame.partialInputs.set(decl.name.text, new Set(rt.props));
+          else bindPatternFrom(frame, decl.name, rt.props);
+        }
       }
     } else if (isPrismaNew(init) && ts.isIdentifier(decl.name)) {
       frame.clients.set(decl.name.text, {
@@ -931,6 +965,15 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       return undefined;
     });
   }
+}
+
+function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
+  const { rel, sf, fn } = frame;
+  const scope = scopeOf(p, frame.facts);
+  const loc = (n: ts.Node): FileRef => ({ file: rel, line: lineOf(sf, n) });
+  const body: ts.Node = fn.body ?? fn;
+
+  bindDeclarations(p, frame, acc);
 
   // `db.transaction(async (tx) => …)` / `prisma.$transaction(async (tx) => …)`: the callback's client is the outer one.
   for (const call of collect(body, ts.isCallExpression)) {
@@ -948,14 +991,20 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
   }
 
   // Auth checks.
+  const isSessionCall = (call: ts.CallExpression): boolean =>
+    /\.auth\.(getUser|getSession|getClaims)$/.test(call.expression.getText(sf)) ||
+    symOfCallee(p, call.expression, scope)?.kind === "auth";
   for (const call of collect(body, ts.isCallExpression)) {
-    const calleeText = call.expression.getText(sf);
-    if (
-      /\.auth\.(getUser|getSession|getClaims)$/.test(calleeText) ||
-      symOfCallee(p, call.expression, scope)?.kind === "auth"
-    ) {
-      acc.authChecks.push({ ...loc(call), kind: "session" });
-    }
+    if (isSessionCall(call)) acc.authChecks.push({ ...loc(call), kind: "session" });
+  }
+  // Role gates (ADR-001): `if (!isAdminEmail(user.email)) return 401` on a session binding.
+  for (const gate of roleGatesIn(body, sessionNamesIn(body, isSessionCall))) {
+    if (gate.exit === "return" && !frame.exitPropagates) continue;
+    acc.roleChecks.push({
+      ...loc(gate.node),
+      source: gate.source,
+      text: gate.node.expression.getText(sf).replace(/\s+/g, " ").slice(0, 160),
+    });
   }
   // A request credential compared with (or verified by) a server secret, deciding the request's fate.
   for (const check of secretChecksIn(fn, sf)) {
@@ -1072,6 +1121,52 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     if (frame.via.length > 0) query.via = frame.via;
     acc.queries.push(query);
   };
+  const supabaseFilters = (segments: readonly ChainSegment[]): QueryFilter[] => {
+    const filters: QueryFilter[] = [];
+    for (const s of segments) {
+      if (!FILTER_METHODS.has(s.name)) continue;
+      const firstArg = s.args[0];
+      if (s.name === "match" && firstArg && ts.isObjectLiteralExpression(firstArg)) {
+        for (const pr of firstArg.properties) {
+          if (ts.isPropertyAssignment(pr)) {
+            const f: QueryFilter = {
+              method: "match",
+              column: pr.name.getText(sf).replace(/['"]/g, ""),
+              valueText: pr.initializer.getText(sf),
+              inputDerived: derivedIn(frame, pr.initializer),
+            };
+            filters.push(valued(f, pr.initializer));
+          }
+        }
+        continue;
+      }
+      const val = s.args[1];
+      const f: QueryFilter = {
+        method: s.name,
+        column: stringLiteralValue(firstArg),
+        valueText: val ? val.getText(sf) : "",
+        inputDerived: val ? derivedIn(frame, val) : false,
+      };
+      filters.push(valued(f, val));
+    }
+    return filters;
+  };
+  // Query builders: `let q = admin.from("t").select().eq("id", id); if (!isAdmin) q = q.eq("user_id", user.id)`.
+  const builders = new Map<string, SupabaseQuery>();
+  const bindBuilder = (tail: ts.CallExpression, query: SupabaseQuery): void => {
+    const { node, parent } = outerOf(tail);
+    if (parent && ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
+      builders.set(parent.name.text, query);
+    } else if (
+      parent &&
+      ts.isBinaryExpression(parent) &&
+      parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      parent.right === node &&
+      ts.isIdentifier(parent.left)
+    ) {
+      builders.set(parent.left.text, query);
+    }
+  };
   for (const call of collect(body, ts.isCallExpression)) {
     if (!isChainTail(call)) continue;
     const chain = flattenChain(call);
@@ -1082,6 +1177,20 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       continue;
     }
     const root = unwrap(chain.root);
+    const builder = ts.isIdentifier(root) ? builders.get(root.text) : undefined;
+    if (builder) {
+      // Filters added to a saved builder belong to its query. One added under an `if` counts only
+      // when the caller cannot steer the condition: `if (!isAdmin(user))` yes, `if (!body.all)` no.
+      const condition = enclosingCondition(call, body);
+      if (!condition || !derivedIn(frame, condition)) {
+        const note = condition ? ` (when ${condition.getText(sf).replace(/\s+/g, " ")})` : "";
+        for (const f of supabaseFilters(chain.segments)) {
+          builder.filters.push(note ? { ...f, valueText: `${f.valueText}${note}` } : f);
+        }
+      }
+      bindBuilder(call, builder);
+      continue;
+    }
     const first = chain.segments[0];
     const fromIdx = chain.segments.findIndex((s) => s.name === "from");
     const rpcIdx = chain.segments.findIndex((s) => s.name === "rpc");
@@ -1110,33 +1219,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
           break;
         }
       }
-      const filters: QueryFilter[] = [];
-      for (const s of after) {
-        if (!FILTER_METHODS.has(s.name)) continue;
-        const firstArg = s.args[0];
-        if (s.name === "match" && firstArg && ts.isObjectLiteralExpression(firstArg)) {
-          for (const pr of firstArg.properties) {
-            if (ts.isPropertyAssignment(pr)) {
-              const f: QueryFilter = {
-                method: "match",
-                column: pr.name.getText(sf).replace(/['"]/g, ""),
-                valueText: pr.initializer.getText(sf),
-                inputDerived: derivedIn(frame, pr.initializer),
-              };
-              filters.push(valued(f, pr.initializer));
-            }
-          }
-          continue;
-        }
-        const val = s.args[1];
-        const f: QueryFilter = {
-          method: s.name,
-          column: stringLiteralValue(firstArg),
-          valueText: val ? val.getText(sf) : "",
-          inputDerived: val ? derivedIn(frame, val) : false,
-        };
-        filters.push(valued(f, val));
-      }
+      const filters = supabaseFilters(after);
       parsed = {
         anchor: anchor.node,
         table: fromTable ?? stringLiteralValue(anchor.args[0]) ?? "(dynamic)",
@@ -1226,6 +1309,16 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
         call,
         chain.segments.map((s) => s.name),
       );
+      // `if (!row || row.user_id !== user.id) return 404`: ownership checked in code after the read.
+      const checks: QueryFilter[] = rowComparisons(call)
+        .filter((c) => c.exit === "throw" || frame.exitPropagates)
+        .map((c) => ({
+          method: "compare",
+          column: c.column,
+          valueText: c.value.getText(sf).replace(/\s+/g, " "),
+          inputDerived: derivedIn(frame, c.value),
+        }));
+      if (checks.length > 0) query.ownerChecks = checks;
       acc.reads.push({
         query,
         keys: query.filters.map((f) => {
@@ -1234,7 +1327,9 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
         }),
         order: [...frame.pathPos, parsed.anchor.getStart(sf)],
         exits: rowExit === "throw" || (rowExit === "return" && frame.exitPropagates),
+        checks,
       });
+      bindBuilder(call, query);
     }
     // Looking the caller up by a request credential (`api_keys.key_hash = sha256(bearer)`) is the
     // authentication step itself.
@@ -1248,66 +1343,202 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
   for (const call of collect(body, ts.isCallExpression)) {
     const target = callTarget(p, call, frame, scope);
     if (!target) continue;
-    const tsf = p.sources.get(target.facts.file);
-    if (!tsf) continue;
-    const child: Frame = {
-      rel: target.facts.file,
-      sf: tsf,
-      facts: target.facts,
-      fn: target.fn,
-      depth: frame.depth + 1,
-      via: [...frame.via, `${target.name} (${target.facts.file}:${lineOf(tsf, target.fn)})`],
-      inputNames: new Set(),
-      wholeNames: new Set(),
-      partialInputs: new Map(),
-      reqNames: new Set(),
-      clients: new Map(),
-      instances: new Map(),
-      cls: target.cls,
-      thisProps: target.thisProps,
-      key: `${target.facts.file}#${target.name}@${call.getStart(frame.sf)}`,
-      aliases: new Map(),
-      pathPos: [...frame.pathPos, call.getStart(frame.sf)],
-      exitPropagates: frame.exitPropagates && callResultChecked(call),
-    };
-    const cx = wholeContext(frame);
-    target.fn.parameters.forEach((param, i) => {
-      const arg = call.arguments[i];
-      const ab = argBinding(p, arg, frame);
-      const names = boundNames(param.name);
-      const head = names[0];
-      if (ab.client && head !== undefined && ts.isIdentifier(param.name)) {
-        child.clients.set(head, ab.client);
-      }
-      if (ab.instance && head !== undefined && ts.isIdentifier(param.name)) {
-        child.instances.set(head, ab.instance);
-      }
-      for (const nm of names) if (ab.isRequest) child.reqNames.add(nm);
-      if (ab.tainted) {
-        bindParamTaint(child, param.name, arg, frame);
-        for (const nm of wholeParamNames(param.name, arg, cx)) {
-          child.inputNames.add(nm);
-          child.wholeNames.add(nm);
-        }
-        // Only user-controlled values can be a guarded id, so only they are named across frames.
-        aliasParam(child, param.name, arg, frame);
-      }
-    });
+    const child = childFrame(p, call, target, frame);
+    if (!child) continue;
     // Same helper, same bindings: analysed once per handler.
-    const signature = [
-      ...[...child.clients].map(([n, c]) => `${n}=${c.kind}`),
-      ...[...child.inputNames].map((n) => `${n}!${child.wholeNames.has(n) ? "*" : ""}`),
-      ...[...child.partialInputs].map(([n, s]) => `${n}.{${[...s].sort().join("|")}}`),
-      ...[...child.reqNames].map((n) => `${n}?`),
-      ...[...child.thisProps].map(([n, b]) => `this.${n}=${b.client?.kind ?? "-"}`),
-      ...[...child.aliases].map(([n, k]) => `${n}~${k}`),
-      `exit=${child.exitPropagates}`,
-    ].sort();
-    const key = `${target.facts.file}#${target.name}#${signature.join(",")}`;
+    const key = `${target.facts.file}#${target.name}#${frameSignature(child)}`;
     if (acc.visited.has(key)) continue;
     acc.visited.add(key);
     analyzeFrame(p, child, acc);
   }
+}
+
+/** The callee's frame for one call site: parameters bound to what the caller passes. */
+function childFrame(
+  p: Project,
+  call: ts.CallExpression,
+  target: CallTarget,
+  frame: Frame,
+): Frame | null {
+  const tsf = p.sources.get(target.facts.file);
+  if (!tsf) return null;
+  const child: Frame = {
+    rel: target.facts.file,
+    sf: tsf,
+    facts: target.facts,
+    fn: target.fn,
+    depth: frame.depth + 1,
+    via: [...frame.via, `${target.name} (${target.facts.file}:${lineOf(tsf, target.fn)})`],
+    inputNames: new Set(),
+    wholeNames: new Set(),
+    partialInputs: new Map(),
+    reqNames: new Set(),
+    clients: new Map(),
+    instances: new Map(),
+    cls: target.cls,
+    thisProps: target.thisProps,
+    key: `${target.facts.file}#${target.name}@${call.getStart(frame.sf)}`,
+    aliases: new Map(),
+    pathPos: [...frame.pathPos, call.getStart(frame.sf)],
+    exitPropagates: frame.exitPropagates && callResultChecked(call),
+  };
+  const cx = wholeContext(frame);
+  target.fn.parameters.forEach((param, i) => {
+    const arg = call.arguments[i];
+    const ab = argBinding(p, arg, frame);
+    const names = boundNames(param.name);
+    const head = names[0];
+    if (ab.client && head !== undefined && ts.isIdentifier(param.name)) {
+      child.clients.set(head, ab.client);
+    }
+    if (ab.instance && head !== undefined && ts.isIdentifier(param.name)) {
+      child.instances.set(head, ab.instance);
+    }
+    for (const nm of names) if (ab.isRequest) child.reqNames.add(nm);
+    if (ab.tainted) {
+      bindParamTaint(child, param.name, arg, frame);
+      for (const nm of wholeParamNames(param.name, arg, cx)) {
+        child.inputNames.add(nm);
+        child.wholeNames.add(nm);
+      }
+      // Only user-controlled values can be a guarded id, so only they are named across frames.
+      aliasParam(child, param.name, arg, frame);
+    }
+  });
+  return child;
+}
+
+/** What the caller bound into a frame, for memoising per-helper work. */
+function frameSignature(child: Frame): string {
+  return [
+    ...[...child.clients].map(([n, c]) => `${n}=${c.kind}`),
+    ...[...child.inputNames].map((n) => `${n}!${child.wholeNames.has(n) ? "*" : ""}`),
+    ...[...child.partialInputs].map(([n, s]) => `${n}.{${[...s].sort().join("|")}}`),
+    ...[...child.reqNames].map((n) => `${n}?`),
+    ...[...child.thisProps].map(([n, b]) => `this.${n}=${b.client?.kind ?? "-"}`),
+    ...[...child.aliases].map(([n, k]) => `${n}~${k}`),
+    `exit=${child.exitPropagates}`,
+  ]
+    .sort()
+    .join(",");
+}
+
+/**
+ * What a helper's result carries back to its caller. `tainted: false`: nothing the caller controls
+ * (rows of a query, identity, literals, an object built from those). `props`: the properties of a
+ * returned object literal that do carry input (`{ id: body.id, row }` taints only `.id`); null
+ * when the whole value does.
+ */
+interface ReturnTaint {
+  tainted: boolean;
+  props: Set<string> | null;
+}
+
+const CLEAN: ReturnTaint = { tainted: false, props: null };
+const TAINTED: ReturnTaint = { tainted: true, props: null };
+/** Helper calls followed for their return value: caller -> helper -> helper. */
+const MAX_RETURN_DEPTH = 2;
+
+/** The branches an expression can evaluate to: `a ?? b`, `c ? a : b`, `a || b`. */
+function branchesOf(e: ts.Expression): ts.Expression[] {
+  const u = unwrap(e);
+  if (ts.isConditionalExpression(u)) return [...branchesOf(u.whenTrue), ...branchesOf(u.whenFalse)];
+  if (
+    ts.isBinaryExpression(u) &&
+    (u.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
+      u.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+      u.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken)
+  ) {
+    return [...branchesOf(u.left), ...branchesOf(u.right)];
+  }
+  return [u];
+}
+
+function isLiteralValue(e: ts.Expression): boolean {
+  return (
+    ts.isStringLiteralLike(e) ||
+    ts.isNumericLiteral(e) ||
+    e.kind === ts.SyntaxKind.NullKeyword ||
+    e.kind === ts.SyntaxKind.TrueKeyword ||
+    e.kind === ts.SyntaxKind.FalseKeyword ||
+    (ts.isIdentifier(e) && e.text === "undefined")
+  );
+}
+
+function mergeTaint(a: ReturnTaint, b: ReturnTaint): ReturnTaint {
+  if (!a.tainted) return b;
+  if (!b.tainted) return a;
+  if (a.props === null || b.props === null) return TAINTED;
+  return { tainted: true, props: new Set([...a.props, ...b.props]) };
+}
+
+/** Taint of one returned branch, evaluated in the callee's own frame after its declarations are bound. */
+function leafTaint(
+  p: Project,
+  leaf: ts.Expression,
+  child: Frame,
+  scope: Map<string, Sym>,
+  depth: number,
+): ReturnTaint {
+  if (isLiteralValue(leaf)) return CLEAN;
+  if (ts.isObjectLiteralExpression(leaf)) {
+    const props = taintedProperties(child, leaf);
+    if (props === null) return TAINTED;
+    return props.size === 0 ? CLEAN : { tainted: true, props };
+  }
+  if (ts.isCallExpression(leaf)) {
+    // Rows of a query and the caller's identity are data, whatever filtered or produced them.
+    if (isChainWithQuery(leaf) || isDbChain(leaf, child)) return CLEAN;
+    if (returnsIdentity(p, leaf, scope)) return CLEAN;
+    const nested = returnTaint(p, leaf, child, scope, depth + 1);
+    if (nested !== null) return nested;
+  }
+  return derivedIn(child, leaf) ? TAINTED : CLEAN;
+}
+
+/**
+ * The return taint of a helper call, or null when the callee is not a function of this repository
+ * (an SDK or an unresolvable import: its result is assumed to carry whatever input it was given).
+ * The callee's declarations are bound with the caller's arguments first, so `const row = await
+ * findByHash(hash(presented))` is clean (`row` is a query result) while `return body.id` is not.
+ */
+function returnTaint(
+  p: Project,
+  call: ts.CallExpression,
+  frame: Frame,
+  scope: Map<string, Sym>,
+  depth: number,
+): ReturnTaint | null {
+  if (depth > MAX_RETURN_DEPTH) return null;
+  const target = callTarget(p, call, frame, scope);
+  if (!target) return null;
+  const child = childFrame(p, call, target, frame);
+  if (!child) return null;
+  const key = `${target.facts.file}#${target.name}#${frameSignature(child)}`;
+  const cached = p.returnTaints.get(key);
+  if (cached !== undefined) return cached;
+  // A helper that (indirectly) calls itself is left to the caller's assumption.
+  p.returnTaints.set(key, null);
+  const scratch: Acc = {
+    inputs: [],
+    authChecks: [],
+    roleChecks: [],
+    queries: [],
+    metadataAccesses: [],
+    visited: new Set(),
+    reads: [],
+  };
+  bindDeclarations(p, child, scratch);
+  const childScope = scopeOf(p, child.facts);
+  let out: ReturnTaint = CLEAN;
+  for (const ret of ownReturns(target.fn)) {
+    for (const leaf of branchesOf(ret)) {
+      out = mergeTaint(out, leafTaint(p, leaf, child, childScope, depth));
+      if (out.tainted && out.props === null) break;
+    }
+  }
+  p.returnTaints.set(key, out);
+  return out;
 }
 
 /**
@@ -1430,26 +1661,101 @@ function aliasParam(
   }
 }
 
+/** The `if` whose branch contains `node`, up to the function body; null when the node runs unconditionally. */
+function enclosingCondition(node: ts.Node, body: ts.Node): ts.Expression | null {
+  let child: ts.Node = node;
+  let cur: ts.Node | undefined = node.parent;
+  while (cur && cur !== body && !isFunctionLikeNode(cur)) {
+    if (ts.isIfStatement(cur) && cur.expression !== child) return cur.expression;
+    child = cur;
+    cur = cur.parent;
+  }
+  return null;
+}
+
+const normalizeColumn = (c: string | null): string => (c ?? "").toLowerCase().replace(/_/g, "");
+
+function singular(table: string): string {
+  if (table.endsWith("ies")) return `${table.slice(0, -3)}y`;
+  if (table.endsWith("ses") || table.endsWith("xes")) return table.slice(0, -2);
+  return table.endsWith("s") ? table.slice(0, -1) : table;
+}
+
+/** `automation_id` names a row of `automations` (or `automation`). */
+function columnNamesTable(column: string, table: string): boolean {
+  const c = normalizeColumn(column);
+  if (!c.endsWith("id") || c === "id") return false;
+  const stem = c.slice(0, -2);
+  const t = normalizeColumn(table);
+  return stem === t || stem === singular(t);
+}
+
+interface GuardMatch {
+  read: GuardableRead;
+  column: string;
+  parent?: QueryGuard["parent"];
+}
+
 /**
- * Links each query to an earlier read of the same table by the same value (the guard), preferring a
- * read whose missing row stops the entry point. Rules decide whether the guard ties the row to the caller.
+ * The read `g` guards the query `q` when both filter by the same value: the same column of the
+ * same table (`flows.id` read, then `flows.id` deleted), or the parent's id and a column of the
+ * child that refers to it (`automations.id` read, then `automation_steps.automation_id`), by a
+ * foreign key in the migrations or by the column's name.
  */
-function linkGuards(reads: readonly GuardableRead[]): void {
-  const col = (c: string | null): string => (c ?? "").toLowerCase().replace(/_/g, "");
+function guardMatch(
+  q: GuardableRead,
+  g: GuardableRead,
+  tables: ReadonlyMap<string, RlsTable>,
+): GuardMatch | null {
+  const qTable = q.query.table.toLowerCase();
+  const gTable = g.query.table.toLowerCase();
+  const info = tables.get(qTable);
+  for (let i = 0; i < q.query.filters.length; i += 1) {
+    const f = q.query.filters[i];
+    const k = q.keys[i];
+    if (!f?.inputDerived || !f.column || k === null || k === undefined) continue;
+    const j = g.keys.indexOf(k);
+    const gf = j >= 0 ? g.query.filters[j] : undefined;
+    if (!gf) continue;
+    if (qTable === gTable) {
+      if (normalizeColumn(gf.column) === normalizeColumn(f.column))
+        return { read: g, column: f.column };
+      continue;
+    }
+    const ref = info?.columnInfo?.find((c) => c.name === f.column?.toLowerCase())?.references;
+    if (ref && ref.table === gTable && normalizeColumn(ref.column) === normalizeColumn(gf.column)) {
+      return {
+        read: g,
+        column: f.column,
+        parent: { table: g.query.table, column: gf.column ?? "id", how: "foreign key" },
+      };
+    }
+    if (normalizeColumn(gf.column) === "id" && columnNamesTable(f.column, gTable)) {
+      return {
+        read: g,
+        column: f.column,
+        parent: { table: g.query.table, column: gf.column ?? "id", how: "column name" },
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Links each query to an earlier read of the same row, or of its parent row, by the same value
+ * (the guard), preferring a read whose missing row stops the entry point. Rules decide whether the
+ * guard ties the row to the caller.
+ */
+function linkGuards(reads: readonly GuardableRead[], tables: ReadonlyMap<string, RlsTable>): void {
   for (const q of reads) {
-    let best: { read: GuardableRead; column: string } | null = null;
+    let best: GuardMatch | null = null;
     for (const g of reads) {
       if (g === q || !["select", "unknown"].includes(g.query.operation)) continue;
-      if (g.query.table.toLowerCase() !== q.query.table.toLowerCase()) continue;
       if (compareOrder(g.order, q.order) >= 0) continue;
-      const shared = q.query.filters.findIndex((f, i) => {
-        const k = q.keys[i];
-        if (!f.inputDerived || k === null || k === undefined) return false;
-        return g.query.filters.some((gf, j) => g.keys[j] === k && col(gf.column) === col(f.column));
-      });
-      const column = q.query.filters[shared]?.column;
-      if (shared < 0 || !column) continue;
-      if (!best || (g.exits && !best.read.exits)) best = { read: g, column };
+      const m = guardMatch(q, g, tables);
+      if (!m) continue;
+      const stops = (r: GuardableRead): boolean => r.exits || r.checks.length > 0;
+      if (!best || (stops(m.read) && !stops(best.read))) best = m;
     }
     if (!best) continue;
     const g = best.read.query;
@@ -1460,9 +1766,12 @@ function linkGuards(reads: readonly GuardableRead[]): void {
       clientName: g.clientName,
       filters: g.filters,
       column: best.column,
-      exitsWhenMissing: best.read.exits,
+      // A row that fails the comparison stops the entry point too; a missing one fails it as well.
+      exitsWhenMissing: best.read.exits || best.read.checks.length > 0,
       text: g.text,
       ...(g.via ? { via: g.via } : {}),
+      ...(best.read.checks.length > 0 ? { checks: best.read.checks } : {}),
+      ...(best.parent ? { parent: best.parent } : {}),
     };
   }
 }
@@ -1521,6 +1830,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
   const acc: Acc = {
     inputs: [],
     authChecks: [],
+    roleChecks: [],
     queries: [],
     metadataAccesses: [],
     visited: new Set(),
@@ -1571,7 +1881,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     acc.authChecks.push({ ...loc(h.node), kind: "session" });
   }
   analyzeFrame(p, frame, acc);
-  linkGuards(acc.reads);
+  linkGuards(acc.reads, p.tables);
 
   const entry =
     h.kind === "route"
@@ -1596,6 +1906,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     queries: acc.queries,
     metadataAccesses: acc.metadataAccesses,
     ignores,
+    roleChecks: acc.roleChecks,
   };
 }
 
@@ -1672,7 +1983,16 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     }
   }
   const registry = new Map<string, ModuleFacts>();
-  for (const [rel, sf] of sources) registry.set(rel, analyzeModule(rel, sf));
+  for (const [rel, sf] of sources) {
+    try {
+      registry.set(rel, analyzeModule(rel, sf));
+    } catch (e) {
+      // A file the walker cannot handle (pathological nesting, a construct that trips a visitor) is
+      // dropped from the model with a warning; the rest of the project is still scanned.
+      sources.delete(rel);
+      warnings.push(`could not analyse ${rel}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
 
   const tables = new Map<string, RlsTable>();
   for (const rel of sql) {
@@ -1706,6 +2026,8 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     varBindings: new Map(),
     drizzleTablesByExport,
     prismaModels,
+    returnTaints: new Map(),
+    tables,
     warnings,
   };
 
@@ -1713,6 +2035,54 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
   const exposures: SecretExposure[] = [];
   const fileIgnores: Record<string, IgnoreDirective[]> = {};
   for (const [rel, sf] of sources) {
+    try {
+      analyzeFile(project, rel, sf, registry.get(rel) ?? analyzeModule(rel, sf), {
+        routes,
+        exposures,
+        fileIgnores,
+      });
+    } catch (e) {
+      // Handlers of this file analysed before the failure stay; the rest of the file is skipped.
+      warnings.push(`could not analyse ${rel}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  routes.sort((a, b) => a.entry.localeCompare(b.entry));
+
+  const all = [...registry.values()];
+  const schema = sqlSchemaFor(tables);
+  warnings.push(...schema.warnings);
+  return {
+    root,
+    files: [...source, ...sql],
+    routes,
+    clientFactories: all.flatMap((f) => f.clientFactories),
+    authHelpers: all.flatMap((f) => f.authHelpers),
+    tables: [...tables.values()],
+    exposures,
+    fileIgnores,
+    warnings,
+    enums: schema.enums,
+    sqlFunctions: schema.sqlFunctions,
+    storageBuckets: schema.storageBuckets,
+  };
+}
+
+interface FileOutputs {
+  routes: RouteHandler[];
+  exposures: SecretExposure[];
+  fileIgnores: Record<string, IgnoreDirective[]>;
+}
+
+/** Everything one source file contributes: file-level directives, secret exposures and its entry points. */
+function analyzeFile(
+  project: Project,
+  rel: string,
+  sf: ts.SourceFile,
+  facts: ModuleFacts,
+  out: FileOutputs,
+): void {
+  const { routes, exposures, fileIgnores } = out;
+  {
     const top = parseIgnoreDirectives(sf, 0).map((d) => ({
       ruleId: d.ruleId,
       reason: d.reason,
@@ -1720,7 +2090,6 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     }));
     if (top.length > 0) fileIgnores[rel] = top;
     exposures.push(...findExposures(rel, sf));
-    const facts = registry.get(rel) ?? analyzeModule(rel, sf);
     const route = routeFromFile(rel);
     if (route) {
       for (const { method, exported } of routeHandlersIn(sf)) {
@@ -1775,22 +2144,4 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
       }
     }
   }
-  routes.sort((a, b) => a.entry.localeCompare(b.entry));
-
-  const all = [...registry.values()];
-  const schema = sqlSchemaFor(tables);
-  return {
-    root,
-    files: [...source, ...sql],
-    routes,
-    clientFactories: all.flatMap((f) => f.clientFactories),
-    authHelpers: all.flatMap((f) => f.authHelpers),
-    tables: [...tables.values()],
-    exposures,
-    fileIgnores,
-    warnings,
-    enums: schema.enums,
-    sqlFunctions: schema.sqlFunctions,
-    storageBuckets: schema.storageBuckets,
-  };
 }

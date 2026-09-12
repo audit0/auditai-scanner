@@ -1,0 +1,24 @@
+{
+  "id": "033-do-block-rls-literal-loop",
+  "vulnerabilityExists": true,
+  "class": ["RLS-missing", "multi-tenancy"],
+  "cwe": ["CWE-284", "CWE-862"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "typescript", "plpgsql"],
+  "vulnerablePath": [
+    "GET /api/notes/[id]",
+    "user-scoped client (RLS applies)",
+    "DO $$ foreach t in array array['notes_archive'] loop execute format('alter table public.%I enable row level security', t) ... $$ never names notes",
+    "public.notes has RLS disabled",
+    "any row is returned"
+  ],
+  "expectedSecureBehavior": "Alice (tenant A) requesting Bob's note (tenant B) gets 404; direct PostgREST reads with the anon key return no rows.",
+  "acceptableFixes": [
+    "Add 'notes' to the literal list the DO block loops over",
+    "alter table public.notes enable row level security + a tenant-scoped select policy, written plainly"
+  ],
+  "unacceptableFixes": [
+    "Filtering in the app layer only while the table stays exposed through PostgREST",
+    "A loop over a list that is computed at runtime (the scanner cannot see it, and neither can a reviewer)"
+  ]
+}

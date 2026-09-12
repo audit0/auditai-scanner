@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { FINDING_STATUSES, type FindingStatus } from "@auditai/core";
 import { formatScanText } from "./format.js";
-import { runScan } from "./scan.js";
+import { runScan, ScanError, type ScanResult } from "./scan.js";
 
 const USAGE = `auditai-scan — deterministic security scan for Next.js + Supabase apps (open source)
 
@@ -16,6 +16,8 @@ Options:
                        one of: candidate, likely, confirmed, verified
   --migrations <dir>   extra directory with Supabase migration SQL (repeatable)
   -h, --help           show this help
+
+Exit code: 0 clean, 1 a finding reached --fail-on, 2 usage error or <path> is not a directory
 
 Config: <path>/audit.config.json { "ignore": ["evals/**"], "migrations": ["supabase/migrations"] }
 Suppress a finding: // auditai:ignore <ruleId|*> -- reason   (above the handler or at the top of a file)
@@ -53,10 +55,15 @@ function main(argv: string[]): number {
     return 2;
   }
   const migrations = (values.migrations as string[]).map((m) => resolve(m));
-  const result = runScan(
-    positionals[0] ?? ".",
-    migrations.length > 0 ? { sqlDirs: migrations } : {},
-  );
+  let result: ScanResult;
+  try {
+    result = runScan(positionals[0] ?? ".", migrations.length > 0 ? { sqlDirs: migrations } : {});
+  } catch (e) {
+    // A path that cannot be scanned is a usage error, not an empty project: nothing on stdout.
+    if (!(e instanceof ScanError)) throw e;
+    process.stderr.write(`error: ${e.message}\n`);
+    return 2;
+  }
   process.stdout.write(
     values.json ? `${JSON.stringify(result, null, 2)}\n` : formatScanText(result),
   );

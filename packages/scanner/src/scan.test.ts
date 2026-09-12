@@ -1,7 +1,10 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { formatScanText } from "./format.js";
-import { runScan, summarize } from "./scan.js";
+import { runScan, ScanError, summarize } from "./scan.js";
 
 const fixture = (variant: "vulnerable" | "secure"): string =>
   fileURLToPath(
@@ -64,5 +67,31 @@ describe("audit scan", () => {
       8,
     );
     expect([s.tablesWithRls, s.tablesKnown]).toEqual([1, 2]);
+  });
+});
+
+function scanErrorFrom(fn: () => unknown): ScanError {
+  try {
+    fn();
+  } catch (e) {
+    if (e instanceof ScanError) return e;
+    throw e;
+  }
+  throw new Error("expected runScan to throw ScanError");
+}
+
+describe("audit scan on a path that is not a directory", () => {
+  it("refuses a missing path with a typed error instead of an empty result", () => {
+    const missing = join(mkdtempSync(join(tmpdir(), "auditai-scan-")), "does-not-exist");
+    const e = scanErrorFrom(() => runScan(missing));
+    expect([e.name, e.code, e.path]).toEqual(["ScanError", "path_not_found", missing]);
+    expect(e.message).toBe(`${missing} is not a directory (no such file or directory)`);
+  });
+
+  it("refuses a file instead of a directory", () => {
+    const file = fileURLToPath(new URL("./scan.ts", import.meta.url));
+    const e = scanErrorFrom(() => runScan(file, { sqlDirs: ["../supabase"] }));
+    expect([e.name, e.code, e.path]).toEqual(["ScanError", "path_not_found", file]);
+    expect(e.message).toBe(`${file} is not a directory`);
   });
 });

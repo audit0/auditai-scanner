@@ -42,8 +42,15 @@ export function formatScanText(r: ScanResult): string {
   const out: string[] = [
     `Audit AI scan  ${displayRoot(s.root)}`,
     `Files ${s.files} · Routes ${s.routes} · Supabase queries ${s.queries} · Tables with RLS ${s.tablesWithRls}/${s.tablesKnown} · Rules ${s.rules}`,
-    "",
   ];
+  if (s.publicTables.length > 0) {
+    // The declaration is never silent: what it suppressed is counted next to it.
+    const n = r.findings.filter((f) => f.evidence.some((e) => e.data?.publicTables)).length;
+    out.push(
+      `Declared public in audit.config.json: ${s.publicTables.join(", ")} (${n} read-only finding${n === 1 ? "" : "s"} suppressed by the declaration; write paths are never covered)`,
+    );
+  }
+  out.push("");
   if (r.findings.length === 0) {
     out.push(
       `No findings. ${s.routes} route${s.routes === 1 ? "" : "s"} and ${s.queries} quer${s.queries === 1 ? "y" : "ies"} checked.`,

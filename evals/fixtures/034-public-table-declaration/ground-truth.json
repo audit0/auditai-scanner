@@ -1,0 +1,23 @@
+{
+  "id": "034-public-table-declaration",
+  "vulnerabilityExists": true,
+  "class": ["authentication", "service-role-bypass", "public-by-design"],
+  "cwe": ["CWE-306", "CWE-284"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "typescript"],
+  "vulnerablePath": [
+    "POST /api/products",
+    "no authentication of any kind",
+    "createServiceRoleClient() bypasses RLS",
+    "products.insert() with the request body: anyone adds rows to the public catalogue"
+  ],
+  "expectedSecureBehavior": "Anyone reads the catalogue (GET 200, declared public); only an operator inserts (POST 401 anonymously, 201 for the admin).",
+  "acceptableFixes": [
+    "Authenticate the write with a session and an operator role from app_metadata or a server-side table",
+    "Gate the write with a shared operator secret (cron/admin secret)"
+  ],
+  "unacceptableFixes": [
+    "Adding the table to publicTables and expecting the write to be covered (the declaration is read-only by design)",
+    "A role read from user_metadata (self-assignable)"
+  ]
+}

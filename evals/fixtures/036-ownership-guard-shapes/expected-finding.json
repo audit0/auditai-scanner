@@ -1,0 +1,25 @@
+{
+  "ruleId": "supabase.service-role-object-access-without-tenant-scope",
+  "title": "Cross-tenant select on \"tasks\" via service-role client",
+  "severity": "critical",
+  "minConfidence": 0.85,
+  "entrypoints": ["GET /api/projects/[id]/tasks", "PATCH /api/documents/[id]", "GET /api/reports/[id]"],
+  "sources": ["route_param:id"],
+  "sinks": ["supabase.select:public.tasks", "supabase.update:public.documents", "supabase.select:public.reports"],
+  "mustMentionFiles": [
+    "vulnerable/app/api/projects/[id]/tasks/route.ts",
+    "vulnerable/app/api/documents/[id]/route.ts",
+    "vulnerable/app/api/reports/[id]/route.ts",
+    "vulnerable/lib/supabase/admin.ts"
+  ],
+  "mustNotFlag": [
+    "secure/app/api/projects/[id]/tasks/route.ts",
+    "secure/app/api/documents/[id]/route.ts",
+    "secure/app/api/reports/[id]/route.ts"
+  ],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 200 on another user's project tasks, document rename and report",
+    "expectedAfter": "HTTP 404 on all three, rows intact; own rows still 200"
+  }
+}

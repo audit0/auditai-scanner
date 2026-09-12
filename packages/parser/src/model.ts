@@ -109,6 +109,18 @@ export interface QueryGuard {
   exitsWhenMissing: boolean;
   text: string;
   via?: string[];
+  /**
+   * Comparisons of the row's columns made in code after the read, each in an `if` that stops the
+   * entry point: `if (!existing || existing.user_id !== user.id) return 404` gives
+   * `{ method: "compare", column: "user_id", valueText: "user.id" }`.
+   */
+  checks?: QueryFilter[];
+  /**
+   * Set when the guard read is of a parent row: the guarded query filters by a column that refers
+   * to the guard's table (`automation_steps.automation_id` -> `automations.id`), by a foreign key
+   * in the migrations or by the column's name.
+   */
+  parent?: { table: string; column: string; how: "foreign key" | "column name" };
 }
 
 export interface SupabaseQuery {
@@ -127,6 +139,8 @@ export interface SupabaseQuery {
   storage?: StorageAccess;
   /** An earlier read of the same row by the same id value (see QueryGuard). */
   guard?: QueryGuard;
+  /** Comparisons of this read's own row against other values in code, each stopping the entry point (see QueryGuard.checks). */
+  ownerChecks?: QueryFilter[];
 }
 
 /** `// auditai:ignore <ruleId|*> -- reason` placed above a handler (or at the top of a file). */
@@ -161,6 +175,19 @@ export interface AuthCheck extends FileRef {
   kind?: AuthCheckKind;
 }
 
+/**
+ * A role or claim of the authenticated session deciding whether the request goes on (ADR-001):
+ * `if (!user || !isAdminEmail(user.email)) return 401`, `if (user.app_metadata?.role !== "admin")
+ * redirect(...)`. The value comes from the session (`auth.getUser()`, an auth helper), never from
+ * `user_metadata` (end-user editable, see R5) and never from the request.
+ */
+export interface RoleCheck extends FileRef {
+  /** The session value the predicate reads, e.g. `user.email` or `user.app_metadata.role`. */
+  source: string;
+  /** The condition, for evidence. */
+  text: string;
+}
+
 export interface RouteHandler {
   kind: EntryKind;
   /** Route path for routes and pages, function name for server actions. */
@@ -174,6 +201,8 @@ export interface RouteHandler {
   queries: SupabaseQuery[];
   metadataAccesses: MetadataAccess[];
   ignores: IgnoreDirective[];
+  /** Role/claim predicates that stop the entry point (see RoleCheck). Absent in older models. */
+  roleChecks?: RoleCheck[];
 }
 
 export type PolicyCommand = "select" | "insert" | "update" | "delete" | "all";

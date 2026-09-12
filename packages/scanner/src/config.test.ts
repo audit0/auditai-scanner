@@ -33,6 +33,36 @@ function layout(config: unknown | ((outside: string) => unknown)): {
   return { base, root, outside };
 }
 
+describe("publicTables from the repository's own audit.config.json (ADR-002)", () => {
+  it("lowercases, de-duplicates and drops anything that is not a table name, with a warning each", () => {
+    const { root } = layout({
+      publicTables: ["Products", "products", " categories ", "public.x", "", 42, "drop;"],
+    });
+    const { config, warnings } = loadAuditConfig(root);
+    expect(config.publicTables).toEqual(["products", "categories"]);
+    expect(warnings).toHaveLength(4);
+    expect(warnings[0]).toContain("ignored publicTables entry");
+  });
+
+  it("ignores a non-array with a warning and caps the list", () => {
+    expect(loadAuditConfig(layout({ publicTables: "products" }).root)).toMatchObject({
+      config: {},
+      warnings: ["audit.config.json: publicTables ignored (not an array of table names)"],
+    });
+    const many = Array.from({ length: 70 }, (_, i) => `t${i}`);
+    const { config, warnings } = loadAuditConfig(layout({ publicTables: many }).root);
+    expect(config.publicTables).toHaveLength(64);
+    expect(warnings).toHaveLength(6);
+  });
+
+  it("reaches the scan: the declaration is echoed in the summary and its suppressions counted", () => {
+    const { root } = layout({ publicTables: ["inside"] });
+    const r = runScan(root);
+    expect(r.summary.publicTables).toEqual(["inside"]);
+    expect(r.summary.warnings.filter((w) => w.includes("publicTables"))).toEqual([]);
+  });
+});
+
 describe("migrations from the repository's own audit.config.json", () => {
   it("never reads SQL outside the project, through .., absolute paths or symlinks", () => {
     const { root } = layout((outside) => ({

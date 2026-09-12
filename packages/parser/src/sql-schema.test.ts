@@ -313,6 +313,125 @@ describe("enums", () => {
   });
 });
 
+describe("DO blocks that loop over a literal list of tables (DeskcommCRM)", () => {
+  const TABLES = `
+    create table public.job_queue (id uuid primary key, organization_id uuid);
+    create table public.send_ledger (id uuid primary key, organization_id uuid);
+    create table public.metrics (id uuid primary key, organization_id uuid);`;
+
+  it("unrolls foreach ... in array array[...] with execute format(%I, %s)", () => {
+    const { tables, warnings } = parse(`${TABLES}
+      do $$
+      declare
+        t text;
+      begin
+        foreach t in array array['job_queue', 'send_ledger'] loop
+          execute format('alter table public.%I enable row level security', t);
+          execute format('drop policy if exists tenant_isolation_%s_all on public.%I', t, t);
+          execute format(
+            'create policy tenant_isolation_%s_all on public.%I for all
+               using (organization_id in (select * from public.fn_user_org_ids()))
+               with check (organization_id in (select * from public.fn_user_org_ids()))',
+            t, t
+          );
+          execute format('revoke all on public.%I from anon', t);
+        end loop;
+      end
+      $$;`);
+    expect(tables.get("job_queue")?.rlsEnabled).toBe(true);
+    expect(tables.get("send_ledger")?.rlsEnabled).toBe(true);
+    expect(tables.get("metrics")?.rlsEnabled).toBe(false);
+    const policy = tables.get("send_ledger")?.policyDetails[0];
+    expect(policy).toMatchObject({
+      name: "tenant_isolation_send_ledger_all",
+      command: "all",
+      using: "organization_id in (select * from public.fn_user_org_ids())",
+    });
+    expect(policy?.location).toEqual({ file: "m0.sql", line: 5 });
+    expect(warnings).toEqual([]);
+  });
+
+  it("reads select unnest(array[...]), (values (...)) and declared lists, %L and %%, and plain execute strings", () => {
+    const { tables, warnings } = parse(`${TABLES}
+      do $$ declare t text; r record; v_tables text[] := array['job_queue']; begin
+        for t in select unnest(array['job_queue']) loop
+          execute format('alter table %I disable row level security', t);
+        end loop;
+        foreach t in array v_tables loop
+          execute format('alter table %I enable row level security', t);
+        end loop;
+        for r in (values ('send_ledger'), ('metrics')) loop
+          execute format('alter table public.%I enable row level security', r.column1);
+          execute format('create policy %I on public.%I for select using (auth.uid() is not null and true = %L)', 'read ' || 'all', r.column1, 'true');
+        end loop;
+        execute 'alter table public.metrics disable row level security';
+      end $$;`);
+    expect(tables.get("job_queue")?.rlsEnabled).toBe(true);
+    expect(tables.get("send_ledger")?.rlsEnabled).toBe(true);
+    // The plain EXECUTE after the loop runs last and wins.
+    expect(tables.get("metrics")?.rlsEnabled).toBe(false);
+    expect(tables.get("send_ledger")?.policies).toEqual([]);
+    // `'read ' || 'all'` is an expression, so that EXECUTE is dynamic: one warning for the file.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("m0.sql");
+  });
+
+  it("does not follow loops over queries, conditional executes or nested loops, and warns once per file", () => {
+    const { tables, sqlFunctions, warnings } = parse(`${TABLES}
+      create function public.fn_secret() returns text language sql security definer as $$ select 'x' $$;
+      do $$ declare f record; begin
+        for f in select p.oid::regprocedure as sig from pg_proc p where p.prosecdef loop
+          execute format('revoke execute on function %s from public, anon', f.sig);
+        end loop;
+      end $$;
+      do $$ declare t text; begin
+        foreach t in array array['job_queue'] loop
+          if to_regclass('public.' || t) is not null then
+            execute format('alter table public.%I enable row level security', t);
+          end if;
+        end loop;
+        foreach t in array array['send_ledger'] loop
+          foreach t in array array['metrics'] loop
+            execute format('alter table public.%I enable row level security', t);
+          end loop;
+        end loop;
+      end $$;`);
+    expect(tables.get("job_queue")?.rlsEnabled).toBe(false);
+    expect(tables.get("send_ledger")?.rlsEnabled).toBe(false);
+    expect(tables.get("metrics")?.rlsEnabled).toBe(false);
+    expect(sqlFunctions?.find((f) => f.name === "fn_secret")?.grantedTo).toContain("anon");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^m0\.sql: a DO block runs dynamic SQL/);
+  });
+
+  it("keeps the drizzle-kit behaviour: a bare ALTER TABLE inside a DO block is not an RLS switch", () => {
+    const { tables, warnings } = parse(`${TABLES}
+      do $$ begin
+        alter table public.job_queue enable row level security;
+      exception when others then null;
+      end $$;`);
+    expect(tables.get("job_queue")?.rlsEnabled).toBe(false);
+    expect(warnings).toEqual([]);
+  });
+
+  it("survives malformed loops", () => {
+    for (const sql of [
+      "do $$ begin foreach t in array array['a' loop execute format('alter table %I enable row level security', t); end loop; end $$;",
+      "do $$ begin foreach in array array['a'] loop execute format('%I %I', t); end $$;",
+      "do $$ begin for t in (values ('a'), ('b' loop execute format('alter table %I enable row level security', t); end loop; end $$;",
+      "do $$ begin foreach t in array array['a'] loop execute format('%3$I', t); end loop; end $$;",
+      "do $$ begin foreach t in array array['a'] loop execute format('%q', t); end loop; end $$;",
+      "do $$ begin foreach t in array array['a'] loop execute format(); end loop; end $$;",
+      "do $$ begin foreach t in array array['a'] loop execute; end loop; end $$;",
+      "do $$ begin end loop; end loop; end $$;",
+      "do $$ $$;",
+      "do",
+    ]) {
+      expect(() => parse(sql)).not.toThrow();
+    }
+  });
+});
+
 describe("SQL functions", () => {
   it("reads SECURITY DEFINER, caller checks (also through helpers) and return types", () => {
     const { sqlFunctions } = parse(`

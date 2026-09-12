@@ -80,13 +80,23 @@ npx auditai-scan [path] [--json] [--fail-on <status>] [--migrations <dir>]...
 --fail-on <status>   exit 1 when a finding reaches this status (default: confirmed)
                      one of: candidate, likely, confirmed, verified
 --migrations <dir>   extra directory with Supabase migration SQL (repeatable)
+
+Exit code: 0 clean, 1 a finding reached --fail-on, 2 usage error or <path> is not a directory
 ```
 
 Project config in `audit.config.json` at the scanned root:
 
 ```json
-{ "ignore": ["evals/**"], "migrations": ["supabase/migrations"] }
+{
+  "ignore": ["evals/**"],
+  "migrations": ["supabase/migrations"],
+  "publicTables": ["products"]
+}
 ```
+
+`publicTables` names tables that are public by design (a catalogue, a blog). A service-role read of
+such a table is still listed, as `suppressed` with the declaration printed next to it, so the choice
+stays visible in every report; writes to the table are never covered by the declaration.
 
 Suppress a finding you have reviewed, with a reason that stays in the code:
 
@@ -124,7 +134,7 @@ instructions" is just a comment.
 
 ## Eval corpus
 
-Thirty-two fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
+Thirty-six fixture pairs today, growing with every rule. The vulnerable app must fire exactly the expected
 rule; the secure twin must produce zero findings. `npm run evals` enforces both on every commit.
 
 | # | Fixture | Rule exercised |
@@ -161,6 +171,10 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 030 | cron-secret-operator-route | service-role-query-without-authentication, secure twin gated by a cron secret instead of a session |
 | 031 | guard-read-then-service-role-delete | service-role-object-access-without-tenant-scope, secure twin checks ownership with an RLS-scoped guard read |
 | 032 | mass-assignment-map-spread-messages | mass-assignment-from-request-body, `.map()` spread of request rows vs explicit fields |
+| 033 | do-block-rls-literal-loop | table-without-rls, RLS switched on in a `DO $$ foreach ... loop execute format(...)` block over a literal list |
+| 034 | public-table-declaration | service-role-query-without-authentication, read of a table declared in `audit.config.json` `publicTables` is suppressed (visibly), the write path is not |
+| 035 | identity-derived-row-id | service-role-object-access-without-tenant-scope, a row id from the caller's own credential lookup vs one from the query string |
+| 036 | ownership-guard-shapes | service-role-object-access-without-tenant-scope, ownership via the parent row, a comparison in code, or a conditional owner filter |
 
 Each fixture also carries the `security-test` the hosted product runs in a sandbox: `DENY` tests
 are the security assertion (Alice must not read Bob's row), `ALLOW` tests are the sanity check

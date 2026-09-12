@@ -1,0 +1,17 @@
+{
+  "ruleId": "supabase.service-role-query-without-authentication",
+  "title": "Unauthenticated service-role access to \"products\" in POST /api/products",
+  "severity": "critical",
+  "minConfidence": 0.8,
+  "entrypoints": ["POST /api/products"],
+  "sources": ["body:body"],
+  "sinks": ["supabase.insert:public.products"],
+  "mustMentionFiles": ["vulnerable/app/api/products/route.ts"],
+  "mustNotFlag": ["secure/app/api/products/route.ts"],
+  "secureSuppressedReason": "declared public in audit.config.json",
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "HTTP 201 anonymously, a product row inserted",
+    "expectedAfter": "HTTP 401 anonymously, catalogue unchanged; HTTP 200 on GET for everyone"
+  }
+}

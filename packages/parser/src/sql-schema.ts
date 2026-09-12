@@ -76,12 +76,15 @@ export interface SqlSchemaState {
   enums: Map<string, string[]>;
   functions: FunctionRegistry;
   buckets: BucketRegistry;
+  /** Parser warnings for the model, e.g. a DO block with dynamic SQL; one per file and cause. */
+  warnings: string[];
 }
 
 export interface SqlSchemaExtras {
   enums: Record<string, string[]>;
   sqlFunctions: SqlFunctionInfo[];
   storageBuckets: StorageBucket[];
+  warnings: string[];
 }
 
 /** Side state per table map, so `parseSqlForRls(rel, text, into)` keeps its signature across files. */
@@ -97,6 +100,7 @@ export function schemaStateFor(tables: Map<string, RlsTable>): SqlSchemaState {
       enums: new Map(),
       functions: newFunctionRegistry(),
       buckets: newBucketRegistry(),
+      warnings: [],
     };
     STATES.set(tables, state);
   }
@@ -622,7 +626,9 @@ function stripPlpgsqlPrefix(tokens: Token[]): Token[] {
 /**
  * DO blocks: older drizzle-kit wraps CREATE TYPE and foreign keys in
  * `DO $$ BEGIN ... EXCEPTION WHEN duplicate_object THEN null; END $$`. Only schema statements are
- * read there; RLS switches and policies inside DO blocks are left alone.
+ * read there; RLS switches and policies written directly inside DO blocks are left alone (they may
+ * sit under an IF). Loops over literal lists with `execute format(...)` are unrolled separately by
+ * `expandDoBlock` (sql-do-loops.ts) and fed back through rls.ts as plain statements.
  */
 function doBlock(state: SqlSchemaState, stmt: SqlStatement, file: string): void {
   const body = stmt.tokens.find((t) => t.kind === "string");
@@ -678,5 +684,6 @@ export function finishSchema(state: SqlSchemaState): SqlSchemaExtras {
     enums: Object.fromEntries([...state.enums].map(([k, v]) => [k, [...v]])),
     sqlFunctions: finishFunctions(state.functions),
     storageBuckets: finishBuckets(state.buckets),
+    warnings: [...state.warnings],
   };
 }
