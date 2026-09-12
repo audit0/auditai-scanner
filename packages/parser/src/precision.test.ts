@@ -550,3 +550,227 @@ describe("model warnings", () => {
     expect(m.routes.map((r) => r.entry)).toEqual(["GET /api/x"]);
   });
 });
+
+/**
+ * Credential checks the blind sample of 13 September 2026 showed we were missing: 13 of 64 false
+ * positives were handlers that do authenticate, just not through Supabase auth.
+ */
+describe("credential checks (blind sample, 13 September 2026)", () => {
+  const kinds = (r: RouteHandler) => r.authChecks.map((a) => a.kind);
+
+  it("counts a webhook secret compared inside a named helper", () => {
+    const r = route({
+      "app/api/webhooks/pay/route.ts": `import { timingSafeEqual } from "node:crypto";
+import { admin } from "@/lib/admin";
+function secretsMatch(received: string | null, expected: string): boolean {
+  if (!received) return false;
+  const a = Buffer.from(received);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+export async function POST(request: Request) {
+  const expected = process.env.PAY_WEBHOOK_SECRET!;
+  const got = new URL(request.url).searchParams.get("webhookSecret");
+  if (!secretsMatch(got, expected)) return Response.json({ error: "no" }, { status: 401 });
+  const body = await request.json();
+  await admin().from("purchases").update({ status: "paid" }).eq("id", body.id);
+  return Response.json({ ok: true });
+}`,
+    });
+    expect(kinds(r)).toEqual(["secret"]);
+  });
+
+  it("counts a signature verified by an object built from the secret, inside try/catch", () => {
+    const r = route({
+      "app/api/webhooks/mail/route.ts": `import { Webhook } from "svix";
+import { admin } from "@/lib/admin";
+export async function POST(request: Request) {
+  const wh = new Webhook(process.env.MAIL_WEBHOOK_SECRET!);
+  const raw = await request.text();
+  let body: { id: string };
+  try {
+    body = wh.verify(raw, { "svix-id": request.headers.get("svix-id") ?? "" }) as { id: string };
+  } catch {
+    return Response.json({ error: "bad signature" }, { status: 401 });
+  }
+  await admin().from("notification_log").update({ delivered: true }).eq("provider_id", body.id);
+  return Response.json({ ok: true });
+}`,
+    });
+    expect(kinds(r)).toEqual(["secret"]);
+  });
+
+  it("counts a session token from a cookie looked up in a table, through two helpers", () => {
+    const r = route({
+      "lib/session.ts": `import { cookies } from "next/headers";
+import { admin } from "@/lib/admin";
+export async function currentAdvertiser() {
+  const store = await cookies();
+  const token = store.get("session")?.value;
+  if (!token) return null;
+  const { data } = await admin()
+    .from("advertiser_sessions")
+    .select("expires_at, advertiser:advertiser_accounts!inner(id)")
+    .eq("token", token)
+    .maybeSingle();
+  return data ? (data.advertiser as { id: string }) : null;
+}`,
+      "app/api/ads/route.ts": `import { currentAdvertiser } from "@/lib/session";
+import { admin } from "@/lib/admin";
+export async function POST(request: Request) {
+  const advertiser = await currentAdvertiser();
+  if (!advertiser) return Response.json({ error: "no" }, { status: 401 });
+  const body = await request.json();
+  await admin().from("ads").update({ text: body.text }).eq("id", body.id).eq("advertiser_id", advertiser.id);
+  return Response.json({ ok: true });
+}`,
+    });
+    expect(kinds(r)).toContain("credential");
+  });
+
+  it("counts a per-account secret read from the database and compared with the caller's", () => {
+    const r = route({
+      "app/api/v1/events/route.ts": `import { admin } from "@/lib/admin";
+import { verifySignature } from "@/lib/hmac";
+export async function POST(request: Request) {
+  const body = await request.json();
+  const { data: account } = await admin()
+    .from("accounts")
+    .select("id, webhook_secret")
+    .eq("id", body.account_id)
+    .single();
+  if (!account) return Response.json({ error: "no" }, { status: 404 });
+  const ok = await verifySignature(account.webhook_secret, body.payload, request.headers.get("x-signature"));
+  if (!ok) return Response.json({ error: "bad signature" }, { status: 403 });
+  await admin().from("events").insert({ account_id: account.id });
+  return Response.json({ ok: true });
+}`,
+    });
+    expect(kinds(r)).toContain("secret");
+  });
+
+  it("still refuses a helper that only looks like authentication", () => {
+    const r = route({
+      "lib/guard.ts": `export async function requireApiKey(request: Request) { return request.headers.get("x-key"); }`,
+      "app/api/admin/route.ts": `import { admin } from "@/lib/admin";
+import { requireApiKey } from "@/lib/guard";
+export async function GET(request: Request) {
+  const key = await requireApiKey(request);
+  if (!key) return Response.json({ error: "no" }, { status: 401 });
+  return Response.json(await admin().from("profiles").select("*"));
+}`,
+    });
+    expect(r.authChecks).toEqual([]);
+  });
+});
+
+/**
+ * A payload parsed through a schema this project declares is an allow-list: zod object schemas drop
+ * unknown keys. Six of the 64 false positives of the blind sample were this shape.
+ */
+describe("schema parse as an allow-list (blind sample, 13 September 2026)", () => {
+  const SCHEMA = `import { z } from "zod";
+export const levelSchema = z.object({ nama: z.string(), urutan: z.number() });
+export const looseSchema = z.object({ nama: z.string() }).passthrough();
+`;
+
+  it("does not call a zod-parsed payload whole", () => {
+    const r = route({
+      "app/levels/schema.ts": SCHEMA,
+      "app/levels/actions.ts": `"use server";
+import { admin } from "@/lib/admin";
+import { levelSchema } from "./schema";
+export async function createLevel(input: unknown) {
+  const parsed = levelSchema.safeParse(input);
+  if (!parsed.success) return { ok: false };
+  await admin().from("levels").insert(parsed.data);
+  return { ok: true };
+}`,
+    });
+    expect(r.queries[0]?.payload).toMatchObject({ inputDerived: true, wholeInput: false });
+  });
+
+  it("keeps a passthrough schema whole", () => {
+    const r = route({
+      "app/levels/schema.ts": SCHEMA,
+      "app/levels/actions.ts": `"use server";
+import { admin } from "@/lib/admin";
+import { looseSchema } from "./schema";
+export async function createLoose(input: unknown) {
+  await admin().from("levels").insert(looseSchema.parse(input));
+}`,
+    });
+    expect(r.queries[0]?.payload).toMatchObject({ inputDerived: true, wholeInput: true });
+  });
+
+  it("keeps a schema it cannot resolve whole", () => {
+    const r = route({
+      "app/levels/actions.ts": `"use server";
+import { admin } from "@/lib/admin";
+import { mystery } from "some-external-package";
+export async function createUnknown(input: unknown) {
+  await admin().from("levels").insert(mystery.parse(input));
+}`,
+    });
+    expect(r.queries[0]?.payload).toMatchObject({ inputDerived: true, wholeInput: true });
+  });
+});
+
+/** A layout above a page runs before it, so its session check guards the page (RoboPrep shape). */
+describe("layout guards (blind sample, 13 September 2026)", () => {
+  it("counts the session check of an ancestor layout as the page's own", () => {
+    const files = {
+      "lib/viewer.ts": `import { createClient } from "@/lib/server";
+export async function requireReviewer() {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+  const { data } = await supabase.from("profiles").select("role").eq("id", user.id).maybeSingle();
+  return data?.role === "reviewer" ? { id: user.id } : null;
+}`,
+      "lib/server.ts": `import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
+export async function createClient() {
+  const store = await cookies();
+  return createServerClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!, {
+    cookies: { getAll: () => store.getAll(), setAll: () => {} },
+  });
+}`,
+      "app/admin/layout.tsx": `import { notFound } from "next/navigation";
+import { requireReviewer } from "@/lib/viewer";
+export default async function AdminLayout({ children }: { children: React.ReactNode }) {
+  const viewer = await requireReviewer();
+  if (!viewer) notFound();
+  return <>{children}</>;
+}`,
+      "app/admin/review/[id]/page.tsx": `import { admin } from "@/lib/admin";
+export default async function ReviewPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const { data } = await admin().from("submissions").select("*").eq("id", id).single();
+  return <pre>{JSON.stringify(data)}</pre>;
+}`,
+    };
+    const r = route(files, "PAGE /admin/review/[id]");
+    expect(r.authChecks.map((a) => a.kind)).toContain("session");
+    expect(r.authChecks.some((a) => a.file === "app/admin/layout.tsx")).toBe(true);
+  });
+
+  it("does not invent a guard when the layout checks nothing", () => {
+    const r = route(
+      {
+        "app/public/layout.tsx": `export default function PublicLayout({ children }: { children: React.ReactNode }) {
+  return <main>{children}</main>;
+}`,
+        "app/public/[id]/page.tsx": `import { admin } from "@/lib/admin";
+export default async function Page({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const { data } = await admin().from("docs").select("*").eq("id", id).single();
+  return <pre>{JSON.stringify(data)}</pre>;
+}`,
+      },
+      "PAGE /public/[id]",
+    );
+    expect(r.authChecks).toEqual([]);
+  });
+});

@@ -1,5 +1,6 @@
 import ts from "typescript";
 import {
+  collect as collectNodes,
   type FunctionLike,
   identifiersIn,
   isFunctionLikeNode,
@@ -130,8 +131,30 @@ function secretScopeFor(fn: FunctionLike, sf: ts.SourceFile): SecretScope {
   return scope;
 }
 
+/**
+ * A secret the server stores per account rather than in the environment: `account.webhook_secret`,
+ * `row.api_key`, `key.key_hash`. Comparing a caller-supplied value with one of these is the same
+ * kind of check as comparing with `process.env.WEBHOOK_SECRET`.
+ */
+const STORED_SECRET_FIELD = /(^|_)(secret|signing_key|api_key|key_hash|token_hash|hmac_key)$/;
+
+function readsStoredSecret(e: ts.Node): boolean {
+  let hit = false;
+  const visit = (n: ts.Node): void => {
+    if (hit) return;
+    if (ts.isPropertyAccessExpression(n) && STORED_SECRET_FIELD.test(n.name.text.toLowerCase())) {
+      hit = true;
+      return;
+    }
+    n.forEachChild(visit);
+  };
+  visit(e);
+  return hit;
+}
+
 function isSecretish(e: ts.Node, scope: SecretScope): boolean {
   if (envNamesIn(e).some(isSecretEnvName)) return true;
+  if (readsStoredSecret(e)) return true;
   for (const id of identifiersIn(e)) if (scope.names.has(id)) return true;
   let calls = false;
   const visit = (n: ts.Node): void => {
@@ -171,7 +194,7 @@ const EQUALITY = new Set([
 ]);
 /** Constant-time and plain comparison helpers. */
 const COMPARE_CALLEE =
-  /^(timingSafeEqual|safeCompare|secureCompare|safeEqual|constantTimeEqual|constantTimeCompare|timingSafeCompare|compare|compareSync|isEqual|equals?)$/i;
+  /^(timingSafeEqual|safeCompare|secureCompare|safeEqual|constantTimeEqual|constantTimeCompare|timingSafeCompare|compare|compareSync|isEqual|equals?|secretsMatch|secretMatch|matchesSecret|tokensMatch|tokenMatches|sameSecret|checkSecret|validSecret|isValidSecret)$/i;
 /** Signature and token verification with a key. */
 const VERIFY_CALLEE =
   /^(verify|verifySync|jwtVerify|constructEvent|constructEventAsync|verifySignature|verifyWebhook|validateSignature)$/i;
@@ -257,11 +280,59 @@ export interface SecretCheck {
  * the function's own statements: `if (req.headers.get("authorization") !== \`Bearer ${process.env.CRON_SECRET}\`) return 401`,
  * `return timingSafeEqual(token, secret)`, `jwt.verify(token, process.env.JWT_SECRET)`.
  */
+/**
+ * `new Webhook(secret).verify(...)`, or `const wh = new Webhook(secret); wh.verify(...)`: the secret
+ * is held by the receiver instead of being passed to the call.
+ */
+function receiverSecret(
+  callee: ts.Expression,
+  secretish: (e: ts.Expression) => boolean,
+  builtFromSecret: ReadonlySet<string>,
+): boolean {
+  if (!ts.isPropertyAccessExpression(callee)) return false;
+  const recv = callee.expression;
+  if (ts.isNewExpression(recv)) return (recv.arguments ?? []).some(secretish);
+  if (ts.isIdentifier(recv) && builtFromSecret.has(recv.text)) return true;
+  return secretish(recv);
+}
+
+/** Locals of this function initialized with `new X(<secret>)`. */
+function instancesBuiltFromSecret(
+  body: ts.Node,
+  secretish: (e: ts.Expression) => boolean,
+): Set<string> {
+  const out = new Set<string>();
+  for (const d of collectNodes(body, ts.isVariableDeclaration)) {
+    if (!d.initializer || !ts.isIdentifier(d.name) || !ts.isNewExpression(d.initializer)) continue;
+    if ((d.initializer.arguments ?? []).some(secretish)) out.add(d.name.text);
+  }
+  return out;
+}
+
+/**
+ * A verification that throws lands in a catch that ends the request: that is a gate even though the
+ * call itself is a plain statement. Only used for calls that already look like a verification, so an
+ * ordinary call inside a try/catch never becomes an authentication check.
+ */
+function gatesByThrow(node: ts.Node, fnBody: ts.Node): boolean {
+  let child: ts.Node = node;
+  let cur: ts.Node | undefined = node.parent;
+  while (cur && cur !== fnBody && !isFunctionLikeNode(cur)) {
+    if (ts.isTryStatement(cur) && cur.tryBlock === child && cur.catchClause) {
+      return exitKind(cur.catchClause.block) !== null;
+    }
+    child = cur;
+    cur = cur.parent;
+  }
+  return false;
+}
+
 export function secretChecksIn(fn: FunctionLike, sf: ts.SourceFile): SecretCheck[] {
   if (!fn.body) return [];
   const body = fn.body;
   const secrets = secretScopeFor(fn, sf);
   const secretish = (e: ts.Expression): boolean => isSecretish(e, secrets);
+  const builtFromSecret = instancesBuiltFromSecret(body, secretish);
   const out: SecretCheck[] = [];
   const push = (n: ts.Node): void => {
     out.push({ node: n, text: n.getText(sf).replace(/\s+/g, " ").slice(0, 160) });
@@ -280,8 +351,10 @@ export function secretChecksIn(fn: FunctionLike, sf: ts.SourceFile): SecretCheck
     const verify = VERIFY_CALLEE.test(name);
     if (!compare && !verify) return;
     const secretArgs = n.arguments.filter(secretish).length;
-    if (secretArgs === 0 || secretArgs === n.arguments.length) return;
-    if ((verify && throwsOnBadCredential(n)) || gates(n, body)) push(n);
+    // `new Webhook(process.env.SECRET).verify(payload, headers)`: the secret is on the receiver.
+    const receiverHoldsSecret = verify && receiverSecret(n.expression, secretish, builtFromSecret);
+    if (!receiverHoldsSecret && (secretArgs === 0 || secretArgs === n.arguments.length)) return;
+    if ((verify && throwsOnBadCredential(n)) || gates(n, body) || gatesByThrow(n, body)) push(n);
   });
   return out;
 }
@@ -323,7 +396,7 @@ export function nextAuthSessionNames(
  * authentication step itself (`api_keys.key_hash = sha256(bearer)`).
  */
 const CREDENTIAL_COLUMN =
-  /(keyhash|tokenhash|hashedkey|hashedtoken|secrethash|apikey|apikeyhash|apitoken|accesstoken|sessiontoken|secret)$/;
+  /(keyhash|tokenhash|hashedkey|hashedtoken|secrethash|apikey|apikeyhash|apitoken|accesstoken|sessiontoken|secret|token|sessioncode|invitecode|accesscode|sharecode)$/;
 
 export function isCredentialColumn(column: string | null): boolean {
   return column !== null && CREDENTIAL_COLUMN.test(column.toLowerCase().replace(/_/g, ""));

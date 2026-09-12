@@ -14,6 +14,12 @@ export interface WholeContext {
   requestBody(call: ts.CallExpression): boolean;
   /** An identifier holding the incoming Request object itself. */
   requestName(name: string): boolean;
+  /**
+   * The expression is a schema this project declares that keeps only the fields it names, so
+   * `schema.parse(body)` is an allow-list. False for a schema we cannot resolve: an unknown
+   * `schema.parse(...)` has to stay whole, because it may keep every key the caller sent.
+   */
+  strippingSchema(e: ts.Expression): boolean;
 }
 
 /** Array methods whose result holds the receiver's own elements, unchanged. */
@@ -39,12 +45,31 @@ const LOGICAL = new Set([
   ts.SyntaxKind.AmpersandAmpersandToken,
 ]);
 
+/**
+ * A parse through a schema this project declares: `levelSchema.parse(input)`,
+ * `levelSchema.safeParse(input).data`. An object schema keeps only the fields it names, so the
+ * result is an allow-list the developer wrote, not the caller's object. The schema has to be
+ * resolvable (see `WholeContext.strippingSchema`): an unknown `schema.parse(...)` stays whole.
+ */
+const SCHEMA_PARSE = /^(parse|safeParse|parseAsync|safeParseAsync)$/;
+
+function isSchemaParse(call: ts.CallExpression, cx: WholeContext): boolean {
+  const callee = call.expression;
+  if (!ts.isPropertyAccessExpression(callee) || !SCHEMA_PARSE.test(callee.name.text)) return false;
+  const recv = callee.expression;
+  if (isWholeInput(recv, cx)) return false;
+  return cx.strippingSchema(recv);
+}
+
 /** Does `e` evaluate to an entire request input object, written without an allow-list of fields? */
 export function isWholeInput(e: ts.Expression, cx: WholeContext): boolean {
   const u = unwrap(e);
   if (ts.isIdentifier(u)) return cx.wholeName(u.text);
-  // A nested object of the caller's input (`body.profile`, `parsed.data`) is still theirs entirely.
+  // A nested object of the caller's input (`body.profile`) is still theirs entirely — but
+  // `parsed.data` of a schema parse is the fields the schema declares.
   if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
+    const inner = unwrap(u.expression);
+    if (ts.isCallExpression(inner) && isSchemaParse(inner, cx)) return false;
     return isWholeInput(u.expression, cx);
   }
   if (ts.isObjectLiteralExpression(u)) {
@@ -65,6 +90,7 @@ export function isWholeInput(e: ts.Expression, cx: WholeContext): boolean {
 
 function isWholeCall(call: ts.CallExpression, cx: WholeContext): boolean {
   if (cx.requestBody(call)) return true;
+  if (isSchemaParse(call, cx)) return false;
   const callee = call.expression;
   if (ts.isPropertyAccessExpression(callee)) {
     const method = callee.name.text;
@@ -98,6 +124,7 @@ function callbackKeepsWhole(
     wholeName: (n) => elementNames.has(n) || cx.wholeName(n),
     requestBody: cx.requestBody,
     requestName: cx.requestName,
+    strippingSchema: cx.strippingSchema,
   };
   return ownReturns(f).some((r) => isWholeInput(r, inner));
 }

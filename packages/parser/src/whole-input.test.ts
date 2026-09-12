@@ -12,6 +12,9 @@ const cx: WholeContext = {
     c.expression.expression.text === "req" &&
     /^(json|formData|text)$/.test(c.expression.name.text),
   requestName: (n) => n === "req",
+  // Only `allowList` resolves to an object schema here; `schema` is unknown, as an imported
+  // name we cannot read would be.
+  strippingSchema: (e) => ts.isIdentifier(e) && e.text === "allowList",
 };
 
 function expr(code: string): ts.Expression {
@@ -31,11 +34,18 @@ describe("isWholeInput", () => {
     expect(whole("await req.json()")).toBe(true);
     expect(whole("{ ...body, owner_id: user.id }")).toBe(true);
     expect(whole("Object.fromEntries(formData)")).toBe(true);
+    // An unresolvable schema keeps the payload whole: it may pass every key through.
     expect(whole("schema.parse(await req.json())")).toBe(true);
     expect(whole("parseBody(req)")).toBe(true);
     expect(whole("body.profile")).toBe(true);
     expect(whole("[body]")).toBe(true);
     expect(whole("cond ? body : {}")).toBe(true);
+  });
+
+  it("does not treat a parse through a schema of this project as whole", () => {
+    expect(whole("allowList.parse(await req.json())")).toBe(false);
+    expect(whole("allowList.safeParse(body).data")).toBe(false);
+    expect(whole("allowList.parse(body)")).toBe(false);
   });
 
   it("does not treat an allow-list of explicit fields as whole", () => {

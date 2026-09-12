@@ -565,6 +565,14 @@ function usesInput(frame: Frame, e: ts.Node): boolean {
   return hit;
 }
 
+/**
+ * A read of something the caller sends, at any depth: `cookies()` and `headers()` from next/headers
+ * (awaited or not), `cookieStore.get("x")?.value`, `req.cookies.get(...)`. Deliberately narrow: it
+ * must be a read, not a write (`cookieStore.set`) and not the store itself being passed to a client.
+ */
+const CALLER_READ =
+  /\b(?:await\s+)?cookies\(\)\s*(?:\.|$)|cookieStore\s*\.\s*get\s*\(|\bcookies\s*\.\s*get\s*\(|\b(?:await\s+)?headers\(\)\s*\.\s*get\s*\(/;
+
 /** What the caller controls on a Request: body readers, headers, cookies, URL (not `req.auth`, a session). */
 const REQUEST_MEMBER =
   /^(json|formData|text|arrayBuffer|blob|body|headers|cookies|url|nextUrl|query|params|ip|geo)$/;
@@ -657,12 +665,36 @@ function isRequestBodyCall(frame: Frame, call: ts.CallExpression): boolean {
   return frame.depth === 0 && frame.reqNames.size === 0 && REQUEST_NAME.test(recv.text);
 }
 
-function wholeContext(frame: Frame): WholeContext {
+function wholeContext(p: Project, frame: Frame): WholeContext {
   return {
     wholeName: (n) => frame.wholeNames.has(n),
     requestBody: (c) => isRequestBodyCall(frame, c),
     requestName: (n) => frame.reqNames.has(n),
+    strippingSchema: (e) => isStrippingSchema(p, frame, e),
   };
+}
+
+/** An object schema that drops unknown keys: `z.object({...})`, with or without `.strict()`. */
+const OBJECT_SCHEMA = /\b(?:z|zod|v|valibot|yup)\s*\.\s*object\s*\(/;
+/** Modifiers that keep whatever the caller sent, which makes the parse no allow-list at all. */
+const SCHEMA_KEEPS_UNKNOWN = /\.\s*(?:passthrough|catchall|nonstrict|unknown)\s*\(/;
+
+/**
+ * Is this expression a schema of this project that keeps only the fields it declares? Resolved
+ * through the module scope, so an imported `levelSchema` is judged by its own declaration; an
+ * unresolvable name is not a schema as far as we know.
+ */
+function isStrippingSchema(p: Project, frame: Frame, e: ts.Expression): boolean {
+  const u = unwrap(e);
+  if (ts.isCallExpression(u) || ts.isPropertyAccessExpression(u)) {
+    const text = u.getText();
+    return OBJECT_SCHEMA.test(text) && !SCHEMA_KEEPS_UNKNOWN.test(text);
+  }
+  if (!ts.isIdentifier(u)) return false;
+  const sym = scopeOf(p, frame.facts).get(u.text);
+  if (sym?.kind !== "var") return false;
+  const text = sym.init.getText();
+  return OBJECT_SCHEMA.test(text) && !SCHEMA_KEEPS_UNKNOWN.test(text);
 }
 
 /**
@@ -726,7 +758,7 @@ function argBinding(p: Project, arg: ts.Expression | undefined, frame: Frame): A
     client,
     instance,
     tainted: derivedIn(frame, arg),
-    whole: isWholeInput(arg, wholeContext(frame)),
+    whole: isWholeInput(arg, wholeContext(p, frame)),
     isRequest,
   };
 }
@@ -892,6 +924,14 @@ function bindDeclarations(p: Project, frame: Frame, acc: Acc): void {
         continue;
       }
     }
+    // A cookie or a request header is caller-supplied wherever it is read, not only in the handler:
+    // custom sessions live in helpers (`getAdvertiserFromCookies()` -> `.eq("token", token)`), and
+    // without this the credential lookup that authenticates the caller is invisible.
+    if (CALLER_READ.test(text)) {
+      if (frame.depth === 0) handlerInput("header", names, decl);
+      else bindInput(names, false);
+      continue;
+    }
     if (ts.isCallExpression(init)) {
       const inst = instanceOfCall(p, init, frame, scope);
       if (inst && ts.isIdentifier(decl.name)) {
@@ -908,7 +948,7 @@ function bindDeclarations(p: Project, frame: Frame, acc: Acc): void {
         // an object whose tainted properties are known. Anything unresolved returns its input.
         const rt = returnTaint(p, init, frame, scope, 0);
         if (rt === null || (rt.tainted && rt.props === null)) {
-          bindInput(names, isWholeInput(init, wholeContext(frame)));
+          bindInput(names, isWholeInput(init, wholeContext(p, frame)));
         } else if (rt.tainted && rt.props !== null) {
           if (ts.isIdentifier(decl.name))
             frame.partialInputs.set(decl.name.text, new Set(rt.props));
@@ -950,7 +990,7 @@ function bindDeclarations(p: Project, frame: Frame, acc: Acc): void {
         } else if (partial) bindPatternFrom(frame, decl.name, partial);
       }
     } else if (!isChainWithQuery(init) && derivedIn(frame, init)) {
-      bindInput(names, isWholeInput(init, wholeContext(frame)));
+      bindInput(names, isWholeInput(init, wholeContext(p, frame)));
     }
   }
   if (frame.depth === 0) {
@@ -1084,7 +1124,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       ? {
           text: arg.getText(sf).replace(/\s+/g, " ").slice(0, 200),
           inputDerived: derivedIn(frame, arg),
-          wholeInput: isWholeInput(arg, wholeContext(frame)),
+          wholeInput: isWholeInput(arg, wholeContext(p, frame)),
         }
       : null;
   interface Parsed {
@@ -1382,7 +1422,7 @@ function childFrame(
     pathPos: [...frame.pathPos, call.getStart(frame.sf)],
     exitPropagates: frame.exitPropagates && callResultChecked(call),
   };
-  const cx = wholeContext(frame);
+  const cx = wholeContext(p, frame);
   target.fn.parameters.forEach((param, i) => {
     const arg = call.arguments[i];
     const ab = argBinding(p, arg, frame);
@@ -1824,6 +1864,68 @@ interface HandlerInput {
   wrapper: string | undefined;
 }
 
+interface LayoutGuards {
+  authChecks: AuthCheck[];
+  roleChecks: RoleCheck[];
+}
+
+const EMPTY_GUARDS: LayoutGuards = { authChecks: [], roleChecks: [] };
+
+/**
+ * Auth evidence of the `layout.tsx` files above a page. In the App Router every ancestor layout
+ * renders before the page, so a layout that reads the session and redirects (or 404s) without one
+ * guards everything below it: `app/admin/layout.tsx` calling `requireReviewer()` then `notFound()`
+ * authenticates every admin page. Only the auth evidence is taken; the layout's own queries stay
+ * with the layout.
+ */
+function layoutGuards(p: Project, pageRel: string, cache: Map<string, LayoutGuards>): LayoutGuards {
+  const parts = pageRel.split("/");
+  parts.pop();
+  const out: LayoutGuards = { authChecks: [], roleChecks: [] };
+  for (let i = parts.length; i > 0; i--) {
+    const g = layoutGuardsFor(p, parts.slice(0, i).join("/"), cache);
+    out.authChecks.push(...g.authChecks);
+    out.roleChecks.push(...g.roleChecks);
+  }
+  return out;
+}
+
+const LAYOUT_EXTENSIONS = ["tsx", "ts", "jsx", "js"] as const;
+
+function layoutGuardsFor(p: Project, dir: string, cache: Map<string, LayoutGuards>): LayoutGuards {
+  const hit = cache.get(dir);
+  if (hit) return hit;
+  let guards = EMPTY_GUARDS;
+  for (const ext of LAYOUT_EXTENSIONS) {
+    const rel = `${dir}/layout.${ext}`;
+    const sf = p.sources.get(rel);
+    const facts = p.registry.get(rel);
+    if (!sf || !facts || isClientComponentFile(sf)) continue;
+    const fn = pageHandlerIn(sf);
+    if (!fn) continue;
+    try {
+      const analysed = analyzeHandler(p, {
+        rel,
+        sf,
+        facts,
+        kind: "page",
+        route: dir,
+        method: "PAGE",
+        fn: fn.fn,
+        node: fn.node,
+        wrapper: fn.wrapper,
+      });
+      guards = { authChecks: analysed.authChecks, roleChecks: analysed.roleChecks ?? [] };
+    } catch {
+      // A layout the analyser cannot read guards nothing, exactly like no layout at all.
+      guards = EMPTY_GUARDS;
+    }
+    break;
+  }
+  cache.set(dir, guards);
+  return guards;
+}
+
 function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
   const { rel, sf, fn } = h;
   const loc = (n: ts.Node): FileRef => ({ file: rel, line: lineOf(sf, n) });
@@ -2073,6 +2175,18 @@ interface FileOutputs {
   fileIgnores: Record<string, IgnoreDirective[]>;
 }
 
+/** Layout guards already computed for this project, by directory. Cleared with the project. */
+const LAYOUT_CACHE = new WeakMap<Project, Map<string, LayoutGuards>>();
+
+function layoutCacheOf(p: Project): Map<string, LayoutGuards> {
+  let m = LAYOUT_CACHE.get(p);
+  if (!m) {
+    m = new Map();
+    LAYOUT_CACHE.set(p, m);
+  }
+  return m;
+}
+
 /** Everything one source file contributes: file-level directives, secret exposures and its entry points. */
 function analyzeFile(
   project: Project,
@@ -2139,6 +2253,11 @@ function analyzeFile(
           node: handler.node,
           wrapper: handler.wrapper,
         });
+        const guards = layoutGuards(project, rel, layoutCacheOf(project));
+        analysed.authChecks.push(...guards.authChecks);
+        if (guards.roleChecks.length > 0) {
+          analysed.roleChecks = [...(analysed.roleChecks ?? []), ...guards.roleChecks];
+        }
         // A page that reads nothing and takes no input is not an entry point worth reporting on.
         if (analysed.queries.length > 0 || analysed.inputs.length > 0) routes.push(analysed);
       }
