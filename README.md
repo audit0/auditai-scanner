@@ -1,4 +1,8 @@
 <p align="center">
+  <a href="https://auditai.sh"><img src="./.github/assets/banner.png" alt="Audit AI. Your AI writes code. We prove it's safe to merge. Open-source security scanner for Next.js + Supabase apps: npx auditai-scan ." width="100%"></a>
+</p>
+
+<p align="center">
   <a href="https://auditai.sh"><img src="https://img.shields.io/badge/auditai.sh-product-22c55e?style=flat-square" alt="auditai.sh"></a>
   <a href="https://github.com/audit0/auditai-scanner/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/audit0/auditai-scanner/ci.yml?branch=main&style=flat-square&label=ci" alt="CI"></a>
   <a href="https://www.npmjs.com/package/auditai-scan"><img src="https://img.shields.io/npm/v/auditai-scan?style=flat-square&label=npm" alt="npm"></a>
@@ -6,7 +10,14 @@
   <a href="https://x.com/Audit_AI"><img src="https://img.shields.io/badge/X-%40Audit__AI-000?style=flat-square" alt="X"></a>
 </p>
 
-<h1 align="center">Audit AI Scanner</h1>
+<p align="center">
+  <a href="https://auditai.sh">Scan a repository</a> ·
+  <a href="https://auditai.sh/r/demo">Sample report</a> ·
+  <a href="https://auditai.sh/docs">Docs</a> ·
+  <a href="https://auditai.sh/stats">Measured precision</a> ·
+  <a href="https://github.com/audit0/auditai-playground">Playground</a> ·
+  <a href="https://youtube.com/shorts/_0e0qbXlorI">Video</a>
+</p>
 
 <p align="center"><strong>Your AI writes code. This scanner finds the bug it ships most: one customer reading another customer's data.</strong></p>
 
@@ -38,6 +49,13 @@ database function, mapped and checked. The hosted product takes a finding from h
 prove it.
 
 ## Try the whole loop
+
+54 seconds on the [playground app](https://github.com/audit0/auditai-playground): a scan by link,
+the finding in plain words, Prove it in the sandbox, Alice reading Bob's invoice, then the fix
+verified by the same attack. The opening message is illustrative and the voice is synthetic;
+everything on screen after it is the live product. Also on [YouTube](https://youtube.com/shorts/_0e0qbXlorI).
+
+https://github.com/user-attachments/assets/50ac7fdf-3a84-4089-a106-44ada2a8f081
 
 - **Scan a public repository by link** at [auditai.sh](https://auditai.sh), free and without an
   account. The report explains each finding in plain words for the app's owner and gives the

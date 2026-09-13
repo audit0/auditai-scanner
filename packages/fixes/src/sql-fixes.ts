@@ -126,7 +126,7 @@ function policedTables(f: SqlFunctionInfo, model: ProjectModel): string[] | null
   const out: string[] = [];
   for (const n of names) {
     const t = table(model, n);
-    if (!t || !t.rlsEnabled || t.policies.length === 0) return null;
+    if (!t?.rlsEnabled || t.policies.length === 0) return null;
     out.push(qualified(t.table));
   }
   return out;
