@@ -51,6 +51,8 @@ interface FunctionState {
   returns: string | null;
   /** Argument types as written (`uuid, integer`), empty for none, null when unreadable. */
   args: string | null;
+  /** Input parameters in order (name null when unnamed); null when the list is unreadable. */
+  params: FunctionParam[] | null;
   /** Body with comments blanked. */
   body: string;
   directCheck: boolean;
@@ -151,7 +153,8 @@ export function applyCreateFunction(reg: FunctionRegistry, stmt: SqlStatement, f
   const q = readQualifiedName(tk, i + 1);
   if (!q || !isPunct(tk[q.next], "(")) return;
   const argsEnd = groupEnd(tk, q.next);
-  const args = argumentTypes(stmt, tk, q.next, argsEnd);
+  const params = readParams(stmt, tk, q.next, argsEnd);
+  const args = params === null ? null : params.map((p) => p.type).join(", ");
   i = argsEnd + 1;
   let securityDefiner = false;
   let returns: string | null = null;
@@ -192,6 +195,7 @@ export function applyCreateFunction(reg: FunctionRegistry, stmt: SqlStatement, f
     securityDefiner,
     returns,
     args,
+    params,
     body: code,
     directCheck: CALLER_CHECKS.some((re) => re.test(code)),
     acl: reg.byKey.get(key)?.acl ?? initialAcl(reg, q.schema),
@@ -261,20 +265,26 @@ const TYPE_WORD = new Set([
   "xml",
 ]);
 
+interface FunctionParam {
+  name: string | null;
+  type: string;
+}
+
 /**
- * Types of the declared parameters, as GRANT and REVOKE need them: `create function f(p_id uuid,
- * count integer default 0)` gives `uuid, integer`. Modes (`in`, `out`, `variadic`), names and
+ * The declared input parameters: `create function f(p_id uuid, count integer default 0)` gives
+ * `p_id uuid` and `count integer`. Their types, joined, are the signature GRANT and REVOKE need;
+ * their names are what PostgREST expects in an rpc call body. Modes (`in`, `out`, `variadic`) and
  * defaults are dropped; `out` parameters are not part of the signature. Null when the list holds
  * something this reader does not understand, so the caller can say so instead of guessing.
  */
-function argumentTypes(
+function readParams(
   stmt: SqlStatement,
   tokens: readonly Token[],
   open: number,
   close: number,
-): string | null {
-  if (close <= open + 1) return "";
-  const parts: string[] = [];
+): FunctionParam[] | null {
+  if (close <= open + 1) return [];
+  const parts: FunctionParam[] = [];
   let depth = 0;
   let start = open + 1;
   const pieces: Array<[number, number]> = [];
@@ -317,15 +327,16 @@ function argumentTypes(
     const first = words[typeStart];
     const last = words[words.length - 1];
     if (!first || !last) return null;
-    parts.push(
-      stmt.text
+    parts.push({
+      name: named && firstWord ? firstWord.value.toLowerCase() : null,
+      type: stmt.text
         .slice(first.start - stmt.start, last.end - stmt.start)
         .replace(/\s+/g, " ")
         .trim()
         .toLowerCase(),
-    );
+    });
   }
-  return parts.join(", ");
+  return parts;
 }
 
 /** `name[(args)], name2[(args)]` → keys; `next` is the index after the list. */
@@ -555,6 +566,27 @@ function callees(
   return out;
 }
 
+/**
+ * Relations named after FROM or JOIN: `from public.invoices i`, `join "notes" n`. A name followed by
+ * `(` is a function (`from generate_series(...)`, `extract(epoch from now())`) and is skipped. Not a
+ * SQL parser: CTE names and aliases of subqueries come through too, so consumers keep only names the
+ * schema has. Bounded names, so hostile bodies cannot make it quadratic.
+ */
+const RELATION =
+  /(?<![A-Za-z0-9_$])(?:from|join)\s+(?:only\s+)?(?:"?([A-Za-z_][A-Za-z0-9_$]{0,62})"?\s*\.\s*)?"?([A-Za-z_][A-Za-z0-9_$]{0,62})"?(?![A-Za-z0-9_$"]|\s*[.(])/gi;
+
+function relationsOf(body: string): string[] {
+  const out: string[] = [];
+  for (const m of body.matchAll(RELATION)) {
+    const schema = m[1]?.toLowerCase();
+    const name = m[2]?.toLowerCase();
+    if (!name || name === "only" || name === "lateral") continue;
+    const key = schema === undefined || schema === "public" ? name : `${schema}.${name}`;
+    if (!out.includes(key)) out.push(key);
+  }
+  return out;
+}
+
 function effectiveRoles(acl: Acl): string[] {
   const out: string[] = [];
   if (acl.publicExec || acl.roles.includes("anon")) out.push("anon");
@@ -599,6 +631,10 @@ export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
     };
     if (f.returns !== null) info.returns = f.returns;
     if (f.args !== null) info.args = f.args;
+    if (f.params?.every((x) => x.name !== null))
+      info.params = f.params.map((x) => ({ name: x.name ?? "", type: x.type }));
+    const tables = relationsOf(f.body);
+    if (tables.length > 0) info.tables = tables;
     return info;
   });
 }

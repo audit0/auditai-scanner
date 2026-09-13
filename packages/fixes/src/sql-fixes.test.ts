@@ -76,6 +76,44 @@ describe("SECURITY DEFINER function", () => {
     expect(fix?.rationale).toContain("anon and authenticated directly");
   });
 
+  it("runs a reading function as the caller when every table it reads is policed by RLS", () => {
+    const sql = `create table public.invoices (id uuid primary key, tenant_id uuid not null, amount integer);
+alter table public.invoices enable row level security;
+create policy "invoices: tenant reads" on public.invoices for select to authenticated using (true);
+create table public.drafts (id uuid primary key, amount integer);
+alter table public.drafts enable row level security;
+create function public.invoice_total(invoice_id uuid) returns bigint language sql security definer as $$
+  select sum(amount) from public.invoices where id = invoice_id
+$$;
+create function public.draft_total(draft_id uuid) returns bigint language sql security definer as $$
+  select sum(amount) from public.drafts where id = draft_id
+$$;
+create function public.user_count() returns bigint language sql security definer as $$
+  select count(*) from auth.users
+$$;
+create function public.touch(invoice_id uuid) returns void language sql security definer as $$
+  select 1 from public.invoices where id = invoice_id
+$$;
+`;
+    const rule = "supabase.security-definer-function-without-caller-check";
+    const invoker = sqlFixFor(finding(rule, { function: "invoice_total" }), model(sql));
+    expect(invoker?.sql).toContain("alter function public.invoice_total(uuid) security invoker;");
+    expect(invoker?.sql).not.toContain("revoke");
+    expect(invoker?.rationale).toContain("public.invoices");
+    // RLS on but no policy: running as the caller would return nothing, so the app would break.
+    expect(sqlFixFor(finding(rule, { function: "draft_total" }), model(sql))?.sql).toContain(
+      "revoke execute on function public.draft_total(uuid)",
+    );
+    // A table the schema does not have: we cannot tell what the caller may read.
+    expect(sqlFixFor(finding(rule, { function: "user_count" }), model(sql))?.sql).toContain(
+      "revoke execute",
+    );
+    // Nothing is returned, so nothing tells a reading caller from a writing one.
+    expect(sqlFixFor(finding(rule, { function: "touch" }), model(sql))?.sql).toContain(
+      "revoke execute",
+    );
+  });
+
   it("proposes nothing for a function the migrations do not declare", () => {
     const fix = sqlFixFor(
       finding("supabase.security-definer-function-without-caller-check", { function: "ghost" }),

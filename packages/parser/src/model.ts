@@ -263,6 +263,16 @@ export interface SqlFunctionInfo {
    * the parameter list could not be read; overloads share one entry, and this is the first one seen.
    */
   args?: string;
+  /**
+   * Input parameters with their names, in order: what an rpc call body is keyed by. Absent when any
+   * input parameter is unnamed or the list could not be read.
+   */
+  params?: Array<{ name: string; type: string }>;
+  /**
+   * Relations named after FROM or JOIN in the body (lowercase, `public.` stripped): the tables it can
+   * read, or delete from. Unfiltered text matches; keep only names the schema has.
+   */
+  tables?: string[];
 }
 
 /** A Supabase Storage bucket created by migration SQL (`insert into storage.buckets ...`). */

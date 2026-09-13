@@ -727,6 +727,9 @@ describe("fixtures", () => {
         returns: "uuid",
         // Argument types, so a GRANT or REVOKE the fixer writes names the right overload.
         args: "",
+        // Named parameters (none) and the tables the body reads: what an rpc proof binds and seeds.
+        params: [],
+        tables: ["profiles"],
       },
     ]);
     const policy = m.tables.find((t) => t.table === "invoices")?.policyDetails[0];
@@ -919,5 +922,34 @@ create function public.f(p_at timestamp with time zone, p_num numeric(10, 2)) re
     // OUT parameters are not part of the signature Postgres identifies a function by.
     expect(byName.e).toBe("uuid");
     expect(byName.f).toBe("timestamp with time zone, numeric(10, 2)");
+  });
+});
+
+describe("function parameters and body tables (for an rpc proof)", () => {
+  const { sqlFunctions } =
+    parse(`create function public.invoice_total(invoice_id uuid) returns bigint language sql security definer as $$
+  select sum(i.amount_cents) from public.invoices i join "invoice_lines" l on l.invoice_id = i.id where i.id = invoice_id
+$$;
+create function public.anon_args(uuid, text) returns void language sql as $$ select 1 $$;
+create function public.series() returns setof int language sql as $$
+  select g from generate_series(1, 3) g where extract(epoch from now()) > 0
+$$;
+create function public.other_schema() returns int language sql as $$ select count(*)::int from private.audit_log $$;`);
+  const byName = Object.fromEntries(sqlFunctions.map((f) => [f.name, f]));
+
+  it("keeps parameter names in order, with their types", () => {
+    expect(byName.invoice_total?.params).toEqual([{ name: "invoice_id", type: "uuid" }]);
+    expect(byName.series?.params).toEqual([]);
+  });
+
+  it("has no params when a parameter is unnamed: an rpc body cannot be keyed", () => {
+    expect(byName.anon_args?.args).toBe("uuid, text");
+    expect(byName.anon_args?.params).toBeUndefined();
+  });
+
+  it("lists relations after FROM and JOIN, and skips functions", () => {
+    expect(byName.invoice_total?.tables).toEqual(["invoices", "invoice_lines"]);
+    expect(byName.series?.tables).toBeUndefined();
+    expect(byName.other_schema?.tables).toEqual(["private.audit_log"]);
   });
 });

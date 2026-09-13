@@ -113,12 +113,44 @@ const HEADER = (title: string): string =>
 
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * The tables a function reads when every one of them is a table of this schema with row level
+ * security on and at least one policy; otherwise null. Only then can the function run with the
+ * caller's rights without losing what the app itself reads through it: the policies already decide
+ * what each caller may see. A relation the schema does not have (auth.users, a CTE, a view) means
+ * we cannot tell, and the fix stays a revoke.
+ */
+function policedTables(f: SqlFunctionInfo, model: ProjectModel): string[] | null {
+  const names = f.tables ?? [];
+  if (names.length === 0) return null;
+  const out: string[] = [];
+  for (const n of names) {
+    const t = table(model, n);
+    if (!t || !t.rlsEnabled || t.policies.length === 0) return null;
+    out.push(qualified(t.table));
+  }
+  return out;
+}
+
 function sqlFunctionFix(finding: Finding, model: ProjectModel): SqlFix | null {
   const name = finding.evidence[0]?.data?.function;
   const f = fn(model, typeof name === "string" ? name : undefined);
   if (!f) return null;
   const sig = signatureOf(f);
   const ambiguous = sig.endsWith("(...)");
+  const policed = f.returns !== undefined && f.returns !== "void" ? policedTables(f, model) : null;
+  if (policed && !ambiguous) {
+    return {
+      file: `fix_security_invoker_${f.name.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}.sql`,
+      sql: [
+        HEADER(`Run ${f.name} with the caller's rights, so row level security applies inside it`),
+        `-- It reads ${policed.join(", ")}, and each of them has row level security with policies.\n`,
+        `alter function ${sig} security invoker;\n`,
+      ].join(""),
+      summary: `Run ${f.name} with the caller's rights (security invoker)`,
+      rationale: `${f.name} only reads tables that already have row level security with policies (${policed.join(", ")}), so running it with the caller's rights lets those policies decide what it returns, and calls from your app keep working. If it must keep its owner's rights on purpose (for example it counts rows a caller may not see), revoke execute from public, anon and authenticated instead, or add a caller check inside the body.`,
+    };
+  }
   const body = [
     HEADER(`Stop anon and authenticated from calling ${f.name} directly`),
     ambiguous
