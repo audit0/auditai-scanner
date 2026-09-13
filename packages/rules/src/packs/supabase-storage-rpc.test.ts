@@ -146,6 +146,11 @@ create policy "Owners update avatars" on storage.objects for update using (auth.
       'Storage policy "Anyone can upload an avatar." lets anyone upload into every object in bucket "avatars"',
     ]);
     expect(findings[0]?.entrypoints).toEqual(['Storage API: bucket "avatars"']);
+    // Uploading cannot read, replace or delete other users' files.
+    expect(findings[0]?.severity).toBe("medium");
+    expect(findings[0]?.evidence[0]?.summary).toContain(
+      "cannot read, replace or delete existing files",
+    );
   });
 
   it("treats public reads as intentional unless the bucket is declared private", () => {
@@ -174,6 +179,7 @@ create policy "tenant folder" on storage.objects for select to authenticated usi
     expect(findings.map((f) => f.title)).toEqual([
       'Storage policy "everything" lets any authenticated user delete every object in every bucket',
     ]);
+    expect(findings[0]?.severity).toBe("high");
   });
 
   it("extracts bucket ids from = and in (...)", () => {
@@ -208,6 +214,66 @@ create function public.leaky(p uuid) returns setof invoices language sql securit
         ["POST /rest/v1/rpc/leaky"],
       ],
     ]);
+  });
+
+  it("counts a helper call that leaves out a parameter defaulting to auth.uid() as a caller check", () => {
+    const findings = definerFindings(`
+create table public.profiles (id uuid primary key, role text, can_blog boolean);
+create function public.user_can_blog(p_user_id uuid default auth.uid()) returns boolean language sql security definer as $$ select exists (select 1 from profiles where id = p_user_id and (role = 'admin' or can_blog)) $$;
+create function public.admin_create_post(p_title text) returns uuid language plpgsql security definer as $$ begin if not user_can_blog() then raise exception 'unauthorized'; end if; return gen_random_uuid(); end $$;
+create function public.post_as(p_author uuid) returns boolean language plpgsql security definer as $$ begin return user_can_blog(p_author); end $$;
+create function public.named_other(p_x uuid) returns boolean language plpgsql security definer as $$ begin return user_can_blog(p_user_id => p_x); end $$;
+`);
+    // The helper itself takes any user id, and so do the callers that pass one.
+    expect(findings.map((f) => f.title).sort()).toEqual([
+      'Anonymous-callable SECURITY DEFINER function "named_other" without a caller check',
+      'Anonymous-callable SECURITY DEFINER function "post_as" without a caller check',
+      'Anonymous-callable SECURITY DEFINER function "user_can_blog" without a caller check',
+    ]);
+  });
+
+  it("skips a function that writes nothing, calls nothing and reads only tables every visitor can read", () => {
+    const findings = definerFindings(`
+create table public.venue_managers (venue_id uuid, profile_id uuid);
+alter table public.venue_managers enable row level security;
+create policy "managers are public" on public.venue_managers for select using (true);
+create table public.member_notes (id uuid primary key, body text);
+alter table public.member_notes enable row level security;
+create policy "members read" on public.member_notes for select to authenticated using (true);
+create table public.secrets (id uuid primary key, owner uuid, value text);
+alter table public.secrets enable row level security;
+create policy "own" on public.secrets for select using (owner = auth.uid());
+create function public.can_manage_venue(p_venue uuid, p_profile uuid) returns boolean language sql security definer as $$ select exists (select 1 from venue_managers where venue_id = p_venue and profile_id = p_profile) $$;
+create function public.note(p uuid) returns text language sql security definer as $$ select body from member_notes where id = p $$;
+create function public.secret_of(p uuid) returns text language sql security definer as $$ select value from secrets where id = p $$;
+create function public.clear_managers(p uuid) returns void language plpgsql security definer as $$ begin delete from venue_managers where venue_id = p; end $$;
+create function public.public_with_helper(p uuid) returns boolean language sql security definer as $$ select exists (select 1 from venue_managers v where v.venue_id = p and secret_of(p) is not null) $$;
+`);
+    expect(findings.map((f) => f.title).sort()).toEqual([
+      'Anonymous-callable SECURITY DEFINER function "clear_managers" without a caller check',
+      'Anonymous-callable SECURITY DEFINER function "note" without a caller check',
+      'Anonymous-callable SECURITY DEFINER function "public_with_helper" without a caller check',
+      'Anonymous-callable SECURITY DEFINER function "secret_of" without a caller check',
+    ]);
+  });
+
+  it("lets a public policy silence it only when a migration declares that policy", () => {
+    const table = `create table public.community_members (id uuid primary key, community_id uuid, user_id uuid);
+alter table public.community_members enable row level security;
+create policy "own" on public.community_members for select using (user_id = auth.uid());`;
+    const open = `create policy "open" on public.community_members for select using (true);`;
+    const fn = `create function public.members_of(p uuid) returns setof uuid language sql security definer as $$ select user_id from community_members where community_id = p $$;`;
+    const run = (files: Record<string, string>) => {
+      const model = parseProject(tempProject(files));
+      return runRules([securityDefinerFunctionWithoutCallerCheck], model, buildGraph(model), {
+        now: NOW,
+      });
+    };
+    expect(run({ "supabase/migrations/0001.sql": `${table}\n${open}\n${fn}` })).toEqual([]);
+    // The same policy in hand-run SQL beside the migrations may never have reached the database.
+    expect(
+      run({ "supabase/migrations/0001.sql": `${table}\n${fn}`, "tools/rls_fix.sql": open }),
+    ).toHaveLength(1);
   });
 
   it("reads functions from model.sqlFunctions only; a model without them knows none", () => {
@@ -303,5 +369,25 @@ create policy "deals: org members" on public.deals for select to authenticated u
 create policy "deals: org members" on public.deals for select to authenticated using (organization_id in (select public.fn_user_org_ids()));`,
     });
     expect(r3(unknown)).toHaveLength(1);
+  });
+
+  it("ignores a policy written only for service_role, which never decides for a request", () => {
+    const route = `import { createClient } from "@supabase/supabase-js";
+export async function GET(req: Request) {
+  const token = req.headers.get("authorization")!;
+  const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!, { global: { headers: { Authorization: token } } });
+  const { data } = await supabase.from("deals").select("*");
+  return Response.json(data);
+}
+`;
+    const project = (roles: string) =>
+      tempProject({
+        "app/api/deals/route.ts": route,
+        "supabase/migrations/0001.sql": `create table public.deals (id uuid primary key, organization_id uuid not null);
+alter table public.deals enable row level security;
+create policy "Service role bypass" on public.deals for all to ${roles} using (true) with check (true);`,
+      });
+    expect(r3(project("service_role"))).toEqual([]);
+    expect(r3(project("authenticated, service_role"))).toHaveLength(1);
   });
 });

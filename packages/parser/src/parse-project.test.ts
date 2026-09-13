@@ -142,11 +142,13 @@ describe("parseProject on fixture 001", () => {
       valueText: "id",
       inputDerived: true,
     });
+    // `profile` is the caller's own row (selected by the session user's id), so its tenant is identity.
     expect(invoices?.filters).toContainEqual({
       method: "eq",
       column: "tenant_id",
       valueText: "profile.tenant_id",
       inputDerived: false,
+      identity: true,
     });
   });
 

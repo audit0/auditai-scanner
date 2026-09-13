@@ -613,6 +613,27 @@ describe("SQL function call chains", () => {
       unrelated: false,
     });
   });
+
+  it("counts a call that leaves out a parameter defaulting to auth.uid() as a caller check", () => {
+    const { sqlFunctions } = parse(`
+      create function user_can_blog(p_user_id uuid default auth.uid()) returns boolean language sql security definer
+        as $$ select exists (select 1 from profiles where id = p_user_id and can_blog) $$;
+      create function create_post(p_title text) returns void language plpgsql security definer
+        as $$ begin if not user_can_blog() then raise exception 'unauthorized'; end if; insert into posts (title) values (p_title); end $$;
+      create function post_as(p_author uuid) returns boolean language sql security definer
+        as $$ select user_can_blog(coalesce(p_author, null)) $$;
+      create function post_named(p_author uuid) returns boolean language sql security definer
+        as $$ select user_can_blog(p_user_id => p_author) $$;`);
+    const byName = Object.fromEntries((sqlFunctions ?? []).map((f) => [f.name, f]));
+    expect(Object.fromEntries(Object.values(byName).map((f) => [f.name, f.checksCaller]))).toEqual({
+      user_can_blog: false,
+      create_post: true,
+      post_as: false,
+      post_named: false,
+    });
+    expect(byName.create_post?.calls).toEqual(["user_can_blog"]);
+    expect(byName.user_can_blog?.calls).toBeUndefined();
+  });
 });
 
 describe("storage", () => {
@@ -663,6 +684,38 @@ ALTER TABLE user_preferences ENABLE ROW LEVEL SECURITY;
       ["scouts", true],
       ["scout_messages", true],
       ["user_preferences", true],
+    ]);
+  });
+
+  it("skips documentation and archived SQL when the project has Supabase migrations (GoalSquad docs/legacy)", () => {
+    const migrations = `create table public.community_members (id uuid primary key, community_id uuid, user_id uuid);
+alter table public.community_members enable row level security;
+create policy "own memberships" on public.community_members for select using (user_id = auth.uid());`;
+    const legacy = `create policy "Anyone can view members" on public.community_members for select using (true);
+create function public.get_featured() returns int language sql security definer as $$ select 1 $$;`;
+    const withMigrations = parseProject(
+      tempProject({
+        "supabase/migrations/0001_init.sql": migrations,
+        "docs/legacy/COMPLETE_SETUP.sql": legacy,
+        "scripts/archive/002_old.sql": legacy,
+        "scripts/setup_extras.sql": `create table public.extras (id uuid primary key);
+alter table public.extras enable row level security;
+create policy "extras open" on public.extras for select using (true);`,
+      }),
+    );
+    expect(withMigrations.tables.find((t) => t.table === "community_members")?.policies).toEqual([
+      "own memberships",
+    ]);
+    expect((withMigrations.sqlFunctions ?? []).map((f) => f.name)).toEqual([]);
+    // A setup script outside an archive may have been run by hand, so it still counts.
+    expect(withMigrations.tables.find((t) => t.table === "extras")?.policies).toEqual([
+      "extras open",
+    ]);
+    // Without migrations, SQL under docs/ may be the only schema there is.
+    const docsOnly = parseProject(tempProject({ "docs/schema.sql": `${migrations}\n${legacy}` }));
+    expect(docsOnly.tables.find((t) => t.table === "community_members")?.policies).toEqual([
+      "own memberships",
+      "Anyone can view members",
     ]);
   });
 });
@@ -951,5 +1004,103 @@ create function public.other_schema() returns int language sql as $$ select coun
     expect(byName.invoice_total?.tables).toEqual(["invoices", "invoice_lines"]);
     expect(byName.series?.tables).toBeUndefined();
     expect(byName.other_schema?.tables).toEqual(["private.audit_log"]);
+  });
+});
+
+describe("function defaults, writes and parameter keys (for an rpc proof)", () => {
+  const { sqlFunctions } =
+    parse(`create function public.archive_invoice(p_invoice_id uuid, p_reason text default 'manual') returns void language plpgsql security definer as $$
+begin
+  update public.invoices i set archived = true where i.id = p_invoice_id;
+  insert into public.audit_log (invoice_id, reason) values (p_invoice_id, p_reason);
+end $$;
+create function public.tokens_for(user_uuid uuid) returns table (remaining int) language sql security definer as $$
+  select remaining from public.ai_scan_tokens where user_id = user_uuid
+$$;
+create function public.reassign(p_row uuid, p_user uuid) returns void language sql security definer as $$
+  update notes set owner_id = p_user where id = p_row for update skip locked
+$$;
+create function public.vote(p_post uuid, p_user uuid) returns void language sql security definer as $$
+  insert into votes (post_id, user_id) values (p_post, p_user) on conflict (post_id, user_id) do update set created_at = now()
+$$;`);
+  const byName = Object.fromEntries(sqlFunctions.map((f) => [f.name, f]));
+
+  it("marks a parameter with a default, and only that one", () => {
+    expect(byName.archive_invoice?.params).toEqual([
+      { name: "p_invoice_id", type: "uuid" },
+      { name: "p_reason", type: "text", default: true },
+    ]);
+  });
+
+  it("lists the tables the body writes, without conflict or lock clauses", () => {
+    expect(byName.archive_invoice?.writes).toEqual(["invoices", "audit_log"]);
+    expect(byName.vote?.writes).toEqual(["votes"]);
+    expect(byName.reassign?.writes).toEqual(["notes"]);
+    expect(byName.tokens_for?.writes).toBeUndefined();
+  });
+
+  it("records the column a parameter is compared with, never one it is assigned to", () => {
+    expect(byName.archive_invoice?.keys).toEqual([
+      { param: "p_invoice_id", table: "invoices", column: "id" },
+    ]);
+    expect(byName.tokens_for?.keys).toEqual([
+      { param: "user_uuid", table: "ai_scan_tokens", column: "user_id" },
+    ]);
+    expect(byName.reassign?.keys).toEqual([{ param: "p_row", table: "notes", column: "id" }]);
+    expect(byName.vote?.keys).toBeUndefined();
+  });
+});
+
+describe("triggers: the columns a row's owner may not change", () => {
+  const { triggers } =
+    parse(`create function public.guard_profile() returns trigger language plpgsql as $$
+begin
+  if new.role is distinct from old.role then raise exception 'only admins change the role'; end if;
+  return new;
+end $$;
+create function public.stamp() returns trigger language plpgsql as $$
+begin
+  new.updated_at := now();
+  return new;
+end $$;
+create function public.reset_plan() returns trigger language plpgsql as $$
+begin
+  new.plan := 'free';
+  return new;
+end $$;
+create trigger guard_profile before update on public.profiles for each row execute function public.guard_profile();
+create or replace trigger stamp before insert or update on profiles for each row execute procedure stamp();
+create constraint trigger reset_plan after update of plan, seats on public.accounts for each row execute function reset_plan();
+create trigger gone before update on public.profiles for each row execute function public.guard_profile();
+drop trigger if exists gone on public.profiles;`);
+  const byName = Object.fromEntries(triggers.map((t) => [t.name, t]));
+
+  it("reads the table, timing, events and function, and forgets a dropped trigger", () => {
+    expect(Object.keys(byName).sort()).toEqual(["guard_profile", "reset_plan", "stamp"]);
+    expect(byName.guard_profile).toMatchObject({
+      table: "profiles",
+      timing: "before",
+      events: ["update"],
+      function: "guard_profile",
+    });
+    expect(byName.stamp?.events).toEqual(["insert", "update"]);
+    expect(byName.reset_plan?.timing).toBe("after");
+  });
+
+  it("counts a column compared with OLD in a raising body, assigned with :=, or listed in UPDATE OF", () => {
+    expect(byName.guard_profile?.checkedColumns).toEqual(["role"]);
+    expect(byName.stamp?.checkedColumns).toEqual(["updated_at"]);
+    expect([...(byName.reset_plan?.checkedColumns ?? [])].sort()).toEqual(["plan", "seats"]);
+  });
+
+  it("does not count a column the function only reads", () => {
+    const { triggers: only } =
+      parse(`create function public.notify_role() returns trigger language plpgsql as $$
+begin
+  perform pg_notify('roles', new.role);
+  return new;
+end $$;
+create trigger notify_role after update on public.profiles for each row execute function notify_role();`);
+    expect(only[0]?.checkedColumns).toEqual([]);
   });
 });

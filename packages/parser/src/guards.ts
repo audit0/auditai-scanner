@@ -161,6 +161,20 @@ export function rowComparisons(tail: ts.CallExpression): RowComparison[] {
   const { parent } = outerOf(tail);
   if (!parent || !ts.isVariableDeclaration(parent)) return [];
   const { data } = resultNames(parent.name);
+  // `const comp = listing.company as Company`: a part of the row, such as an embedded relation, is
+  // compared as the row itself.
+  const fn = enclosingFunction(parent);
+  const scope: ts.Node | undefined = fn ? fn.body : parent.getSourceFile();
+  if (scope) {
+    walkOwn(scope, (n) => {
+      if (!ts.isVariableDeclaration(n) || !n.initializer || n.pos < parent.end) return;
+      if (!ts.isIdentifier(n.name)) return;
+      const init = unwrap(n.initializer);
+      if (!ts.isPropertyAccessExpression(init) && !ts.isElementAccessExpression(init)) return;
+      const r = rootName(init);
+      if (r !== null && data.has(r)) data.add(n.name.text);
+    });
+  }
   const out: RowComparison[] = [];
   for (const s of ifsAfter(parent)) {
     const exit = exitKind(s.thenStatement);

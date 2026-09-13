@@ -1,4 +1,4 @@
-import type { ColumnInfo, RlsTable, SqlFunctionInfo, StorageBucket } from "./model.js";
+import type { ColumnInfo, RlsTable, SqlFunctionInfo, SqlTrigger, StorageBucket } from "./model.js";
 import {
   type ColumnDef,
   identList,
@@ -21,6 +21,7 @@ import {
   applyGrantRevoke,
   type FunctionRegistry,
   finishFunctions,
+  functionBodyOf,
   newFunctionRegistry,
 } from "./sql-functions.js";
 import {
@@ -76,6 +77,8 @@ export interface SqlSchemaState {
   enums: Map<string, string[]>;
   functions: FunctionRegistry;
   buckets: BucketRegistry;
+  /** CREATE TRIGGER statements still in force, keyed `table#name`. */
+  triggers: Map<string, TriggerState>;
   /** Parser warnings for the model, e.g. a DO block with dynamic SQL; one per file and cause. */
   warnings: string[];
 }
@@ -84,6 +87,7 @@ export interface SqlSchemaExtras {
   enums: Record<string, string[]>;
   sqlFunctions: SqlFunctionInfo[];
   storageBuckets: StorageBucket[];
+  triggers: SqlTrigger[];
   warnings: string[];
 }
 
@@ -100,6 +104,7 @@ export function schemaStateFor(tables: Map<string, RlsTable>): SqlSchemaState {
       enums: new Map(),
       functions: newFunctionRegistry(),
       buckets: newBucketRegistry(),
+      triggers: new Map(),
       warnings: [],
     };
     STATES.set(tables, state);
@@ -645,6 +650,128 @@ function doBlock(state: SqlSchemaState, stmt: SqlStatement, file: string): void 
   }
 }
 
+type TriggerEvent = SqlTrigger["events"][number];
+
+interface TriggerState {
+  name: string;
+  /** Table key, like `RlsTable.table`. */
+  table: string;
+  timing: SqlTrigger["timing"];
+  events: TriggerEvent[];
+  /** `UPDATE OF a, b`. */
+  ofColumns: string[];
+  fn: { schema: string | null; name: string };
+  location: { file: string; line: number };
+}
+
+const isTriggerEvent = (v: string): v is TriggerEvent =>
+  v === "insert" || v === "update" || v === "delete" || v === "truncate";
+
+/**
+ * CREATE [OR REPLACE] [CONSTRAINT] TRIGGER name {BEFORE | AFTER | INSTEAD OF} event [OR event] ON
+ * table ... EXECUTE {FUNCTION | PROCEDURE} fn(). Read for what RLS cannot express: a policy lets a
+ * user update their own row, and only a trigger stops them from changing one of its columns.
+ */
+function createTrigger(state: SqlSchemaState, stmt: SqlStatement, file: string): void {
+  const tk = stmt.tokens;
+  let i = 1;
+  if (isWord(tk[i], "or") && isWord(tk[i + 1], "replace")) i += 2;
+  if (isWord(tk[i], "constraint")) i += 1;
+  if (!isWord(tk[i], "trigger")) return;
+  const name = identOf(tk[i + 1]);
+  if (name === null || name === "") return;
+  i += 2;
+  let timing: SqlTrigger["timing"];
+  if (isWord(tk[i], "before")) timing = "before";
+  else if (isWord(tk[i], "after")) timing = "after";
+  else if (isWord(tk[i], "instead") && isWord(tk[i + 1], "of")) {
+    timing = "instead of";
+    i += 1;
+  } else return;
+  i += 1;
+  const events: TriggerEvent[] = [];
+  const ofColumns: string[] = [];
+  while (i < tk.length && !isWord(tk[i], "on")) {
+    const t = tk[i];
+    if (t?.kind === "word" && isTriggerEvent(t.value)) {
+      events.push(t.value);
+      i += 1;
+    } else if (isWord(t, "of")) {
+      i += 1;
+      while (i < tk.length && !isWord(tk[i], "or") && !isWord(tk[i], "on")) {
+        const col = identOf(tk[i]);
+        if (col !== null && col !== "") ofColumns.push(col.toLowerCase());
+        i += 1;
+      }
+    } else {
+      i += 1;
+    }
+  }
+  const table = readQualifiedName(tk, i + 1);
+  if (!table || events.length === 0) return;
+  let j = table.next;
+  while (j < tk.length && !isWord(tk[j], "execute")) j += 1;
+  if (!isWord(tk[j + 1], "function") && !isWord(tk[j + 1], "procedure")) return;
+  const fn = readQualifiedName(tk, j + 2);
+  if (!fn) return;
+  const key = qualifiedKey(table);
+  state.triggers.set(`${key}#${name.toLowerCase()}`, {
+    name: name.toLowerCase(),
+    table: key,
+    timing,
+    events,
+    ofColumns,
+    fn: { schema: fn.schema, name: fn.name },
+    location: { file, line: stmt.line },
+  });
+}
+
+/** DROP TRIGGER [IF EXISTS] name ON table. */
+function dropTrigger(state: SqlSchemaState, stmt: SqlStatement): void {
+  const tk = stmt.tokens;
+  let i = 2;
+  if (isWord(tk[i], "if") && isWord(tk[i + 1], "exists")) i += 2;
+  const name = identOf(tk[i]);
+  if (name === null || !isWord(tk[i + 1], "on")) return;
+  const table = readQualifiedName(tk, i + 2);
+  if (table) state.triggers.delete(`${qualifiedKey(table)}#${name.toLowerCase()}`);
+}
+
+const NEW_COLUMN = /(?<![A-Za-z0-9_$])new\s*\.\s*"?([A-Za-z_][A-Za-z0-9_]{0,62})"?/gi;
+/** Distinct NEW columns examined per trigger function; hostile bodies stay linear in practice. */
+const MAX_TRIGGER_COLUMNS = 200;
+
+/**
+ * Columns the trigger holds back on NEW: an `UPDATE OF` list, or a column its function reads off NEW
+ * and also reads off OLD, assigns with `:=`, or reads in a body that raises. A trigger that only
+ * stamps `new.updated_at := now()` holds back nothing else.
+ */
+function finishTrigger(state: SqlSchemaState, t: TriggerState): SqlTrigger {
+  const body = functionBodyOf(state.functions, t.fn) ?? "";
+  const raises = /(?<![A-Za-z0-9_$])raise(?![A-Za-z0-9_$])/i.test(body);
+  const read = new Set<string>();
+  for (const m of body.matchAll(NEW_COLUMN)) {
+    const col = m[1]?.toLowerCase();
+    if (col) read.add(col);
+    if (read.size >= MAX_TRIGGER_COLUMNS) break;
+  }
+  const checked = new Set(t.ofColumns);
+  for (const col of read) {
+    const old = new RegExp(`(?<![A-Za-z0-9_$])old\\s*\\.\\s*"?${col}"?(?![A-Za-z0-9_$])`, "i");
+    const assigned = new RegExp(`(?<![A-Za-z0-9_$])new\\s*\\.\\s*"?${col}"?\\s*:=`, "i");
+    if (raises || old.test(body) || assigned.test(body)) checked.add(col);
+  }
+  return {
+    name: t.name,
+    table: t.table,
+    timing: t.timing,
+    events: [...t.events],
+    checkedColumns: [...checked],
+    function: qualifiedKey(t.fn),
+    location: t.location,
+  };
+}
+
 /** Applies one statement (anything but CREATE POLICY, which rls.ts reads). Unknown statements are ignored. */
 export function applySchemaStatement(
   state: SqlSchemaState,
@@ -660,6 +787,7 @@ export function applySchemaStatement(
     else if (kind === "type") createType(state, stmt);
     else if (kind === "function") applyCreateFunction(state.functions, stmt, file);
     else if (kind === "unique") createUniqueIndex(state, stmt);
+    else if (kind === "trigger" || kind === "constraint") createTrigger(state, stmt, file);
   } else if (w0 === "alter") {
     if (w1 === "table") alterTable(state, stmt, file, false);
     else if (w1 === "type") alterType(state, stmt);
@@ -669,6 +797,7 @@ export function applySchemaStatement(
     if (w1 === "table") dropTable(state, stmt);
     else if (w1 === "type") dropType(state, stmt);
     else if (w1 === "function" || w1 === "routine") applyDropFunction(state.functions, stmt);
+    else if (w1 === "trigger") dropTrigger(state, stmt);
   } else if (w0 === "grant" || w0 === "revoke") {
     applyGrantRevoke(state.functions, stmt);
   } else if (w0 === "do") {
@@ -684,6 +813,7 @@ export function finishSchema(state: SqlSchemaState): SqlSchemaExtras {
     enums: Object.fromEntries([...state.enums].map(([k, v]) => [k, [...v]])),
     sqlFunctions: finishFunctions(state.functions),
     storageBuckets: finishBuckets(state.buckets),
+    triggers: [...state.triggers.values()].map((t) => finishTrigger(state, t)),
     warnings: [...state.warnings],
   };
 }

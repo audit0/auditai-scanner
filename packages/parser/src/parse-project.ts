@@ -74,7 +74,7 @@ import {
   prismaWhereFilters,
 } from "./orm.js";
 import { Resolver } from "./resolve.js";
-import { parseSqlForRls, sqlSchemaFor } from "./rls.js";
+import { appliedSqlFiles, parseSqlForRls, sqlSchemaFor } from "./rls.js";
 import { roleGatesIn, sessionNamesIn } from "./role-gates.js";
 import {
   bucketName,
@@ -174,6 +174,8 @@ interface Project {
   prismaModels: Map<string, string>;
   /** Memo of returnTaint by helper and bindings; null marks a helper being analysed (recursion). */
   returnTaints: Map<string, ReturnTaint | null>;
+  /** Memo of returnIdentity: `false` when the helper returns something other than an identity. */
+  returnIdentities: Map<string, { who: string | null } | false>;
   /** Tables from the migrations, for foreign keys between a guard read and the row it guards. */
   tables: ReadonlyMap<string, RlsTable>;
   warnings: string[];
@@ -207,6 +209,12 @@ interface Frame {
   pathPos: number[];
   /** A `return` in this frame ends the entry point: every call site up to it checks the result. */
   exitPropagates: boolean;
+  /**
+   * Identifiers holding the caller's identity or a row it selected: the session user (null), the
+   * account a request credential looked up or a row filtered by an identity (its table), a part of
+   * such a row (""). See identityOf.
+   */
+  identities: Map<string, string | null>;
 }
 
 /** A query as a possible guard: the value keys of its filters, its place in the call order, its stop. */
@@ -897,6 +905,9 @@ function bindDeclarations(p: Project, frame: Frame, acc: Acc): void {
     const names = boundNames(decl.name);
     const text = init.getText(sf);
     aliasLocal(frame, decl.name, init);
+    const who = identityBinding(p, frame, init, scope);
+    if (who !== undefined)
+      for (const nm of identityNamesOf(decl.name)) frame.identities.set(nm, who);
     // A client first: `createClient(url, anon, { global: { headers: { Authorization:
     // req.headers.get(…) } } })` reads a header, but what it binds is a client, not input.
     const client = ts.isCallExpression(init) ? classifyCall(p, init, sf, scope, frame, 0) : null;
@@ -993,6 +1004,23 @@ function bindDeclarations(p: Project, frame: Frame, acc: Acc): void {
       bindInput(names, isWholeInput(init, wholeContext(p, frame)));
     }
   }
+  // `dev = data` after `let dev = null`: a variable holds an identity only when every non-literal
+  // value assigned to it is one.
+  const assigned = new Map<string, Array<string | null | undefined>>();
+  for (const asg of collect(body, ts.isBinaryExpression)) {
+    if (asg.operatorToken.kind !== ts.SyntaxKind.EqualsToken || !ts.isIdentifier(asg.left))
+      continue;
+    if (isLiteralValue(unwrap(asg.right))) continue;
+    const list = assigned.get(asg.left.text) ?? [];
+    list.push(identityBinding(p, frame, asg.right, scope));
+    assigned.set(asg.left.text, list);
+  }
+  for (const [name, whos] of assigned) {
+    const [first] = whos;
+    if (first !== undefined && whos.every((w) => w !== undefined))
+      frame.identities.set(name, first);
+    else frame.identities.delete(name);
+  }
   if (frame.depth === 0) {
     walk(body, (n) => {
       if (
@@ -1031,19 +1059,25 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
   }
 
   // Auth checks.
-  const isSessionCall = (call: ts.CallExpression): boolean =>
-    /\.auth\.(getUser|getSession|getClaims)$/.test(call.expression.getText(sf)) ||
-    symOfCallee(p, call.expression, scope)?.kind === "auth";
+  const isSessionCall = (call: ts.CallExpression): boolean => callsSession(p, call, sf, scope);
   for (const call of collect(body, ts.isCallExpression)) {
     if (isSessionCall(call)) acc.authChecks.push({ ...loc(call), kind: "session" });
   }
   // Role gates (ADR-001): `if (!isAdminEmail(user.email)) return 401` on a session binding.
-  for (const gate of roleGatesIn(body, sessionNamesIn(body, isSessionCall))) {
+  // A row the caller's identity selected speaks for the session too (`profil.rolle` of the caller's
+  // own profile); the check then carries the table and column, so the rules can ask who writes it.
+  const sessionNames = sessionNamesIn(body, isSessionCall);
+  for (const name of frame.identities.keys()) sessionNames.add(name);
+  for (const gate of roleGatesIn(body, sessionNames)) {
     if (gate.exit === "return" && !frame.exitPropagates) continue;
+    const [root, ...rest] = gate.source.split(".");
+    const table = root === undefined ? undefined : frame.identities.get(root);
+    const column = rest[rest.length - 1];
     acc.roleChecks.push({
       ...loc(gate.node),
       source: gate.source,
       text: gate.node.expression.getText(sf).replace(/\s+/g, " ").slice(0, 160),
+      ...(typeof table === "string" && column !== undefined ? { table, column } : {}),
     });
   }
   // A request credential compared with (or verified by) a server secret, deciding the request's fate.
@@ -1116,6 +1150,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
         column: f.column,
         valueText: f.value ? f.value.getText(sf) : f.text,
         inputDerived: f.value ? derivedIn(frame, f.value) : false,
+        ...(f.value && identityOf(frame, f.value) !== undefined ? { identity: true } : {}),
       },
       f.value,
     );
@@ -1174,6 +1209,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
               column: pr.name.getText(sf).replace(/['"]/g, ""),
               valueText: pr.initializer.getText(sf),
               inputDerived: derivedIn(frame, pr.initializer),
+              ...(identityOf(frame, pr.initializer) !== undefined ? { identity: true } : {}),
             };
             filters.push(valued(f, pr.initializer));
           }
@@ -1186,6 +1222,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
         column: stringLiteralValue(firstArg),
         valueText: val ? val.getText(sf) : "",
         inputDerived: val ? derivedIn(frame, val) : false,
+        ...(val && identityOf(frame, val) !== undefined ? { identity: true } : {}),
       };
       filters.push(valued(f, val));
     }
@@ -1357,6 +1394,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
           column: c.column,
           valueText: c.value.getText(sf).replace(/\s+/g, " "),
           inputDerived: derivedIn(frame, c.value),
+          ...(identityOf(frame, c.value) !== undefined ? { identity: true } : {}),
         }));
       if (checks.length > 0) query.ownerChecks = checks;
       acc.reads.push({
@@ -1421,6 +1459,7 @@ function childFrame(
     aliases: new Map(),
     pathPos: [...frame.pathPos, call.getStart(frame.sf)],
     exitPropagates: frame.exitPropagates && callResultChecked(call),
+    identities: new Map(),
   };
   const cx = wholeContext(p, frame);
   target.fn.parameters.forEach((param, i) => {
@@ -1435,6 +1474,10 @@ function childFrame(
       child.instances.set(head, ab.instance);
     }
     for (const nm of names) if (ab.isRequest) child.reqNames.add(nm);
+    // The caller's identity handed over (`requireOwner(user, id)`) is still the caller's identity.
+    const who = arg ? identityOf(frame, arg) : undefined;
+    if (who !== undefined && ts.isIdentifier(param.name))
+      child.identities.set(param.name.text, who);
     if (ab.tainted) {
       bindParamTaint(child, param.name, arg, frame);
       for (const nm of wholeParamNames(param.name, arg, cx)) {
@@ -1455,6 +1498,7 @@ function frameSignature(child: Frame): string {
     ...[...child.inputNames].map((n) => `${n}!${child.wholeNames.has(n) ? "*" : ""}`),
     ...[...child.partialInputs].map(([n, s]) => `${n}.{${[...s].sort().join("|")}}`),
     ...[...child.reqNames].map((n) => `${n}?`),
+    ...[...child.identities].map(([n, t]) => `${n}@${t ?? ""}`),
     ...[...child.thisProps].map(([n, b]) => `this.${n}=${b.client?.kind ?? "-"}`),
     ...[...child.aliases].map(([n, k]) => `${n}~${k}`),
     `exit=${child.exitPropagates}`,
@@ -1836,6 +1880,168 @@ function returnsIdentity(p: Project, call: ts.CallExpression, scope: Map<string,
   return IDENTITY_CALLEE.test(calleePath(call.expression));
 }
 
+/** `supabase.auth.getUser()`, `getSession()`, `getClaims()`, or a call to an auth helper of this repository. */
+function callsSession(
+  p: Project,
+  call: ts.CallExpression,
+  sf: ts.SourceFile,
+  scope: Map<string, Sym>,
+): boolean {
+  return (
+    /\.auth\.(getUser|getSession|getClaims)$/.test(call.expression.getText(sf)) ||
+    symOfCallee(p, call.expression, scope)?.kind === "auth"
+  );
+}
+
+/**
+ * The caller's identity an expression reads (`user.id`, `dev.id`, `advertiser`): null for the session
+ * itself, the table of a row the identity selected, "" for a part of such a row; undefined for
+ * anything else. User input never counts, and neither does `user_metadata`, which the user edits.
+ * Evidence only: a helper merely named like authentication does not make its result an identity.
+ */
+function identityOf(frame: Frame, e: ts.Expression): string | null | undefined {
+  if (frame.identities.size === 0 || derivedIn(frame, e)) return undefined;
+  let u = unwrap(e);
+  let part = false;
+  while (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
+    if (ts.isPropertyAccessExpression(u) && u.name.text === "user_metadata") return undefined;
+    u = unwrap(u.expression);
+    part = true;
+  }
+  if (!ts.isIdentifier(u) || !frame.identities.has(u.text)) return undefined;
+  const who = frame.identities.get(u.text) ?? null;
+  return part && who !== null ? "" : who;
+}
+
+/** Names that receive a result: `dev` of `{ data: dev }`, `user` of `{ data: { user } }`, a plain name; never `error`. */
+function identityNamesOf(name: ts.BindingName): string[] {
+  if (ts.isIdentifier(name)) return [name.text];
+  if (ts.isArrayBindingPattern(name)) {
+    const first = name.elements[0];
+    return first && !ts.isOmittedExpression(first) ? boundNames(first.name) : [];
+  }
+  const data = name.elements.find((el) => propertyKeyOf(el.propertyName ?? el.name) === "data");
+  if (data) return boundNames(data.name);
+  return name.elements
+    .filter((el) => propertyKeyOf(el.propertyName ?? el.name) !== "error")
+    .flatMap((el) => boundNames(el.name));
+}
+
+/**
+ * A Supabase query whose row is the caller's: filtered with `eq`/`match` by the caller's identity
+ * (`claimed_by = user.id`), or by a credential column with a value the caller sent (`token = <cookie>`,
+ * the lookup that authenticates them). Its table; undefined otherwise.
+ */
+function identityRowOf(frame: Frame, call: ts.CallExpression): string | undefined {
+  const { segments } = flattenChain(call);
+  const table = stringLiteralValue(segments.find((s) => s.name === "from")?.args[0]);
+  if (table === null) return undefined;
+  const keyed = (column: string | null, value: ts.Expression | undefined): boolean =>
+    value !== undefined &&
+    (identityOf(frame, value) !== undefined ||
+      (isCredentialColumn(column) && derivedIn(frame, value)));
+  for (const s of segments) {
+    if (s.name === "eq" && keyed(stringLiteralValue(s.args[0]), s.args[1])) return table;
+    const obj = s.name === "match" ? s.args[0] : undefined;
+    if (!obj || !ts.isObjectLiteralExpression(obj)) continue;
+    for (const pr of obj.properties) {
+      if (ts.isPropertyAssignment(pr) && keyed(propertyKeyOf(pr.name), pr.initializer))
+        return table;
+    }
+  }
+  return undefined;
+}
+
+/** The identity a declaration or an assignment receives: every non-literal branch must be one. */
+function identityBinding(
+  p: Project,
+  frame: Frame,
+  init: ts.Expression,
+  scope: Map<string, Sym>,
+): string | null | undefined {
+  let out: string | null | undefined;
+  for (const leaf of branchesOf(init)) {
+    if (isLiteralValue(leaf)) continue;
+    const who = identityLeaf(p, frame, leaf, scope);
+    if (who === undefined) return undefined;
+    if (out === undefined) out = who;
+  }
+  return out;
+}
+
+function identityLeaf(
+  p: Project,
+  frame: Frame,
+  leaf: ts.Expression,
+  scope: Map<string, Sym>,
+): string | null | undefined {
+  const u = unwrap(leaf);
+  if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
+    // `(await supabase.auth.getUser()).data.user`: a part of an identity a call returns.
+    let base: ts.Expression = u;
+    while (ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) {
+      if (ts.isPropertyAccessExpression(base) && base.name.text === "user_metadata")
+        return undefined;
+      base = unwrap(base.expression);
+    }
+    if (!ts.isCallExpression(base)) return identityOf(frame, u);
+    if (derivedIn(frame, u)) return undefined;
+    const who = identityLeaf(p, frame, base, scope);
+    return who === undefined || who === null ? who : "";
+  }
+  if (ts.isIdentifier(u)) return identityOf(frame, u);
+  if (!ts.isCallExpression(u)) return undefined;
+  if (callsSession(p, u, frame.sf, scope)) return null;
+  if (isChainWithQuery(u)) return identityRowOf(frame, u);
+  if (isDbChain(u, frame)) return undefined;
+  return returnIdentity(p, u, frame, scope);
+}
+
+/**
+ * The identity a helper of this repository returns (see identityOf), evaluated in its own frame with
+ * the caller's arguments bound. Undefined when some path returns anything else, or when the callee is
+ * not a function of this repository. Literal returns (`return null` when signed out) do not count
+ * against it.
+ */
+function returnIdentity(
+  p: Project,
+  call: ts.CallExpression,
+  frame: Frame,
+  scope: Map<string, Sym>,
+): string | null | undefined {
+  if (frame.depth >= MAX_DEPTH) return undefined;
+  const target = callTarget(p, call, frame, scope);
+  if (!target) return undefined;
+  const child = childFrame(p, call, target, frame);
+  if (!child) return undefined;
+  const key = `${target.facts.file}#${target.name}#${frameSignature(child)}`;
+  const cached = p.returnIdentities.get(key);
+  if (cached !== undefined) return cached === false ? undefined : cached.who;
+  // A helper that (indirectly) calls itself returns no identity.
+  p.returnIdentities.set(key, false);
+  bindDeclarations(p, child, {
+    inputs: [],
+    authChecks: [],
+    roleChecks: [],
+    queries: [],
+    metadataAccesses: [],
+    visited: new Set(),
+    reads: [],
+  });
+  const childScope = scopeOf(p, child.facts);
+  let out: { who: string | null } | false = false;
+  for (const ret of ownReturns(target.fn)) {
+    for (const leaf of branchesOf(ret)) {
+      if (isLiteralValue(leaf)) continue;
+      const who = identityLeaf(p, child, leaf, childScope);
+      if (who === undefined) return undefined;
+      if (out === false) out = { who };
+    }
+  }
+  p.returnIdentities.set(key, out);
+  return out === false ? undefined : out.who;
+}
+
 /**
  * The names a callee is made of, without call arguments: `request.headers.get()?.slice` for
  * `request.headers.get("authorization")?.slice`, so a string argument never reads as a name.
@@ -1959,6 +2165,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     aliases: new Map(),
     pathPos: [],
     exitPropagates: true,
+    identities: new Map(),
   };
   const first = fn.parameters[0];
   if (h.kind === "route" && first) {
@@ -2097,7 +2304,7 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
   }
 
   const tables = new Map<string, RlsTable>();
-  for (const rel of sql) {
+  for (const rel of appliedSqlFiles(sql)) {
     try {
       parseSqlForRls(rel, readFileSync(resolve(root, rel), "utf8"), tables);
     } catch (e) {
@@ -2129,6 +2336,7 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     drizzleTablesByExport,
     prismaModels,
     returnTaints: new Map(),
+    returnIdentities: new Map(),
     tables,
     warnings,
   };
@@ -2166,6 +2374,7 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     enums: schema.enums,
     sqlFunctions: schema.sqlFunctions,
     storageBuckets: schema.storageBuckets,
+    ...(schema.triggers.length > 0 ? { sqlTriggers: schema.triggers } : {}),
   };
 }
 

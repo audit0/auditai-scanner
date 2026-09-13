@@ -19,19 +19,39 @@ npx auditai-scan .
 <p align="center"><img src="./demo.gif" alt="auditai-scan finding a cross-tenant read in a fixture app" width="900"></p>
 
 ```
+Audit AI scan  evals/fixtures/001-cross-tenant-invoice-read/vulnerable
+Files 6 · Routes 1 · Supabase queries 1 · Tables with RLS 3/3 · Rules 14
+
 AUDIT-001  LIKELY  CRITICAL  Cross-tenant select on "invoices" via service-role client
-           app/api/invoices/[id]/route.ts:14  GET /api/invoices/[id]
-           The service-role client bypasses RLS and the query is scoped by `id` only.
-           Fix: use a per-request client carrying the caller's JWT, or add `.eq("tenant_id", session.tenantId)`.
+  Entry   GET /api/invoices/[id]   app/api/invoices/[id]/route.ts:6
+  Path    HTTP request -> GET /api/invoices/[id] -> id eq id (user-controlled) -> createServiceRoleClient (service role, bypasses RLS) -> public.invoices.select
+  Why     select on public.invoices filtered by user-controlled "id" through a service-role client, with no tenant/owner scoping. The handler authenticates the caller but never checks that the row belongs to them. RLS is enabled on public.invoices with 2 policies, but the service role bypasses it.
+  Where   app/api/invoices/[id]/route.ts:6, app/api/invoices/[id]/route.ts:14, lib/supabase.ts:7
+  Rule    supabase.service-role-object-access-without-tenant-scope · CWE-639, CWE-284 · confidence 0.85
 
 Checked 1 risk in class authorization/RLS. Verified: 0. Confirmed (no sandbox): 0. Unverified: 0.
 ```
 
-This is the open-source engine behind [Audit AI](https://auditai.sh). The hosted product takes a
-finding from here and closes the loop: reproduces it against a sandboxed copy of your app, writes
-the minimal fix and a regression test, and proves the fix (`HTTP 200` before, `HTTP 403` after).
-The scanner alone gives you the deterministic part: every route, server action, Supabase client,
-query and RLS policy, mapped and checked.
+This is the open-source engine behind [Audit AI](https://auditai.sh). The scanner gives you the
+deterministic part: every route, server action, page, Supabase client, query, RLS policy and
+database function, mapped and checked. The hosted product takes a finding from here and tries to
+prove it.
+
+## Try the whole loop
+
+- **Scan a public repository by link** at [auditai.sh](https://auditai.sh), free and without an
+  account. The report explains each finding in plain words for the app's owner and gives the
+  developer the code path and a ready task for Cursor or Claude Code. [Sample report](https://auditai.sh/r/demo).
+- **Prove it.** A button on the report starts a sandbox run: a local Supabase with your migrations,
+  two users seeded from your schema, and a generated test in which Alice asks for Bob's rows. The
+  verdict is `Reproduced` only if the attack actually works. When the fix is a migration, the
+  sandbox applies it and runs the same attack again; `Verified fix` needs every `DENY` test to pass
+  and every `ALLOW` test to stay green. A person approves each sandbox run on a repository we have
+  not seen before.
+- **A check on every pull request** with the [GitHub App](https://github.com/apps/auditai-sh).
+- **A deliberately vulnerable app to try it on:** [audit0/auditai-playground](https://github.com/audit0/auditai-playground).
+  It has three holes of three kinds (a service-role read by id, a table without RLS, a
+  `SECURITY DEFINER` function), and all three are proven on the live product.
 
 ## Why this exists
 
@@ -43,8 +63,8 @@ these because they do not understand the framework. This one does nothing else.
 
 ## What it finds
 
-Rule packs `supabase-authorization` and `supabase-storage-rpc`. Every rule ships with a vulnerable
-fixture that must fire and a secure fixture that must stay silent.
+Rule packs `supabase-authorization`, `supabase-storage-rpc` and `supabase-sql-policies`. Every rule
+ships with a vulnerable fixture that must fire and a secure fixture that must stay silent.
 
 | Rule | Severity | What it catches |
 |---|---|---|
@@ -54,7 +74,7 @@ fixture that must fire and a secure fixture that must stay silent.
 | `supabase.service-role-key-exposed-to-client` | critical | Service-role key reaches the browser (`NEXT_PUBLIC_*`, client components). Blocking. |
 | `supabase.table-without-rls` | high | Table queried by a user-facing client has row level security disabled |
 | `supabase.rls-policy-without-caller-predicate` | high | RLS policy grants rows without referencing the caller (`using (true)` and friends) |
-| `supabase.mass-assignment-from-request-body` | high | Request body written to a table without an allow-list |
+| `supabase.mass-assignment-from-request-body` | high | Request body written to a table without an allow-list, where RLS does not already refuse the write |
 | `supabase.role-check-from-user-metadata` | high | Authorization decided by `user_metadata`, which the user can edit |
 | `supabase.storage-object-access-without-owner-scope` | critical | Storage download/upload/signed URL/move/remove through the service role on a caller-supplied path that is never tied to the caller's user id |
 | `supabase.storage-policy-without-owner-check` | high | Policy on `storage.objects` that only checks `bucket_id`: every user reads, overwrites or deletes every file in the bucket |
@@ -66,12 +86,65 @@ fixture that must fire and a secure fixture that must stay silent.
 Findings are reported as `likely`, never `confirmed`: confirmation needs evidence, and evidence
 means a reproduced request. Suppressed findings stay in the output, marked `suppressed`.
 
+The last three rules read the migrations only: they need no query from your application, because
+PostgREST exposes the schema to anyone holding the public key. Their findings name the Data API
+as the entry point instead of a route.
+
+## Fixes it proposes
+
+Findings whose fix follows from the schema alone come with that fix: one migration, printed under
+the finding and included in `--json` as `fix`. No model is involved and nothing is applied: it is
+SQL to read and apply yourself.
+
+```
+AUDIT-001  LIKELY  HIGH  SECURITY DEFINER function "get_invoice" without a caller check
+  Entry   GET /api/invoices/[id], POST /rest/v1/rpc/get_invoice   supabase/migrations/0001_init.sql:55
+  ...
+  Fix     Run get_invoice with the caller's rights (security invoker) (supabase/migrations/20260913175911_fix_security_invoker_get_invoice.sql)
+          -- Run get_invoice with the caller's rights, so row level security applies inside it
+          -- Proposed by Audit AI. Read it, then apply it with the rest of your migrations.
+          -- It reads public.invoices, and each of them has row level security with policies.
+          alter function public.get_invoice(uuid) security invoker;
+```
+
+Today that covers the `SECURITY DEFINER`, row-level-security and write-policy rules, about a
+quarter of what the scanner reports on real repositories. Every table, function and policy name in
+a proposed migration is resolved against the parsed schema. A finding whose fix lives in
+application code gets no proposal, on purpose.
+
+## How precise it is
+
+Measured by hand on public repositories the engine had never seen. The selection rule and the
+sample size were written down and committed before any repository was picked; the sample was drawn
+before any code was read. Precision is real ÷ (real + false positive); findings labeled `unsure` are
+left out of the denominator.
+
+| Blind sample | Repositories | Findings labeled | Precision | Blocking tier (high + critical) |
+|---|---:|---:|---:|---:|
+| 1st, 13 Sep 2026 | 20 | 100 | **36%** (36/100) | 35% (32/92) |
+| 2nd, 13 Sep 2026, after precision rounds 4–5 | 20 new | 100 | **46%** (44/95, 95% interval 37–56%) | 49% (43/87) |
+
+- The rise from 36% to 46% is not statistically proven at this sample size (p ≈ 0.14). The honest
+  reading: the fixes did not hurt precision on unfamiliar code, and probably raised it.
+- Strong in the second sample: open write policies for `anon` (13 of 14 real) and RLS policies that
+  trust `user_metadata` (7 of 7). Weak: service-role reads by id (2 of 18) and `SECURITY DEFINER`
+  functions (12 of 30), where most false positives were public-by-design functions and an internal
+  tool behind a corporate login.
+- The engine in this repository carries precision round 6, made with the second sample's labels in
+  view, so its numbers on those labels are no longer blind. The next honest number comes from a
+  third sample.
+- Repository names and labels stay private: a real finding is a real vulnerability in someone's app.
+
+Live numbers, including every sample so far: [auditai.sh/stats](https://auditai.sh/stats). This is
+why the hosted product proves before it blocks: a `likely` finding is a lead, not a verdict.
+
 ## What it does not do
 
 - It does not prove the absence of vulnerabilities. Every run ends with an honest coverage line:
   `Checked N risks in class authorization/RLS. Verified: X. Confirmed: Y. Unverified: Z.`
 - It does not cover other stacks. Next.js + TypeScript with Supabase clients, Drizzle or Prisma on Postgres; deep rather than wide.
-- It does not fix, test or verify. That is the hosted product.
+- It does not change your code. Schema-level fixes are printed for you to apply; application-code
+  fixes, regression tests and sandbox proof are the hosted product.
 - It does not call a model. Everything here is static analysis on the TypeScript compiler API.
 
 ## Usage
@@ -121,7 +194,7 @@ CI gate (GitHub Actions):
 ## How it works
 
 ```
-source files ──► parser ──► Program Security Graph ──► rules ──► findings + coverage
+source files ──► parser ──► Program Security Graph ──► rules ──► findings + coverage ──► fixes
                  (TS compiler API)   Route → Handler → Query → Client / Table → RLSPolicy
 ```
 
@@ -129,11 +202,14 @@ source files ──► parser ──► Program Security Graph ──► rules �
   classifies every Supabase client (`service_role`, `anon`, `user_scoped`) and every Drizzle or
   Prisma connection (`direct_db`: RLS never runs for it), follows calls from the
   entry point into helpers, service classes and workspace packages (tsconfig `paths`, package.json
-  `exports`) three levels deep, tracks which arguments carry user input, reads insert/update
-  payloads, and ingests RLS policies from migration SQL.
+  `exports`) three levels deep, tracks which arguments carry user input and which values come from
+  the caller's own identity, recognises guards (session, credential and secret checks, ownership
+  reads, layout gates), and reads tables, columns, policies, grants, functions, triggers and storage
+  buckets from migration SQL.
 - **graph** links handlers, queries, clients, tables and policies into one structure a rule can walk.
 - **rules** are small pure functions over the graph. Each returns findings with file, line, entry
   point, evidence and a one-line remediation.
+- **fixes** derives a migration from the schema when the fix needs nothing else.
 - **scanner** is the facade and the CLI.
 
 Repository content under analysis is untrusted data. A comment saying "ignore previous
@@ -186,16 +262,6 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 038 | policies-without-rls-enabled | policies-without-rls-enabled, four policies on a table whose RLS was never switched on |
 | 039 | anon-write-policy | anon-write-policy, an open delete policy for `anon` next to a deliberate public insert |
 
-Findings whose fix follows from the schema alone come with that fix: one migration, printed under
-the finding and included in `--json` as `fix`. No model is involved and nothing is applied — it is
-SQL to read and apply yourself. Today that covers the `SECURITY DEFINER`, row-level-security and
-write-policy rules, about a quarter of what the scanner reports on real repositories. A finding
-whose fix lives in application code gets no proposal, on purpose.
-
-The last three rules read the migrations only: they need no query from your application, because
-PostgREST exposes the schema to anyone holding the public key. Their findings name the Data API
-as the entry point instead of a route.
-
 Each fixture also carries the `security-test` the hosted product runs in a sandbox: `DENY` tests
 are the security assertion (Alice must not read Bob's row), `ALLOW` tests are the sanity check
 (Alice still reads her own).
@@ -215,8 +281,10 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for how to add a rule (always with a fi
 
 ## Roadmap for the open engine
 
+- Precision before breadth: the weakest rules above first, then a third blind sample on the engine
+  that ships.
 - More of the authorization family: realtime channels.
-- Rules as data with positive and negative fixtures declared next to them.
+- Proposed migrations for more of the SQL class.
 - Better inter-procedural resolution (helpers that wrap `createClient`, shared query builders).
 
 Wider language and framework support is out of scope until this stack is covered deeply.
@@ -224,3 +292,4 @@ Wider language and framework support is out of scope until this stack is covered
 ## License
 
 Apache-2.0. Built in public by [audit0](https://github.com/audit0). Product: [auditai.sh](https://auditai.sh).
+Security reports: security@auditai.sh.

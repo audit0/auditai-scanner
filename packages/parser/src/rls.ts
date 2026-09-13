@@ -50,6 +50,48 @@ export function isAppliedSqlFile(rel: string): boolean {
   return !/(?:^|\/)supabase\/migrations\/[^/]+\/.+\.sql$/i.test(rel.split("\\").join("/"));
 }
 
+/** Folder names that keep SQL for reference (documentation, archives, backups), not the schema itself. */
+const REFERENCE_SQL_DIRS: ReadonlySet<string> = new Set([
+  "doc",
+  "docs",
+  "documentation",
+  "legacy",
+  "archive",
+  "archives",
+  "archived",
+  "backup",
+  "backups",
+  "deprecated",
+  "example",
+  "examples",
+  "old",
+]);
+
+/**
+ * The SQL files to read as the schema, in the order given. Files the migration tool never applies are
+ * dropped (see `isAppliedSqlFile`). When the project has Supabase migrations, SQL kept in a folder for
+ * documentation, archives or backups (`docs/legacy/COMPLETE_SETUP.sql`, `scripts/archive/...`) is
+ * dropped too: the database got its schema from the migrations, and an old setup script's `using
+ * (true)` policy would make the model more open than the database (GoalSquad). Without migrations such
+ * a file may be the only schema there is, so it stays; so does SQL elsewhere, such as `scripts/` or a
+ * root schema dump, which may have been run by hand.
+ */
+export function appliedSqlFiles(rels: readonly string[]): string[] {
+  const applied = rels.filter(isAppliedSqlFile);
+  const slashed = (rel: string): string => rel.split("\\").join("/");
+  const hasMigrations = applied.some((rel) =>
+    /(?:^|\/)supabase\/migrations\/[^/]+\.sql$/i.test(slashed(rel)),
+  );
+  if (!hasMigrations) return applied;
+  return applied.filter(
+    (rel) =>
+      !slashed(rel)
+        .split("/")
+        .slice(0, -1)
+        .some((dir) => REFERENCE_SQL_DIRS.has(dir.toLowerCase())),
+  );
+}
+
 /**
  * Extracts table columns, RLS state, policy details, enums, functions and storage buckets from
  * migration SQL. Call once per file in application order: later statements override earlier ones.

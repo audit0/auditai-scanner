@@ -199,10 +199,50 @@ function adminOnly(
   ctx: RuleContext,
   h: HandlerView,
   t: TableNodeData | undefined,
-): RoleCheck | undefined {
-  const check = h.roleChecks[0];
-  if (!check || !t?.known || !singleTenantTable(ctx, t.table)) return undefined;
-  return check;
+): { check?: RoleCheck; selfGrant?: string } {
+  if (h.roleChecks.length === 0 || !t?.known || !singleTenantTable(ctx, t.table)) return {};
+  let selfGrant: string | undefined;
+  for (const check of h.roleChecks) {
+    const open = selfGrantable(ctx, check);
+    if (open === null) return { check };
+    selfGrant ??= open;
+  }
+  return selfGrant === undefined ? {} : { selfGrant };
+}
+
+/**
+ * A role read off a row (`profil.rolle`, selected by the caller's id) holds only while users cannot
+ * rewrite that column: RLS is on, and either no policy lets them update their own row or a BEFORE
+ * UPDATE trigger checks the column. The reason it may not hold, or null when it holds (and for a claim
+ * of the session itself, which ADR-001 already vets).
+ */
+function selfGrantable(ctx: RuleContext, check: RoleCheck): string | null {
+  if (check.table === undefined || check.column === undefined) return null;
+  const column = check.column.toLowerCase();
+  if (check.table === "")
+    return `the role is read off a row whose table could not be told (${check.source}), so nothing shows users cannot change it`;
+  const where = `public.${check.table}.${column}`;
+  const info = ctx.model.tables.find((x) => x.table === check.table?.toLowerCase());
+  if (!info)
+    return `the role comes from ${where}, which the migrations do not define, so nothing shows users cannot change it`;
+  if (!info.rlsEnabled)
+    return `the role comes from ${where}, and RLS is off on public.${info.table}, so a signed-in user can rewrite it`;
+  const writable = info.policyDetails.find(
+    (pl) =>
+      (pl.command === "update" || pl.command === "all") &&
+      (pl.roles.length === 0 || pl.roles.some((r) => r === "authenticated" || r === "public")) &&
+      policyScopesToCaller(pl.using),
+  );
+  if (!writable) return null;
+  const guarded = (ctx.model.sqlTriggers ?? []).some(
+    (tr) =>
+      tr.table === info.table &&
+      tr.timing === "before" &&
+      tr.events.includes("update") &&
+      tr.checkedColumns.includes(column),
+  );
+  if (guarded) return null;
+  return `the role comes from ${where}, policy "${writable.name}" (${writable.location.file}:${writable.location.line}) lets a user update their own row, and no BEFORE UPDATE trigger in the migrations checks ${column}, so the admin check may be self-granted`;
 }
 
 /**
@@ -231,9 +271,13 @@ function tableDataOf(ctx: RuleContext, table: string): TableNodeData | undefined
   return ctx.graph.nodes.get(`table:${table}`)?.data as TableNodeData | undefined;
 }
 
-/** A comparison in code that ties the row to the caller: `row.user_id !== user.id` with an exit. */
+/**
+ * A comparison in code that ties the row to the caller: `row.user_id !== user.id` with an exit, or any
+ * column compared with the caller's identity (`comp.advertiser_id !== advertiser.id`, the advertiser
+ * being the account a session token looked up).
+ */
 function callerCheck(checks: readonly QueryFilter[] | undefined): QueryFilter | undefined {
-  return checks?.find((c) => isScopeColumn(c.column) && !c.inputDerived);
+  return checks?.find((c) => !c.inputDerived && (c.identity === true || isScopeColumn(c.column)));
 }
 
 /**
@@ -248,7 +292,9 @@ function guardTiesRowToCaller(
   table: TableNodeData | undefined,
   callerFns: ReadonlySet<string>,
 ): { tied: boolean; how: string; why: string } {
-  const callerFilter = guard.filters.find((f) => isScopeColumn(f.column) && !f.inputDerived);
+  const callerFilter = guard.filters.find(
+    (f) => !f.inputDerived && (f.identity === true || isScopeColumn(f.column)),
+  );
   if (callerFilter) {
     return {
       tied: true,
@@ -318,7 +364,12 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
         if (!["select", "update", "delete"].includes(q.operation)) continue;
         const filters: QueryFilter[] = q.filters;
         const idFilter = filters.find((f) => f.inputDerived && isObjectIdColumn(f.column));
-        if (!idFilter || filters.some((f) => isScopeColumn(f.column))) continue;
+        // Scoped by a tenant/owner column, or by the caller's identity under any column name
+        // (`developer_id = dev.id`, where `dev` was selected by `claimed_by = user.id`).
+        const scoped = filters.some(
+          (f) => isScopeColumn(f.column) || (f.identity === true && !f.inputDerived),
+        );
+        if (!idFilter || scoped) continue;
         // A read whose own row is compared with the caller before anything continues is the
         // ownership check itself (`existing.user_id !== user.id` -> 404).
         if (q.operation === "select" && callerCheck(q.ownerChecks)) continue;
@@ -340,11 +391,13 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
           ? "The handler authenticates the caller but never checks that the row belongs to them."
           : "The handler does not authenticate the caller at all.";
         // ADR-001 and the ADR-002 evidence path lower the impact, never hide the finding.
-        const admin = adminOnly(ctx, h, v.tableData);
+        const gate = adminOnly(ctx, h, v.tableData);
+        const admin = gate.check;
         const anonPolicy = q.operation === "select" ? anonReadPolicy(v.tableData) : undefined;
         const downgrade = admin || anonPolicy ? "medium" : undefined;
         const downgradeNote =
           (admin ? adminOnlyNote(admin, tableName) : "") +
+          (gate.selfGrant ? ` The handler is behind a role check, but ${gate.selfGrant}.` : "") +
           (anonPolicy ? publicReadNote(anonPolicy, tableName) : "");
         const path = [
           h.data.kind === "server_action" ? "Server action call" : "HTTP request",
@@ -503,6 +556,9 @@ function emitGroups(ctx: RuleContext, rule: Rule, groups: Map<string, Group>): F
   return out;
 }
 
+/** Roles a PostgREST request runs as. A policy written only for other roles (service_role) never decides for one. */
+const REQUEST_ROLES = new Set(["public", "anon", "authenticated"]);
+
 /** R3. RLS is on, but a policy grants rows without tying them to the caller (e.g. `using (true)`). */
 export const rlsPolicyWithoutCallerPredicate: Rule = {
   id: "supabase.rls-policy-without-caller-predicate",
@@ -528,6 +584,7 @@ export const rlsPolicyWithoutCallerPredicate: Rule = {
         const op = v.data.operation === "unknown" ? "select" : v.data.operation;
         for (const p of t.policyDetails) {
           if (p.command !== "all" && p.command !== op) continue;
+          if (p.roles.length > 0 && !p.roles.some((r) => REQUEST_ROLES.has(r))) continue;
           const expr = op === "insert" ? p.check : p.using;
           if (expr === null || policyScopesToCaller(expr) || callsFunctionIn(expr, callerFns)) {
             continue;
@@ -792,6 +849,50 @@ export const serviceRoleQueryWithoutAuthentication: Rule = {
   },
 };
 
+/**
+ * What RLS does to a write through a client it binds (anon or user-scoped): "refused" when RLS is on
+ * and no policy covers the command; the covering policies when every one pins the new row to the
+ * caller (auth.uid() or auth.jwt() in WITH CHECK, or in USING for an UPDATE or ALL policy without
+ * one); undefined otherwise. Policies only for the service role do not count.
+ */
+function rlsOnWrite(
+  t: TableNodeData | undefined,
+  operation: string,
+): "refused" | PolicyDetail[] | undefined {
+  if (!t?.known || !t.rlsEnabled) return undefined;
+  const commands = operation === "upsert" ? ["insert", "update"] : [operation];
+  const covering = t.policyDetails.filter(
+    (pl) =>
+      (pl.command === "all" || commands.includes(pl.command)) &&
+      !(pl.roles.length > 0 && pl.roles.every((r) => r === "service_role")),
+  );
+  if (covering.length === 0) return "refused";
+  return covering.every((pl) => /auth\.uid\(\)|auth\.jwt\(\)/i.test(pinExpression(pl)))
+    ? covering
+    : undefined;
+}
+
+/** The expression a new row must satisfy: WITH CHECK, or USING when an UPDATE or ALL policy has none. */
+function pinExpression(pl: PolicyDetail): string {
+  return pl.check ?? (pl.command === "insert" ? "" : (pl.using ?? ""));
+}
+
+function mentionsColumn(expr: string, column: string): boolean {
+  const c = column.replace(/[^A-Za-z0-9_]/g, "");
+  return c !== "" && new RegExp(`(?<![A-Za-z0-9_])"?${c}"?(?![A-Za-z0-9_])`, "i").test(expr);
+}
+
+function ownedWriteNote(
+  policies: readonly PolicyDetail[],
+  table: string,
+  pinned: readonly string[],
+): string {
+  const names = policies
+    .map((pl) => `"${pl.name}" (${pl.location.file}:${pl.location.line})`)
+    .join(", ");
+  return ` RLS still binds this client: ${policies.length === 1 ? "policy" : "policies"} ${names} only accept rows tied to the caller${pinned.length > 0 ? ` (${pinned.join(", ")})` : ""}, and public.${table} has no other column that grants a role, a price or a status, so the caller can only fill in the ordinary columns of their own row.`;
+}
+
 /** R8. The whole request body is written to a table: the caller can set any column (role, tenant_id, price...). */
 export const massAssignmentFromRequestBody: Rule = {
   id: "supabase.mass-assignment-from-request-body",
@@ -812,6 +913,21 @@ export const massAssignmentFromRequestBody: Rule = {
         const sensitive = cols.filter(
           (c) => isScopeColumn(c) || /role|admin|price|amount|status|plan|tier|balance/i.test(c),
         );
+        // RLS still binds an anon or user-scoped client: a write no policy allows is refused, and
+        // policies that pin the new row to the caller leave the caller only their own row's columns.
+        const kind = v.clientData?.kind;
+        const rls =
+          kind === "anon" || kind === "user_scoped"
+            ? rlsOnWrite(v.tableData, v.data.operation)
+            : undefined;
+        if (rls === "refused") continue;
+        const pinned = rls
+          ? cols.filter((c) => rls.some((pl) => mentionsColumn(pinExpression(pl), c)))
+          : [];
+        const ownedNote =
+          rls && sensitive.every((c) => pinned.includes(c))
+            ? ownedWriteNote(rls, tableName, pinned)
+            : "";
         const path = [
           "HTTP request",
           h.data.entry,
@@ -820,22 +936,27 @@ export const massAssignmentFromRequestBody: Rule = {
           `public.${tableName}.${v.data.operation}`,
         ];
         out.push(
-          finding(ctx, this, {
-            title: `Mass assignment into "${tableName}" from the request body`,
-            entrypoints: [h.data.entry],
-            sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
-            sinks: [`supabase.${v.data.operation}:public.${tableName}`],
-            path,
-            evidence: [
-              {
-                kind: "rule",
-                summary: `${v.data.operation} on public.${tableName} writes ${p.text} directly. ${sensitive.length > 0 ? `Columns the caller could set: ${sensitive.join(", ")}.` : "Every column of the table is writable by the caller."} Pick the allowed fields explicitly.`,
-                locations: locations(h.handler.location, v.query.location),
-                data: { deterministic: false, ruleId: this.id, payload: p.text },
-              },
-              { kind: "trace", summary: path.join(" -> ") },
-            ],
-          }),
+          finding(
+            ctx,
+            this,
+            {
+              title: `Mass assignment into "${tableName}" from the request body`,
+              entrypoints: [h.data.entry],
+              sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
+              sinks: [`supabase.${v.data.operation}:public.${tableName}`],
+              path,
+              evidence: [
+                {
+                  kind: "rule",
+                  summary: `${v.data.operation} on public.${tableName} writes ${p.text} directly.${ownedNote || ` ${sensitive.length > 0 ? `Columns the caller could set: ${sensitive.join(", ")}.` : "Every column of the table is writable by the caller."}`} Pick the allowed fields explicitly.`,
+                  locations: locations(h.handler.location, v.query.location),
+                  data: { deterministic: false, ruleId: this.id, payload: p.text },
+                },
+                { kind: "trace", summary: path.join(" -> ") },
+              ],
+            },
+            ownedNote ? "medium" : undefined,
+          ),
         );
       }
     }

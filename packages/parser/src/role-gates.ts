@@ -11,8 +11,12 @@ import { envNamesIn, exitKind } from "./auth-evidence.js";
  * ownership check, see guards.ts), nor a helper merely named `isAdmin` with no session value in it.
  */
 
-/** Properties of a session that carry a role or a claim the user cannot self-assign. */
-const ROLE_PROPERTY = /^(role|roles|app_metadata|is_?admin|is_?superuser|permissions?|claims?)$/i;
+/**
+ * Properties of a session, or of a row the caller's identity selected, that carry a role or a claim.
+ * Whether the user can rewrite a row's column is the rules' question (RoleCheck.table).
+ */
+const ROLE_PROPERTY =
+  /^(role|roles|rolle|rol|user_?role|access_?level|app_metadata|admin|is_?admin|superuser|is_?superuser|permissions?|claims?)$/i;
 /** The e-mail counts only against literals, env values or as a helper argument (`isAdminEmail(user.email)`). */
 const EMAIL_PROPERTY = /^email$/i;
 

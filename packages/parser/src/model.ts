@@ -52,6 +52,12 @@ export interface QueryFilter {
   valueText: string;
   /** True when the filter value is derived from a user-controlled input of the handler. */
   inputDerived: boolean;
+  /**
+   * The value is the caller's identity, or read off a row that identity selected: `user.id`, `dev.id`
+   * where `dev` was selected by `claimed_by = user.id`, the account a session token looked up. Absent
+   * otherwise. When a value is also `inputDerived`, the input wins.
+   */
+  identity?: boolean;
 }
 
 export type QueryOperation =
@@ -186,6 +192,12 @@ export interface RoleCheck extends FileRef {
   source: string;
   /** The condition, for evidence. */
   text: string;
+  /**
+   * Set when the role is a column of a row the caller's identity selected (`profil.rolle` read from
+   * `profiles` by `id = user.id`): who can write that column decides whether the gate holds.
+   */
+  table?: string;
+  column?: string;
 }
 
 export interface RouteHandler {
@@ -267,12 +279,39 @@ export interface SqlFunctionInfo {
    * Input parameters with their names, in order: what an rpc call body is keyed by. Absent when any
    * input parameter is unnamed or the list could not be read.
    */
-  params?: Array<{ name: string; type: string }>;
+  params?: Array<{ name: string; type: string; default?: true }>;
   /**
    * Relations named after FROM or JOIN in the body (lowercase, `public.` stripped): the tables it can
    * read, or delete from. Unfiltered text matches; keep only names the schema has.
    */
   tables?: string[];
+  /** Tables the body writes (`update t`, `insert into t`, `delete from t`); same caveats as `tables`. */
+  writes?: string[];
+  /**
+   * Parameters compared with a column in a WHERE/ON/AND/OR/IF clause of the body: `where i.id =
+   * p_invoice_id` gives `{ param: "p_invoice_id", table: "invoices", column: "id" }`.
+   */
+  keys?: Array<{ param: string; table: string; column: string }>;
+  /** Migration functions the body calls, spelled like `name`; absent when it calls none. */
+  calls?: string[];
+}
+
+/** A trigger from migration SQL, kept for what RLS cannot express: columns a row's owner may not change. */
+export interface SqlTrigger {
+  /** Lowercase trigger name. */
+  name: string;
+  /** Table key, like `RlsTable.table`. */
+  table: string;
+  timing: "before" | "after" | "instead of";
+  events: Array<"insert" | "update" | "delete" | "truncate">;
+  /**
+   * Columns the trigger holds back on NEW: an `UPDATE OF` list, or columns its function reads off NEW
+   * and also reads off OLD, assigns with `:=`, or reads in a body that raises.
+   */
+  checkedColumns: string[];
+  /** The trigger function, keyed like `SqlFunctionInfo.name`. */
+  function: string;
+  location: FileRef;
 }
 
 /** A Supabase Storage bucket created by migration SQL (`insert into storage.buckets ...`). */
@@ -324,4 +363,6 @@ export interface ProjectModel {
   sqlFunctions?: SqlFunctionInfo[];
   /** Storage buckets created by migration SQL, in creation order. */
   storageBuckets?: StorageBucket[];
+  /** Triggers from migration SQL still in force; absent when there are none. */
+  sqlTriggers?: SqlTrigger[];
 }

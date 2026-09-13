@@ -296,27 +296,39 @@ export const storagePolicyWithoutOwnerCheck: Rule = {
           entries.length > 0
             ? ` The app reaches the bucket from ${entries.join(", ")} with a client that relies on this policy.`
             : "";
+        // An INSERT policy adds files; reading, replacing and deleting the ones already there take others.
+        const insertOnly = p.command === "insert";
+        const insertNote = insertOnly
+          ? " An INSERT policy cannot read, replace or delete existing files, so this is reported as medium: what it allows is placing files in other users' folders."
+          : "";
         out.push(
-          finding(ctx, this, {
-            title: `Storage policy "${p.name}" lets ${who} ${verb} every object in ${buckets.length > 0 ? `bucket ${where}` : "every bucket"}`,
-            entrypoints: [...entries, storageEntry],
-            sources: unique([
-              ...reached.flatMap((r) => r.inputs.map((i) => `${i.kind}:${i.name}`)),
-              "storage API (caller's own session)",
-            ]),
-            sinks:
-              buckets.length > 0 ? buckets.map((b) => `storage.objects:${b}`) : ["storage.objects"],
-            path,
-            evidence: [
-              {
-                kind: "rule",
-                summary: `Policy "${p.name}" for ${p.command} on storage.objects ${clause} (${expr}) checks only the bucket: no auth.uid(), no storage.foldername(name) ownership, no owner column. So ${whoLong} can ${verb} every object in ${where}, including other users' files, straight through the Storage API.${privateNote}${reachNote} Scope it to the owner, e.g. bucket_id = '${buckets[0] ?? "<bucket>"}' and (storage.foldername(name))[1] = (select auth.uid())::text.`,
-                locations: locations(p.location, ...reached.map((r) => r.query.location)),
-                data: { deterministic: false, ruleId: this.id, policy: p.name, buckets },
-              },
-              { kind: "trace", summary: path.join(" -> ") },
-            ],
-          }),
+          finding(
+            ctx,
+            this,
+            {
+              title: `Storage policy "${p.name}" lets ${who} ${verb} every object in ${buckets.length > 0 ? `bucket ${where}` : "every bucket"}`,
+              entrypoints: [...entries, storageEntry],
+              sources: unique([
+                ...reached.flatMap((r) => r.inputs.map((i) => `${i.kind}:${i.name}`)),
+                "storage API (caller's own session)",
+              ]),
+              sinks:
+                buckets.length > 0
+                  ? buckets.map((b) => `storage.objects:${b}`)
+                  : ["storage.objects"],
+              path,
+              evidence: [
+                {
+                  kind: "rule",
+                  summary: `Policy "${p.name}" for ${p.command} on storage.objects ${clause} (${expr}) checks only the bucket: no auth.uid(), no storage.foldername(name) ownership, no owner column. So ${whoLong} can ${verb} every object in ${where}, including other users' files, straight through the Storage API.${privateNote}${reachNote}${insertNote} Scope it to the owner, e.g. bucket_id = '${buckets[0] ?? "<bucket>"}' and (storage.foldername(name))[1] = (select auth.uid())::text.`,
+                  locations: locations(p.location, ...reached.map((r) => r.query.location)),
+                  data: { deterministic: false, ruleId: this.id, policy: p.name, buckets },
+                },
+                { kind: "trace", summary: path.join(" -> ") },
+              ],
+            },
+            insertOnly ? "medium" : undefined,
+          ),
         );
       }
     }
@@ -325,6 +337,46 @@ export const storagePolicyWithoutOwnerCheck: Rule = {
 };
 
 // ---------------------------------------------------------------------------------------------
+
+/** `true`, with any parentheses: a policy predicate that lets every row through. */
+const EVERY_ROW = /^\(*\s*true\s*\)*$/i;
+/** A file the Supabase CLI applies: directly inside `supabase/migrations/`. */
+const MIGRATION_SQL = /(?:^|\/)supabase\/migrations\/[^/]+\.sql$/i;
+
+/**
+ * A definer function that can hand out nothing RLS does not already show to anyone: it writes
+ * nothing, calls no other migration function, and every table it reads has RLS on and a SELECT (or
+ * ALL) policy for anonymous visitors that lets every row through. Tables the schema does not know
+ * (views, CTE names, auth.users) keep the finding. Column-level grants are not modelled. Silencing
+ * takes stronger evidence than reporting: with `fromMigrationsOnly`, only a policy a Supabase migration
+ * declares counts, because hand-run SQL beside the migrations (`database/RLS_FIX.sql`) may never
+ * have reached the database.
+ */
+function readsOnlyPublicRows(
+  fn: { tables?: string[]; writes?: string[]; calls?: string[] },
+  tables: ReadonlyMap<string, { rlsEnabled: boolean; policyDetails: readonly PolicyDetail[] }>,
+  fromMigrationsOnly: boolean,
+): boolean {
+  if ((fn.writes?.length ?? 0) > 0 || (fn.calls?.length ?? 0) > 0) return false;
+  const read = fn.tables ?? [];
+  return (
+    read.length > 0 &&
+    read.every((name) => {
+      const t = tables.get(name);
+      return (
+        t?.rlsEnabled === true &&
+        t.policyDetails.some(
+          (p) =>
+            (p.command === "select" || p.command === "all") &&
+            opensToEveryone(p) &&
+            p.using !== null &&
+            EVERY_ROW.test(p.using.trim()) &&
+            (!fromMigrationsOnly || MIGRATION_SQL.test(p.location.file)),
+        )
+      );
+    })
+  );
+}
 
 /** Roles PostgREST requests run as. */
 const API_ROLES = new Set(["anon", "authenticated", "public"]);
@@ -351,6 +403,8 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
       const key = r.data.table.toLowerCase();
       rpcByName.set(key, [...(rpcByName.get(key) ?? []), r]);
     }
+    const tables = new Map(ctx.model.tables.map((t) => [t.table, t]));
+    const hasMigrations = ctx.model.files.some((f) => MIGRATION_SQL.test(f));
     const out: Finding[] = [];
     for (const fn of fns) {
       if (!fn.securityDefiner || fn.checksCaller) continue;
@@ -359,6 +413,8 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
       if (fn.returns === "trigger" || fn.returns === "event_trigger") continue;
       const roles = fn.grantedTo.filter((r) => API_ROLES.has(r));
       if (roles.length === 0) continue;
+      // Nothing to hand out: every row it can read is already public through RLS.
+      if (readsOnlyPublicRows(fn, tables, hasMigrations)) continue;
       const anonymous = roles.includes("anon") || roles.includes("public");
       const sites = rpcByName.get(fn.name) ?? [];
       const entries = unique(sites.map((s) => s.handlerData.entry));

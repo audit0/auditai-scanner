@@ -82,6 +82,22 @@ export function newFunctionRegistry(): FunctionRegistry {
   };
 }
 
+/**
+ * Body (comments blanked) of a function the migrations define: the exact key first, then an
+ * unqualified name in any schema. Null when the migrations do not define it.
+ */
+export function functionBodyOf(
+  reg: FunctionRegistry,
+  q: { schema: string | null; name: string },
+): string | null {
+  const direct = reg.byKey.get(qualifiedKey(q));
+  if (direct) return direct.body;
+  if (q.schema !== null) return null;
+  const lower = q.name.toLowerCase();
+  for (const f of reg.byKey.values()) if (f.name.toLowerCase() === lower) return f.body;
+  return null;
+}
+
 /** Direct reads of the caller's identity. auth.role() is deliberately absent: it names a role, not a caller. */
 const CALLER_CHECKS = [
   /"?\bauth"?\s*\.\s*"?(?:uid|jwt|email)"?\s*\(\s*\)/i,
@@ -268,6 +284,10 @@ const TYPE_WORD = new Set([
 interface FunctionParam {
   name: string | null;
   type: string;
+  /** DEFAULT (or `=`) follows the type: an rpc call may leave the parameter out. */
+  hasDefault: boolean;
+  /** The default reads the caller's identity: `p_user_id uuid default auth.uid()`. */
+  callerDefault: boolean;
 }
 
 /**
@@ -300,11 +320,18 @@ function readParams(
   pieces.push([start, close]);
   for (const [from, to] of pieces) {
     const words: Token[] = [];
+    let hasDefault = false;
+    let callerDefault = false;
     for (let i = from; i < to; i++) {
       const t = tokens[i];
       if (!t) continue;
-      if (isWord(t, "default")) break;
-      if (t.kind === "punct" && t.value === "=") break;
+      if (isWord(t, "default") || (t.kind === "punct" && t.value === "=")) {
+        hasDefault = true;
+        const last = tokens[to - 1];
+        const text = last ? stmt.text.slice(t.end - stmt.start, last.end - stmt.start) : "";
+        callerDefault = CALLER_CHECKS.some((re) => re.test(text));
+        break;
+      }
       words.push(t);
     }
     if (words.length === 0) return null;
@@ -334,6 +361,8 @@ function readParams(
         .replace(/\s+/g, " ")
         .trim()
         .toLowerCase(),
+      hasDefault,
+      callerDefault,
     });
   }
   return parts;
@@ -548,7 +577,21 @@ export function applyDefaultPrivileges(reg: FunctionRegistry, stmt: SqlStatement
 const CALL =
   /(?<![A-Za-z0-9_$])(?:"?([A-Za-z_][A-Za-z0-9_$]{0,62})"?\s*\.\s*)?"?([A-Za-z_][A-Za-z0-9_$]{0,62})"?\s*\(/g;
 
-/** Functions of the registry that `f` calls. Unqualified calls resolve to `public` first, then by name. */
+/** The registry function a call names. Unqualified calls resolve to `public` first, then by name. */
+function calledFunction(
+  reg: FunctionRegistry,
+  m: RegExpMatchArray,
+  byName: Map<string, FunctionState>,
+): FunctionState | undefined {
+  const name = m[2];
+  if (!name) return undefined;
+  return (
+    reg.byKey.get(qualifiedKey({ schema: m[1] ?? null, name })) ??
+    (m[1] === undefined ? byName.get(name.toLowerCase()) : undefined)
+  );
+}
+
+/** Functions of the registry that `f` calls. */
 function callees(
   reg: FunctionRegistry,
   f: FunctionState,
@@ -556,14 +599,74 @@ function callees(
 ): Set<FunctionState> {
   const out = new Set<FunctionState>();
   for (const m of f.body.matchAll(CALL)) {
-    const name = m[2];
-    if (!name) continue;
-    const g =
-      reg.byKey.get(qualifiedKey({ schema: m[1] ?? null, name })) ??
-      (m[1] === undefined ? byName.get(name.toLowerCase()) : undefined);
+    const g = calledFunction(reg, m, byName);
     if (g && g !== f) out.add(g);
   }
   return out;
+}
+
+/** Longest argument list read at a call site; a longer one is left unread. */
+const MAX_CALL_ARGS_CHARS = 4000;
+
+/**
+ * The top-level arguments of a call whose `(` ends just before `from`: `f(a, g(b, c), 'x,y')` gives
+ * `a`, `g(b, c)` and `'x,y'`; `f()` gives none. Null when the list does not close within reach.
+ */
+function callArguments(body: string, from: number): string[] | null {
+  const args: string[] = [];
+  let depth = 0;
+  let quoted = false;
+  let start = from;
+  const end = Math.min(body.length, from + MAX_CALL_ARGS_CHARS);
+  for (let i = from; i < end; i++) {
+    const c = body[i];
+    if (quoted) {
+      if (c === "'") quoted = false;
+    } else if (c === "'") {
+      quoted = true;
+    } else if (c === "(") {
+      depth += 1;
+    } else if (c === ")") {
+      if (depth === 0) {
+        const last = body.slice(start, i).trim();
+        if (last !== "" || args.length > 0) args.push(last);
+        return args;
+      }
+      depth -= 1;
+    } else if (c === "," && depth === 0) {
+      args.push(body.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  return null;
+}
+
+/**
+ * `f` calls a registry function and leaves out a parameter whose default reads the caller's identity.
+ * `if not user_can_blog() then raise` checks the caller when the helper is declared
+ * `user_can_blog(p_user_id uuid default auth.uid())`; `user_can_blog(p_author)` does not, because the
+ * caller chose the value. Postgres puts positional arguments before named ones (`p => v`, `p := v`).
+ */
+function callsWithCallerDefault(
+  reg: FunctionRegistry,
+  f: FunctionState,
+  byName: Map<string, FunctionState>,
+): boolean {
+  for (const m of f.body.matchAll(CALL)) {
+    const g = calledFunction(reg, m, byName);
+    if (!g || g === f || !g.params?.some((p) => p.callerDefault)) continue;
+    const args = callArguments(f.body, (m.index ?? 0) + m[0].length);
+    if (args === null) continue;
+    const named = args
+      .filter((a) => /=>|:=/.test(a))
+      .map((a) => (a.split(/=>|:=/)[0] ?? "").trim().replace(/"/g, "").toLowerCase());
+    const positional = args.length - named.length;
+    const omitted = g.params.some(
+      (p, i) => p.callerDefault && i >= positional && (p.name === null || !named.includes(p.name)),
+    );
+    if (omitted) return true;
+  }
+  return false;
 }
 
 /**
@@ -587,6 +690,150 @@ function relationsOf(body: string): string[] {
   return out;
 }
 
+const IDENT_SRC = "[A-Za-z_][A-Za-z0-9_$]{0,62}";
+
+/**
+ * Tables the body writes: `update t`, `insert into t (...)`, `delete from t`. `do update set` and
+ * `for update [of|skip|nowait]` name no table. Text matches, like relationsOf: consumers keep the
+ * names the schema has.
+ */
+const WRITE = new RegExp(
+  `(?<![A-Za-z0-9_$])(?:update|insert\\s+into|delete\\s+from)\\s+(?:only\\s+)?(?:"?(${IDENT_SRC})"?\\s*\\.\\s*)?"?(${IDENT_SRC})"?(?![A-Za-z0-9_$"]|\\s*\\.)`,
+  "gi",
+);
+const NOT_A_RELATION = new Set(["set", "of", "skip", "nowait", "only", "on"]);
+
+function writesOf(body: string): string[] {
+  const out: string[] = [];
+  for (const m of body.matchAll(WRITE)) {
+    const schema = m[1]?.toLowerCase();
+    const name = m[2]?.toLowerCase();
+    if (!name || NOT_A_RELATION.has(name)) continue;
+    const key = schema === undefined || schema === "public" ? name : `${schema}.${name}`;
+    if (!out.includes(key)) out.push(key);
+  }
+  return out;
+}
+
+/** `from public.invoices i`, `join notes as n`, `update invoices i`: a relation and the alias the body gives it. */
+const ALIASED = new RegExp(
+  `(?<![A-Za-z0-9_$])(?:from|join|update|into)\\s+(?:only\\s+)?(?:"?(${IDENT_SRC})"?\\s*\\.\\s*)?"?(${IDENT_SRC})"?(?:\\s+(?:as\\s+)?"?(${IDENT_SRC})"?)?`,
+  "gi",
+);
+const SQL_WORDS = new Set([
+  "and",
+  "as",
+  "conflict",
+  "cross",
+  "default",
+  "do",
+  "else",
+  "elsif",
+  "end",
+  "except",
+  "for",
+  "from",
+  "full",
+  "group",
+  "having",
+  "if",
+  "in",
+  "inner",
+  "intersect",
+  "into",
+  "is",
+  "join",
+  "lateral",
+  "left",
+  "limit",
+  "loop",
+  "natural",
+  "not",
+  "nowait",
+  "of",
+  "offset",
+  "on",
+  "only",
+  "or",
+  "order",
+  "returning",
+  "right",
+  "select",
+  "set",
+  "skip",
+  "then",
+  "union",
+  "using",
+  "values",
+  "when",
+  "where",
+  "window",
+  "with",
+]);
+/** Keywords after which `a = b` compares; after `set` (or in a `values` list) it assigns. */
+const CLAUSE =
+  /(?<![A-Za-z0-9_$])(set|where|on|and|or|when|if|elsif|having|values|select|returning|then|else)(?![A-Za-z0-9_$])/gi;
+const COMPARING = new Set(["where", "on", "and", "or", "when", "if", "elsif", "having"]);
+const MAX_KEYED_PARAMS = 32;
+/** How far back a comparison looks for the clause it sits in. */
+const CLAUSE_WINDOW = 400;
+
+export interface ParamKey {
+  param: string;
+  table: string;
+  column: string;
+}
+
+/**
+ * Which column of which table each parameter is compared with: `where i.id = p_invoice_id`, or
+ * `user_id = user_uuid` in a body that names a single relation. An rpc proof needs it to seed the
+ * row a parameter selects. Only comparisons in a WHERE/ON/AND/OR/IF clause count: `set owner_id =
+ * p_user` assigns, and reading it as a key would make a proof look at the wrong column. Text matches,
+ * like relationsOf; an alias the body does not resolve gives nothing.
+ */
+function paramKeysOf(body: string, params: readonly string[]): ParamKey[] {
+  const aliases = new Map<string, string>();
+  const relations: string[] = [];
+  for (const m of body.matchAll(ALIASED)) {
+    const schema = m[1]?.toLowerCase();
+    const name = m[2]?.toLowerCase();
+    if (!name || SQL_WORDS.has(name)) continue;
+    const table = schema === undefined || schema === "public" ? name : `${schema}.${name}`;
+    if (!relations.includes(table)) relations.push(table);
+    aliases.set(name, table);
+    const alias = m[3]?.toLowerCase();
+    if (alias && !SQL_WORDS.has(alias)) aliases.set(alias, table);
+  }
+  const side = `(?:"?(${IDENT_SRC})"?\\s*\\.\\s*)?"?(${IDENT_SRC})"?`;
+  const out: ParamKey[] = [];
+  for (const param of params.slice(0, MAX_KEYED_PARAMS)) {
+    if (!/^[a-z_][a-z0-9_]*$/.test(param)) continue;
+    const re = new RegExp(
+      `${side}\\s*(?<![<>!:])=\\s*"?${param}"?(?![A-Za-z0-9_$.(])|(?<![A-Za-z0-9_$."])"?${param}"?\\s*=(?!=)\\s*${side}(?!\\s*\\()`,
+      "gi",
+    );
+    for (const m of body.matchAll(re)) {
+      const at = m.index ?? 0;
+      const clauses = [...body.slice(Math.max(0, at - CLAUSE_WINDOW), at).matchAll(CLAUSE)];
+      const clause = clauses[clauses.length - 1]?.[1]?.toLowerCase();
+      if (clause === undefined || !COMPARING.has(clause)) continue;
+      const qualifier = (m[1] ?? m[3])?.toLowerCase();
+      const column = (m[2] ?? m[4])?.toLowerCase();
+      if (!column || column === param || SQL_WORDS.has(column)) continue;
+      const table =
+        qualifier !== undefined
+          ? aliases.get(qualifier)
+          : relations.length === 1
+            ? relations[0]
+            : undefined;
+      if (table === undefined) continue;
+      if (!out.some((k) => k.param === param && k.table === table && k.column === column))
+        out.push({ param, table, column });
+    }
+  }
+  return out;
+}
+
 function effectiveRoles(acl: Acl): string[] {
   const out: string[] = [];
   if (acl.publicExec || acl.roles.includes("anon")) out.push("anon");
@@ -598,7 +845,8 @@ function effectiveRoles(acl: Acl): string[] {
 
 /**
  * Final function list. `checksCaller` propagates through calls: a definer function that filters by
- * `current_tenant_id()` checks the caller when `current_tenant_id()` itself reads `auth.uid()`.
+ * `current_tenant_id()` checks the caller when `current_tenant_id()` itself reads `auth.uid()`. A call
+ * that leaves out a parameter defaulting to `auth.uid()` reads the caller too.
  */
 export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
   const fns = [...reg.byKey.values()];
@@ -609,10 +857,15 @@ export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
     }
   }
   const callers = new Map<FunctionState, FunctionState[]>();
+  const calls = new Map<FunctionState, Set<FunctionState>>();
   for (const f of fns) {
-    for (const g of callees(reg, f, byName)) callers.set(g, [...(callers.get(g) ?? []), f]);
+    const called = callees(reg, f, byName);
+    calls.set(f, called);
+    for (const g of called) callers.set(g, [...(callers.get(g) ?? []), f]);
   }
-  const checks = new Set(fns.filter((f) => f.directCheck));
+  const checks = new Set(
+    fns.filter((f) => f.directCheck || callsWithCallerDefault(reg, f, byName)),
+  );
   const queue = [...checks];
   for (let g = queue.pop(); g !== undefined; g = queue.pop()) {
     for (const f of callers.get(g) ?? []) {
@@ -631,10 +884,25 @@ export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
     };
     if (f.returns !== null) info.returns = f.returns;
     if (f.args !== null) info.args = f.args;
-    if (f.params?.every((x) => x.name !== null))
-      info.params = f.params.map((x) => ({ name: x.name ?? "", type: x.type }));
+    if (f.params?.every((x) => x.name !== null)) {
+      const params = f.params.map((x) => ({
+        name: x.name ?? "",
+        type: x.type,
+        ...(x.hasDefault ? { default: true as const } : {}),
+      }));
+      info.params = params;
+      const keys = paramKeysOf(
+        f.body,
+        params.map((x) => x.name),
+      );
+      if (keys.length > 0) info.keys = keys;
+    }
     const tables = relationsOf(f.body);
     if (tables.length > 0) info.tables = tables;
+    const called = [...(calls.get(f) ?? [])].map((g) => qualifiedKey(g));
+    if (called.length > 0) info.calls = called;
+    const writes = writesOf(f.body);
+    if (writes.length > 0) info.writes = writes;
     return info;
   });
 }
