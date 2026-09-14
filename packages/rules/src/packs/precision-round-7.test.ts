@@ -7,6 +7,7 @@ import { parseProject } from "@auditai/parser";
 import { describe, expect, it } from "vitest";
 import { runRules } from "../rule.js";
 import { supabaseAuthorizationPack } from "./supabase-authorization.js";
+import { supabaseStorageRpcPack } from "./supabase-storage-rpc.js";
 
 /**
  * Precision round 7 (14 September 2026): causes the third blind sample showed
@@ -26,9 +27,14 @@ function scan(files: Record<string, string>): Finding[] {
     writeFileSync(join(dir, rel), text);
   }
   const model = parseProject(dir, { sqlDirs: ["supabase/migrations"] });
-  return runRules(supabaseAuthorizationPack, model, buildGraph(model), {
-    now: "2026-09-14T00:00:00Z",
-  });
+  return runRules(
+    [...supabaseAuthorizationPack, ...supabaseStorageRpcPack],
+    model,
+    buildGraph(model),
+    {
+      now: "2026-09-14T00:00:00Z",
+    },
+  );
 }
 
 const R1 = "supabase.service-role-object-access-without-tenant-scope";
@@ -157,6 +163,67 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
       '.eq("organisation_id", roadmap.organisation_id)',
     ]) {
       expect(of(scan(route(filter)), R1).length, filter).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("a SECURITY DEFINER function that changes nothing and returns only true or false, or only the catalog", () => {
+  const S3 = "supabase.security-definer-function-without-caller-check";
+  const definer = (sql: string): Finding[] =>
+    of(scan({ "supabase/migrations/0001_init.sql": sql }), S3);
+  const TABLES = `create table public.accounts (id uuid primary key, tenant_id uuid not null, active boolean);
+alter table public.accounts enable row level security;
+create table public.buckets (key text primary key, tokens int);
+alter table public.buckets enable row level security;`;
+
+  it("lowers a yes/no answer to medium and keeps it", () => {
+    const findings = definer(`${TABLES}
+create function public.account_is_active(p_tenant uuid, p_id uuid) returns boolean language sql security definer as $$
+  select exists (select 1 from public.accounts where tenant_id = p_tenant and id = p_id and active)
+$$;`);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.severity).toBe("medium");
+    expect(findings[0]?.evidence[0]?.summary).toContain("returns only true or false");
+  });
+
+  it("lowers a function that reads only the system catalog", () => {
+    const findings =
+      definer(`create function public.writable_columns(p_table text) returns text[] language sql security definer as $$
+  select array_agg(column_name::text) from information_schema.columns where table_name = p_table
+$$;`);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.severity).toBe("medium");
+  });
+
+  it("keeps the severity when the function writes, calls a writer, returns rows, returns nothing, or answers about a person or a credential", () => {
+    for (const sql of [
+      `${TABLES}
+create function public.is_member(p_tenant uuid, p_user_id uuid) returns boolean language sql security definer as $$
+  select exists (select 1 from public.accounts where tenant_id = p_tenant and id = p_user_id)
+$$;`,
+      `create table public.staff (id uuid primary key, pin text);
+alter table public.staff enable row level security;
+create function public.verify_staff_pin(p_pin text) returns boolean language sql security definer as $$
+  select exists (select 1 from public.staff where pin = p_pin)
+$$;`,
+      `${TABLES}
+create function public.consume_token(p_key text) returns boolean language plpgsql security definer as $$
+begin update public.buckets set tokens = tokens - 1 where key = p_key; return true; end $$;`,
+      `${TABLES}
+create function public.drain(p_key text) returns void language sql security definer as $$ update public.buckets set tokens = 0 where key = p_key $$;
+create function public.try_drain(p_key text) returns boolean language plpgsql security definer as $$
+begin perform public.drain(p_key); return true; end $$;`,
+      `${TABLES}
+create function public.accounts_of(p_tenant uuid) returns setof public.accounts language sql security definer as $$ select * from public.accounts where tenant_id = p_tenant $$;`,
+      `create function public.add_constraints() returns void language plpgsql security definer as $$
+begin perform 1 from information_schema.columns; end $$;`,
+    ]) {
+      const findings = definer(sql);
+      expect(findings.length, sql).toBeGreaterThan(0);
+      expect(
+        findings.some((f) => f.severity === "medium"),
+        sql,
+      ).toBe(false);
     }
   });
 });

@@ -381,6 +381,71 @@ function readsOnlyPublicRows(
 /** Roles PostgREST requests run as. */
 const API_ROLES = new Set(["anon", "authenticated", "public"]);
 
+interface FunctionFacts {
+  name: string;
+  returns?: string;
+  args?: string;
+  params?: Array<{ name: string }>;
+  tables?: string[];
+  writes?: string[];
+  calls?: string[];
+}
+
+/** A parameter that names a person: a yes/no about someone the caller picks reveals their memberships or roles. */
+const NAMES_A_PERSON =
+  /(^|_)(user|uid|profile|member|person|owner|customer|employee|student|patient|email)(_?id)?$/i;
+/** A parameter that carries a credential: a yes/no answer about it is a guessing oracle. */
+const CARRIES_CREDENTIAL = /(^|_)(pin|password|passwd|secret|token|otp|code|hash)$/i;
+
+/** The system catalog describes the schema itself (`information_schema.columns`, `pg_constraint`), not anyone's rows. */
+function isCatalogRelation(name: string): boolean {
+  return (
+    name.startsWith("information_schema.") ||
+    name.startsWith("pg_catalog.") ||
+    /^pg_[a-z_]+$/.test(name)
+  );
+}
+
+/** Neither the function nor any migration function it calls writes a table. A callee the migrations do not define counts as writing. */
+function writesNothing(
+  fn: FunctionFacts,
+  byName: ReadonlyMap<string, FunctionFacts>,
+  seen: Set<string> = new Set(),
+): boolean {
+  if ((fn.writes?.length ?? 0) > 0) return false;
+  if (seen.has(fn.name)) return true;
+  seen.add(fn.name);
+  return (fn.calls ?? []).every((c) => {
+    const callee = byName.get(c);
+    return callee !== undefined && writesNothing(callee, byName, seen);
+  });
+}
+
+/**
+ * What a definer function that changes nothing can hand out: only true or false, or only rows of the
+ * system catalog. Null when it may return other users' rows or has effects. A function that returns
+ * nothing while reading the catalog is doing something else (DDL), so it keeps its severity. So does a
+ * yes/no answer about a person the caller names (`is_tribe_admin(p_tribe_id, p_user_id)` reveals a
+ * membership RLS hides) or about a credential (`verify_staff_pin(p_pin)` can be guessed against).
+ */
+function narrowResult(
+  fn: FunctionFacts,
+  byName: ReadonlyMap<string, FunctionFacts>,
+): "boolean" | "catalog" | null {
+  if (!writesNothing(fn, byName)) return null;
+  if (fn.returns === "boolean") {
+    // Unread parameters prove nothing about whom the answer is about.
+    if (fn.params === undefined && fn.args !== "") return null;
+    const about = (fn.params ?? []).map((p) => p.name);
+    return about.some((n) => NAMES_A_PERSON.test(n) || CARRIES_CREDENTIAL.test(n))
+      ? null
+      : "boolean";
+  }
+  const read = fn.tables ?? [];
+  if (fn.returns !== "void" && read.length > 0 && read.every(isCatalogRelation)) return "catalog";
+  return null;
+}
+
 /**
  * S3. A SECURITY DEFINER function runs with its owner's rights, so RLS does not apply inside it. When
  * its body never reads the caller's identity, every role that may EXECUTE it gets whatever it returns
@@ -405,6 +470,7 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
     }
     const tables = new Map(ctx.model.tables.map((t) => [t.table, t]));
     const hasMigrations = ctx.model.files.some((f) => MIGRATION_SQL.test(f));
+    const byName = new Map(fns.map((f) => [f.name, f]));
     const out: Finding[] = [];
     for (const fn of fns) {
       if (!fn.securityDefiner || fn.checksCaller) continue;
@@ -415,6 +481,15 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
       if (roles.length === 0) continue;
       // Nothing to hand out: every row it can read is already public through RLS.
       if (readsOnlyPublicRows(fn, tables, hasMigrations)) continue;
+      // A yes/no answer or the schema's own catalog is not other users' rows: lowered, never dropped,
+      // because a boolean can still confirm that a record exists or that a user holds a role.
+      const narrow = narrowResult(fn, byName);
+      const narrowNote =
+        narrow === "boolean"
+          ? " It changes nothing and returns only true or false, so it is reported as medium: a yes/no answer about ids the caller supplies can still confirm that a record exists or that a user holds a role."
+          : narrow === "catalog"
+            ? " It changes nothing and reads only the system catalog, so it is reported as medium: it describes the schema, not anyone's rows."
+            : "";
       const anonymous = roles.includes("anon") || roles.includes("public");
       const sites = rpcByName.get(fn.name) ?? [];
       const entries = unique(sites.map((s) => s.handlerData.entry));
@@ -448,7 +523,7 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
             evidence: [
               {
                 kind: "rule",
-                summary: `public.${fn.name}() is SECURITY DEFINER: it runs with the rights of its owner and Row Level Security does not apply inside it. Its body never reads the caller's identity (auth.uid(), auth.jwt(), auth.email() or the request JWT), so whatever it returns or changes is available to every role that can execute it: ${roles.join(", ")}. ${who} at ${endpoint}.${callNote} Filter by auth.uid() inside the function, make it SECURITY INVOKER, or revoke EXECUTE from public, anon and authenticated.`,
+                summary: `public.${fn.name}() is SECURITY DEFINER: it runs with the rights of its owner and Row Level Security does not apply inside it. Its body never reads the caller's identity (auth.uid(), auth.jwt(), auth.email() or the request JWT), so whatever it returns or changes is available to every role that can execute it: ${roles.join(", ")}. ${who} at ${endpoint}.${callNote}${narrowNote} Filter by auth.uid() inside the function, make it SECURITY INVOKER, or revoke EXECUTE from public, anon and authenticated.`,
                 locations: locations(
                   fn.location,
                   ...sites.flatMap((s) => [s.handler.location, s.query.location]),
@@ -458,12 +533,13 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
                   ruleId: this.id,
                   function: fn.name,
                   grantedTo: [...fn.grantedTo],
+                  ...(narrow ? { narrowResult: narrow } : {}),
                 },
               },
               { kind: "trace", summary: path.join(" -> ") },
             ],
           },
-          anonymous ? "critical" : "high",
+          narrow ? "medium" : anonymous ? "critical" : "high",
         ),
       );
     }
