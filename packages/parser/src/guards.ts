@@ -227,6 +227,56 @@ export function callResultChecked(call: ts.CallExpression): boolean {
   );
 }
 
+/** The names bound to a query's row: `request` of `const { data: request } = await …`, a plain `row`. */
+export function rowNamesOf(tail: ts.CallExpression): Set<string> {
+  const { parent } = outerOf(tail);
+  if (!parent || !ts.isVariableDeclaration(parent)) return new Set();
+  const rows = resultNames(parent.name).data;
+  // `const result = await q; const { data: roadmap } = result;`: the row under a second name.
+  const fn = enclosingFunction(parent);
+  const scope: ts.Node | undefined = fn ? fn.body : parent.getSourceFile();
+  if (scope) {
+    walkOwn(scope, (n) => {
+      if (!ts.isVariableDeclaration(n) || !n.initializer || n.pos < parent.end) return;
+      const init = unwrap(n.initializer);
+      if (!ts.isIdentifier(init) || !rows.has(init.text) || ts.isIdentifier(n.name)) return;
+      for (const name of resultNames(n.name).data) rows.add(name);
+    });
+  }
+  return rows;
+}
+
+/**
+ * How the caller stops when a call reports failure: `const allowed = await canAccess(…); if
+ * (!allowed) return null`, or `if (!(await canAccess(…))) throw …`. Null when nothing stops it, and
+ * for a result that is only passed on (`return canAccess(…)`): that is not a stop in this function.
+ */
+export function checkedResultExit(call: ts.CallExpression): ExitKind | null {
+  const { node, parent } = outerOf(call);
+  if (!parent) return null;
+  if (ts.isVariableDeclaration(parent) && parent.initializer === node) {
+    const names = new Set(boundNames(parent.name));
+    for (const s of ifsAfter(parent)) {
+      if (!checksMissing(s.expression, names)) continue;
+      const kind = exitKind(s.thenStatement);
+      if (kind) return kind;
+    }
+    return null;
+  }
+  if (!ts.isPrefixUnaryExpression(parent) || parent.operator !== ts.SyntaxKind.ExclamationToken) {
+    return null;
+  }
+  let cur: ts.Node | undefined = parent.parent;
+  let child: ts.Node = parent;
+  while (cur && ts.isParenthesizedExpression(cur)) {
+    child = cur;
+    cur = cur.parent;
+  }
+  return cur !== undefined && ts.isIfStatement(cur) && cur.expression === child
+    ? exitKind(cur.thenStatement)
+    : null;
+}
+
 /** Source order of two call paths (positions from the entry point down): negative when `a` runs first. */
 export function compareOrder(a: readonly number[], b: readonly number[]): number {
   const n = Math.min(a.length, b.length);

@@ -277,7 +277,11 @@ function tableDataOf(ctx: RuleContext, table: string): TableNodeData | undefined
  * being the account a session token looked up).
  */
 function callerCheck(checks: readonly QueryFilter[] | undefined): QueryFilter | undefined {
-  return checks?.find((c) => !c.inputDerived && (c.identity === true || isScopeColumn(c.column)));
+  const tying = (checks ?? []).filter(
+    (c) => !c.inputDerived && (c.identity === true || isScopeColumn(c.column)),
+  );
+  // A check every path makes wins over one a role of the caller can skip.
+  return tying.find((c) => c.bypass === undefined) ?? tying[0];
 }
 
 /**
@@ -291,7 +295,7 @@ function guardTiesRowToCaller(
   guard: QueryGuard,
   table: TableNodeData | undefined,
   callerFns: ReadonlySet<string>,
-): { tied: boolean; how: string; why: string } {
+): { tied: boolean; how: string; why: string; bypass?: string } {
   const callerFilter = guard.filters.find(
     (f) => !f.inputDerived && (f.identity === true || isScopeColumn(f.column)),
   );
@@ -308,6 +312,7 @@ function guardTiesRowToCaller(
       tied: true,
       how: `its ${compared.column} compared with ${compared.valueText} in code, stopping otherwise`,
       why: "",
+      ...(compared.bypass !== undefined ? { bypass: compared.bypass } : {}),
     };
   }
   if (guard.client !== "user_scoped") {
@@ -372,18 +377,25 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
         if (!idFilter || scoped) continue;
         // A read whose own row is compared with the caller before anything continues is the
         // ownership check itself (`existing.user_id !== user.id` -> 404).
-        if (q.operation === "select" && callerCheck(q.ownerChecks)) continue;
+        const own = q.operation === "select" ? callerCheck(q.ownerChecks) : undefined;
+        if (own && own.bypass === undefined) continue;
         // Ownership can be checked by an earlier read of the same row, or of its parent row, rather
         // than by this query's filters.
         const guard = q.guard;
         const guardTable = guard?.parent ? tableDataOf(ctx, guard.table) : v.tableData;
         const tied = guard ? guardTiesRowToCaller(guard, guardTable, callerFns) : null;
-        if (guard && tied?.tied && guard.exitsWhenMissing) continue;
+        if (guard && tied?.tied && guard.exitsWhenMissing && tied.bypass === undefined) continue;
+        // Compared with the caller, except that a role of the caller skips the comparison
+        // (`canAccessRequest` lets reviewers through): lowered, never dropped, as ADR-001 does.
+        const bypassed =
+          own ??
+          (guard && tied?.tied && guard.exitsWhenMissing ? callerCheck(guard.checks) : undefined);
+        const bypass = bypassed?.bypass;
         const guardWhat = guard?.parent
           ? `the parent row ${guard.parent.table}.${guard.parent.column} (${q.table}.${guard.column} refers to it by ${guard.parent.how})`
           : `the same "${guard?.column}"`;
         const guardNote =
-          guard && tied && (tied.tied || guard.client === "user_scoped")
+          guard && tied && bypass === undefined && (tied.tied || guard.client === "user_scoped")
             ? ` An earlier read of ${guardWhat} at ${guard.location.file}:${guard.location.line} (${tied.how}) could be an ownership check, but ${tied.tied ? "the entry point does not stop when it finds no row" : tied.why}.`
             : "";
         const tableName = v.tableData?.table ?? q.table;
@@ -394,11 +406,14 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
         const gate = adminOnly(ctx, h, v.tableData);
         const admin = gate.check;
         const anonPolicy = q.operation === "select" ? anonReadPolicy(v.tableData) : undefined;
-        const downgrade = admin || anonPolicy ? "medium" : undefined;
+        const downgrade = admin || anonPolicy || bypass !== undefined ? "medium" : undefined;
         const downgradeNote =
           (admin ? adminOnlyNote(admin, tableName) : "") +
           (gate.selfGrant ? ` The handler is behind a role check, but ${gate.selfGrant}.` : "") +
-          (anonPolicy ? publicReadNote(anonPolicy, tableName) : "");
+          (anonPolicy ? publicReadNote(anonPolicy, tableName) : "") +
+          (bypassed && bypass !== undefined
+            ? ` The row's ${bypassed.column} is checked against the caller (${bypassed.valueText}), but ${bypass} lets the caller through without that check, so the finding is lowered rather than dropped: verify those roles belong to the service's staff and a user cannot grant them to themselves.`
+            : "");
         const path = [
           h.data.kind === "server_action" ? "Server action call" : "HTTP request",
           h.data.entry,
@@ -427,17 +442,23 @@ export const serviceRoleObjectAccessWithoutTenantScope: Rule = {
               query: q.text,
               ...(admin ? { adminOnly: true, roleCheck: admin.source } : {}),
               ...(anonPolicy ? { anonReadPolicy: anonPolicy.name } : {}),
+              ...(bypass !== undefined ? { roleBypass: bypass } : {}),
             },
           },
           { kind: "trace", summary: path.join(" -> ") },
         ];
         const who = admin ? "Admin-only" : h.authenticated ? "Cross-tenant" : "Unauthenticated";
+        const verify = admin
+          ? " (verify the admin check)"
+          : bypass !== undefined
+            ? " (verify the role exception)"
+            : "";
         out.push(
           finding(
             ctx,
             this,
             {
-              title: `${who} ${q.operation} on "${tableName}" via ${clientNoun(v.clientData)}${admin ? " (verify the admin check)" : ""}`,
+              title: `${who} ${q.operation} on "${tableName}" via ${clientNoun(v.clientData)}${verify}`,
               entrypoints: [h.data.entry],
               sources: h.inputs.map((i) => `${i.kind}:${i.name}`),
               sinks: [`supabase.${q.operation}:public.${tableName}`],

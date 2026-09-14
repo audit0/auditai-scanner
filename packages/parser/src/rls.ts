@@ -67,14 +67,26 @@ const REFERENCE_SQL_DIRS: ReadonlySet<string> = new Set([
   "old",
 ]);
 
+/** A migration the Supabase CLI applies: `<version>_<name>.sql` directly inside `supabase/migrations/`. */
+const CLI_MIGRATION = /(?:^|\/)supabase\/migrations\/[0-9]+_[^/]*\.sql$/;
+/** The seed the Supabase CLI runs after the migrations. */
+const CLI_SEED = /(?:^|\/)supabase\/seed\.sql$/;
+
 /**
- * The SQL files to read as the schema, in the order given. Files the migration tool never applies are
+ * The SQL files to read as the schema, in application order. Files the migration tool never applies are
  * dropped (see `isAppliedSqlFile`). When the project has Supabase migrations, SQL kept in a folder for
  * documentation, archives or backups (`docs/legacy/COMPLETE_SETUP.sql`, `scripts/archive/...`) is
  * dropped too: the database got its schema from the migrations, and an old setup script's `using
  * (true)` policy would make the model more open than the database (GoalSquad). Without migrations such
  * a file may be the only schema there is, so it stays; so does SQL elsewhere, such as `scripts/` or a
  * root schema dump, which may have been run by hand.
+ *
+ * SQL the CLI does not apply by itself is read before the CLI migrations, not interleaved by path: a
+ * production schema dump (`audit-evidence/.../production-schema-snapshot.sql`), a rollback
+ * (`supabase/rollbacks/`) or a hand-run script inside the migrations folder whose name has no version
+ * (`DEMO_RESET_SCRIPT_V2.sql`, which sorts after every timestamp) would otherwise override migrations
+ * that came later: Costpro's `GRANT ALL ON ALL FUNCTIONS ... TO authenticated` undid 13 later REVOKEs.
+ * The seed runs after the migrations, as the CLI runs it.
  */
 export function appliedSqlFiles(rels: readonly string[]): string[] {
   const applied = rels.filter(isAppliedSqlFile);
@@ -83,13 +95,20 @@ export function appliedSqlFiles(rels: readonly string[]): string[] {
     /(?:^|\/)supabase\/migrations\/[^/]+\.sql$/i.test(slashed(rel)),
   );
   if (!hasMigrations) return applied;
-  return applied.filter(
+  const kept = applied.filter(
     (rel) =>
       !slashed(rel)
         .split("/")
         .slice(0, -1)
         .some((dir) => REFERENCE_SQL_DIRS.has(dir.toLowerCase())),
   );
+  const migrations = kept.filter((rel) => CLI_MIGRATION.test(slashed(rel)));
+  if (migrations.length === 0) return kept;
+  const seeds = kept.filter((rel) => CLI_SEED.test(slashed(rel)));
+  const byHand = kept.filter(
+    (rel) => !CLI_MIGRATION.test(slashed(rel)) && !CLI_SEED.test(slashed(rel)),
+  );
+  return [...byHand, ...migrations, ...seeds];
 }
 
 /**

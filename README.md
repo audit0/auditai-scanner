@@ -140,17 +140,24 @@ left out of the denominator.
 | Blind sample | Repositories | Findings labeled | Precision | Blocking tier (high + critical) |
 |---|---:|---:|---:|---:|
 | 1st, 13 Sep 2026 | 20 | 100 | **36%** (36/100) | 35% (32/92) |
-| 2nd, 13 Sep 2026, after precision rounds 4–5 | 20 new | 100 | **46%** (44/95, 95% interval 37–56%) | 49% (43/87) |
+| 2nd, 13 Sep 2026, after precision rounds 4–5 | 20 new | 100 | 46% (44/95, 95% interval 37–56%) | 49% (43/87) |
+| 3rd, 14 Sep 2026, after precision round 6 | 20 new | 100 | **31%** (31/99, 95% interval 23–41%) | 32% (29/92) |
 
-- The rise from 36% to 46% is not statistically proven at this sample size (p ≈ 0.14). The honest
-  reading: the fixes did not hurt precision on unfamiliar code, and probably raised it.
-- Strong in the second sample: open write policies for `anon` (13 of 14 real) and RLS policies that
-  trust `user_metadata` (7 of 7). Weak: service-role reads by id (2 of 18) and `SECURITY DEFINER`
-  functions (12 of 30), where most false positives were public-by-design functions and an internal
-  tool behind a corporate login.
-- The engine in this repository carries precision round 6, made with the second sample's labels in
+- **The latest number is the lowest.** The drop from 46% to 31% is statistically significant
+  (p ≈ 0.03; blocking tier p ≈ 0.015), so the second sample does not describe this engine on
+  unfamiliar code. Against the first sample (36%) the difference is within noise. The spread between
+  corpora is larger than the effect of any round of fixes, which is why every sample is published.
+- Where the third sample went wrong: SQL outside the migrations overriding them (a production schema
+  dump re-granted `EXECUTE` that later migrations had revoked: 13 false positives in one repository),
+  authorization done in code by loading the parent record and refusing another organization (18),
+  writes that row-level security already constrains (7), and public-by-design data (7).
+- Still strong: `SECURITY DEFINER` functions callable by anyone (18 real of 42, many in one ERP whose
+  financial functions take the tenant id as an argument). Weak: service-role reads by id (1 of 22).
+- The sample is concentrated: three repositories gave 60 of the 100 findings (the cap is 20 per
+  repository).
+- The engine in this repository carries precision round 7, made with the third sample's labels in
   view, so its numbers on those labels are no longer blind. The next honest number comes from a
-  third sample.
+  fourth sample.
 - Repository names and labels stay private: a real finding is a real vulnerability in someone's app.
 
 Live numbers, including every sample so far: [auditai.sh/stats](https://auditai.sh/stats). This is

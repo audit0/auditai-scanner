@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { ColumnInfo, RlsTable } from "./model.js";
 import { parseProject } from "./parse-project.js";
-import { isAppliedSqlFile, parseSqlForRls, sqlSchemaFor } from "./rls.js";
+import { appliedSqlFiles, isAppliedSqlFile, parseSqlForRls, sqlSchemaFor } from "./rls.js";
 import { splitSqlStatements } from "./sql-lexer.js";
 
 function parse(...files: string[]) {
@@ -717,6 +717,56 @@ create policy "extras open" on public.extras for select using (true);`,
       "own memberships",
       "Anyone can view members",
     ]);
+  });
+
+  it("reads SQL the CLI does not apply before the CLI migrations (Costpro DEMO_RESET_SCRIPT_V2, a schema dump, a rollback)", () => {
+    expect(
+      appliedSqlFiles([
+        "audit-evidence/2026/production-schema-snapshot.sql",
+        "docs/legacy/setup.sql",
+        "supabase/migrations/20260101000000_init.sql",
+        "supabase/migrations/20260201000000_harden.sql",
+        "supabase/migrations/DEMO_RESET_SCRIPT_V2.sql",
+        "supabase/rollbacks/20260201000000_harden_rollback.sql",
+        "supabase/seed.sql",
+      ]),
+    ).toEqual([
+      "audit-evidence/2026/production-schema-snapshot.sql",
+      "supabase/migrations/DEMO_RESET_SCRIPT_V2.sql",
+      "supabase/rollbacks/20260201000000_harden_rollback.sql",
+      "supabase/migrations/20260101000000_init.sql",
+      "supabase/migrations/20260201000000_harden.sql",
+      "supabase/seed.sql",
+    ]);
+    // Only versioned files count as CLI migrations; a folder of unversioned ones keeps path order.
+    expect(
+      appliedSqlFiles(["supabase/migrations/rls.sql", "supabase/migrations/schema.sql"]),
+    ).toEqual(["supabase/migrations/rls.sql", "supabase/migrations/schema.sql"]);
+
+    const fn = (name: string): string =>
+      `create or replace function public.${name}(p_id uuid) returns int language sql security definer as $$ select 1 $$;`;
+    const m = parseProject(
+      tempProject({
+        "audit-evidence/2026/production-schema-snapshot.sql": `${fn("from_dump")}
+grant execute on function public.from_dump(uuid) to anon, authenticated;`,
+        "supabase/migrations/20260101000000_init.sql": `${fn("validate_restore")}
+create table public.votes (id uuid primary key);
+alter table public.votes enable row level security;
+create policy "Anyone can insert votes" on public.votes for insert with check (true);`,
+        "supabase/migrations/20260201000000_harden.sql": `revoke execute on function public.validate_restore(p_id uuid) from public, anon, authenticated;
+revoke execute on function public.from_dump(uuid) from public, anon, authenticated;
+drop policy "Anyone can insert votes" on public.votes;`,
+        "supabase/migrations/DEMO_RESET_SCRIPT_V2.sql":
+          "grant all on all functions in schema public to anon, authenticated, service_role;",
+        "supabase/rollbacks/20260201000000_harden_rollback.sql": `create policy "Anyone can insert votes" on public.votes for insert with check (true);`,
+      }),
+    );
+    const granted = Object.fromEntries((m.sqlFunctions ?? []).map((f) => [f.name, f.grantedTo]));
+    for (const name of ["validate_restore", "from_dump"]) {
+      expect(granted[name]).not.toContain("anon");
+      expect(granted[name]).not.toContain("authenticated");
+    }
+    expect(m.tables.find((t) => t.table === "votes")?.policies).toEqual([]);
   });
 });
 

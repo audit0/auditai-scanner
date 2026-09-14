@@ -6,6 +6,7 @@ import {
   type ChainSegment,
   type ClassInfo,
   collect,
+  enclosingFunction,
   enclosingStatement,
   exportedFunctions,
   type FunctionLike,
@@ -19,15 +20,18 @@ import {
   stringLiteralValue,
   unwrap,
   walk,
+  walkOwn,
 } from "./ast.js";
 import { isCredentialColumn, isSessionProviderImport, secretChecksIn } from "./auth-evidence.js";
 import { discoverFiles } from "./discover.js";
 import {
   callResultChecked,
+  checkedResultExit,
   compareOrder,
   missingRowExit,
   outerOf,
   rowComparisons,
+  rowNamesOf,
 } from "./guards.js";
 import type {
   AuthCheck,
@@ -226,6 +230,9 @@ interface GuardableRead {
   exits: boolean;
   /** Comparisons of the row in code that stop the entry point (`existing.user_id !== user.id`). */
   checks: QueryFilter[];
+  /** The frame the read ran in (`Frame.key`) and the names its row is bound to there. */
+  frame: string;
+  rows: ReadonlySet<string>;
 }
 
 interface Acc {
@@ -1386,17 +1393,25 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
         call,
         chain.segments.map((s) => s.name),
       );
-      // `if (!row || row.user_id !== user.id) return 404`: ownership checked in code after the read.
-      const checks: QueryFilter[] = rowComparisons(call)
-        .filter((c) => c.exit === "throw" || frame.exitPropagates)
-        .map((c) => ({
-          method: "compare",
-          column: c.column,
-          valueText: c.value.getText(sf).replace(/\s+/g, " "),
-          inputDerived: derivedIn(frame, c.value),
-          ...(identityOf(frame, c.value) !== undefined ? { identity: true } : {}),
-        }));
+      const exits = rowExit === "throw" || (rowExit === "return" && frame.exitPropagates);
+      const checks: QueryFilter[] = [
+        // `if (!row || row.user_id !== user.id) return 404`: ownership checked in code after the read.
+        ...rowComparisons(call)
+          .filter((c) => c.exit === "throw" || frame.exitPropagates)
+          .map((c) => ({
+            method: "compare",
+            column: c.column,
+            valueText: c.value.getText(sf).replace(/\s+/g, " "),
+            inputDerived: derivedIn(frame, c.value),
+            ...(identityOf(frame, c.value) !== undefined ? { identity: true } : {}),
+          })),
+        // `if (!(await canAccessRequest(user, request.org_id))) return null`: checked by a helper.
+        ...helperRowChecks(p, call, frame, scope),
+      ];
       if (checks.length > 0) query.ownerChecks = checks;
+      if (exits && query.operation === "select") {
+        membershipChecks(acc.reads, query, filterValues, frame);
+      }
       acc.reads.push({
         query,
         keys: query.filters.map((f) => {
@@ -1404,8 +1419,10 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
           return v ? valueKey(frame, v) : null;
         }),
         order: [...frame.pathPos, parsed.anchor.getStart(sf)],
-        exits: rowExit === "throw" || (rowExit === "return" && frame.exitPropagates),
+        exits,
         checks,
+        frame: frame.key,
+        rows: rowNamesOf(call),
       });
       bindBuilder(call, query);
     }
@@ -1428,6 +1445,269 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     if (acc.visited.has(key)) continue;
     acc.visited.add(key);
     analyzeFrame(p, child, acc);
+  }
+}
+
+/** The parameter an expression is rooted at, by role: `user.orgId` -> "caller" when `user` is one. */
+function paramRole(
+  e: ts.Expression,
+  roles: ReadonlyMap<string, "row" | "caller">,
+): "row" | "caller" | null {
+  let u = unwrap(e);
+  while (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
+    // The user edits their own metadata.
+    if (ts.isPropertyAccessExpression(u) && u.name.text === "user_metadata") return null;
+    u = unwrap(u.expression);
+  }
+  return ts.isIdentifier(u) ? (roles.get(u.text) ?? null) : null;
+}
+
+const EQUALS: ReadonlySet<ts.SyntaxKind> = new Set([
+  ts.SyntaxKind.EqualsEqualsEqualsToken,
+  ts.SyntaxKind.EqualsEqualsToken,
+]);
+const NOT_EQUALS: ReadonlySet<ts.SyntaxKind> = new Set([
+  ts.SyntaxKind.ExclamationEqualsEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsToken,
+]);
+
+/** `orgId === user.orgId` (or `!==` with NOT_EQUALS), in either order. */
+function comparesRowAndCaller(
+  e: ts.Expression,
+  roles: ReadonlyMap<string, "row" | "caller">,
+  ops: ReadonlySet<ts.SyntaxKind>,
+): boolean {
+  const u = unwrap(e);
+  if (!ts.isBinaryExpression(u) || !ops.has(u.operatorToken.kind)) return false;
+  const a = paramRole(u.left, roles);
+  const b = paramRole(u.right, roles);
+  return (a === "row" && b === "caller") || (a === "caller" && b === "row");
+}
+
+/** `user.role === "admin"`, `["admin", "reviewer"].includes(user.role)`, joined by `||` or `&&`. */
+function isCallerRoleTest(e: ts.Expression, roles: ReadonlyMap<string, "row" | "caller">): boolean {
+  const u = unwrap(e);
+  const onCaller = (x: ts.Expression): boolean => {
+    const ux = unwrap(x);
+    return ts.isPropertyAccessExpression(ux) && paramRole(ux, roles) === "caller";
+  };
+  if (ts.isBinaryExpression(u)) {
+    const op = u.operatorToken.kind;
+    if (op === ts.SyntaxKind.BarBarToken || op === ts.SyntaxKind.AmpersandAmpersandToken) {
+      return isCallerRoleTest(u.left, roles) && isCallerRoleTest(u.right, roles);
+    }
+    if (!EQUALS.has(op)) return false;
+    return (
+      (onCaller(u.left) && ts.isStringLiteralLike(unwrap(u.right))) ||
+      (onCaller(u.right) && ts.isStringLiteralLike(unwrap(u.left)))
+    );
+  }
+  if (
+    !ts.isCallExpression(u) ||
+    !ts.isPropertyAccessExpression(u.expression) ||
+    u.expression.name.text !== "includes"
+  ) {
+    return false;
+  }
+  const list = unwrap(u.expression.expression);
+  const arg = u.arguments[0];
+  return (
+    ts.isArrayLiteralExpression(list) &&
+    list.elements.length > 0 &&
+    list.elements.every((el) => ts.isStringLiteralLike(el)) &&
+    u.arguments.length === 1 &&
+    arg !== undefined &&
+    onCaller(arg)
+  );
+}
+
+function isDenyValue(e: ts.Expression): boolean {
+  const u = unwrap(e);
+  return (
+    u.kind === ts.SyntaxKind.FalseKeyword ||
+    u.kind === ts.SyntaxKind.NullKeyword ||
+    (ts.isIdentifier(u) && u.text === "undefined")
+  );
+}
+
+/** `a || b || c` -> [a, b, c] for `op` `||`. */
+function operandsOf(e: ts.Expression, op: ts.SyntaxKind): ts.Expression[] {
+  const u = unwrap(e);
+  return ts.isBinaryExpression(u) && u.operatorToken.kind === op
+    ? [...operandsOf(u.left, op), ...operandsOf(u.right, op)]
+    : [u];
+}
+
+/** The `if` whose then-branch holds this returned expression, inside its own function. */
+function thenBranchIf(ret: ts.Expression): ts.IfStatement | null {
+  let child: ts.Node = ret;
+  for (let cur = ret.parent; cur && !isFunctionLikeNode(cur); cur = cur.parent) {
+    if (ts.isIfStatement(cur)) return cur.thenStatement === child ? cur : null;
+    child = cur;
+  }
+  return null;
+}
+
+/** A branch that only stops: every return in it returns false/null/nothing, or it throws. */
+function onlyDenies(stmt: ts.Statement): boolean {
+  let stops = false;
+  let allows = false;
+  walkOwn(stmt, (n) => {
+    if (ts.isThrowStatement(n)) stops = true;
+    else if (ts.isReturnStatement(n)) {
+      if (!n.expression || isDenyValue(n.expression)) stops = true;
+      else allows = true;
+    }
+  });
+  return stops && !allows;
+}
+
+/**
+ * Does a helper answer "may this caller have this row" by comparing the two? Every path that does not
+ * return false or null must compare the row's value with the caller (`return user.orgId === orgId`, or
+ * `return true` after `if (orgId !== user.orgId) return false`), or let the caller through on a role
+ * of the caller, which comes back as `bypass`. Null when some path lets a caller through on anything
+ * else, such as an argument the request supplies.
+ */
+function helperComparison(
+  fn: FunctionLike,
+  rowIndex: number,
+  callerIndexes: readonly number[],
+  sf: ts.SourceFile,
+): { bypass?: string } | null {
+  const roles = new Map<string, "row" | "caller">();
+  fn.parameters.forEach((param, i) => {
+    if (!ts.isIdentifier(param.name)) return;
+    if (i === rowIndex) roles.set(param.name.text, "row");
+    else if (callerIndexes.includes(i)) roles.set(param.name.text, "caller");
+  });
+  const kinds = new Set(roles.values());
+  if (!kinds.has("row") || !kinds.has("caller") || !fn.body) return null;
+  let denied = false;
+  if (ts.isBlock(fn.body)) {
+    walkOwn(fn.body, (n) => {
+      if (
+        ts.isIfStatement(n) &&
+        operandsOf(n.expression, ts.SyntaxKind.BarBarToken).some((c) =>
+          comparesRowAndCaller(c, roles, NOT_EQUALS),
+        ) &&
+        onlyDenies(n.thenStatement)
+      ) {
+        denied = true;
+      }
+    });
+  }
+  const bypasses: string[] = [];
+  let compared = false;
+  for (const ret of ownReturns(fn)) {
+    if (isDenyValue(ret)) continue;
+    if (unwrap(ret).kind === ts.SyntaxKind.TrueKeyword) {
+      const gate = thenBranchIf(ret);
+      if (gate && isCallerRoleTest(gate.expression, roles)) {
+        bypasses.push(gate.expression.getText(sf).replace(/\s+/g, " "));
+        continue;
+      }
+      if (gate === null && denied) {
+        compared = true;
+        continue;
+      }
+      return null;
+    }
+    for (const alt of operandsOf(ret, ts.SyntaxKind.BarBarToken)) {
+      const conjuncts = operandsOf(alt, ts.SyntaxKind.AmpersandAmpersandToken);
+      if (conjuncts.some((c) => comparesRowAndCaller(c, roles, EQUALS))) compared = true;
+      else if (isCallerRoleTest(alt, roles)) bypasses.push(alt.getText(sf).replace(/\s+/g, " "));
+      else return null;
+    }
+  }
+  if (!compared) return null;
+  return bypasses.length > 0 ? { bypass: bypasses.join(" || ") } : {};
+}
+
+/**
+ * Ownership checked by a helper of this repository after a read: `const allowed = await
+ * canAccessRequest(user, request.org_id); if (!allowed) return null`, where the helper compares the
+ * row's value with the caller (see helperComparison). The helper's body is the evidence, never its
+ * name.
+ */
+function helperRowChecks(
+  p: Project,
+  tail: ts.CallExpression,
+  frame: Frame,
+  scope: Map<string, Sym>,
+): QueryFilter[] {
+  const rows = rowNamesOf(tail);
+  const decl = outerOf(tail).parent;
+  const fn = decl ? enclosingFunction(decl) : null;
+  if (rows.size === 0 || !decl || !fn?.body) return [];
+  const out: QueryFilter[] = [];
+  walkOwn(fn.body, (n) => {
+    if (!ts.isCallExpression(n) || n.pos < decl.end) return;
+    const rowIndex = n.arguments.findIndex((a) => {
+      const u = unwrap(a);
+      if (!ts.isPropertyAccessExpression(u)) return false;
+      const base = unwrap(u.expression);
+      return ts.isIdentifier(base) && rows.has(base.text);
+    });
+    const rowArg = unwrap(n.arguments[rowIndex] ?? n);
+    if (rowIndex < 0 || !ts.isPropertyAccessExpression(rowArg)) return;
+    const exit = checkedResultExit(n);
+    if (exit === null || (exit === "return" && !frame.exitPropagates)) return;
+    const callerIndexes = n.arguments.flatMap((a, i) =>
+      i !== rowIndex && identityOf(frame, a) !== undefined ? [i] : [],
+    );
+    if (callerIndexes.length === 0) return;
+    const target = callTarget(p, n, frame, scope);
+    const targetSf = target ? p.sources.get(target.facts.file) : undefined;
+    if (!target || !targetSf) return;
+    const verdict = helperComparison(target.fn, rowIndex, callerIndexes, targetSf);
+    if (!verdict) return;
+    out.push({
+      method: "compare",
+      column: rowArg.name.text,
+      valueText: n.getText(frame.sf).replace(/\s+/g, " ").slice(0, 160),
+      inputDerived: false,
+      identity: true,
+      ...(verdict.bypass !== undefined ? { bypass: verdict.bypass } : {}),
+    });
+  });
+  return out;
+}
+
+/**
+ * `if (!membership) return 404` after a read filtered by the caller's identity and by a column of an
+ * earlier row (`organisation_members.organisation_id = roadmap.organisation_id`): that row's column is
+ * checked against the caller's own rows, as if compared in code.
+ */
+function membershipChecks(
+  reads: readonly GuardableRead[],
+  query: SupabaseQuery,
+  values: WeakMap<QueryFilter, ts.Expression>,
+  frame: Frame,
+): void {
+  if (!query.filters.some((f) => f.identity === true && !f.inputDerived && f.method === "eq")) {
+    return;
+  }
+  for (const f of query.filters) {
+    if (f.identity === true || f.inputDerived || f.method !== "eq") continue;
+    const v = values.get(f);
+    const u = v ? unwrap(v) : undefined;
+    if (!u || !ts.isPropertyAccessExpression(u)) continue;
+    const base = unwrap(u.expression);
+    if (!ts.isIdentifier(base) || normalizeColumn(u.name.text) !== normalizeColumn(f.column)) {
+      continue;
+    }
+    const row = [...reads].reverse().find((r) => r.frame === frame.key && r.rows.has(base.text));
+    if (!row) continue;
+    const check: QueryFilter = {
+      method: "compare",
+      column: u.name.text,
+      valueText: `a ${query.table} row of the caller (${query.location.file}:${query.location.line})`,
+      inputDerived: false,
+      identity: true,
+    };
+    row.checks.push(check);
+    row.query.ownerChecks = [...(row.query.ownerChecks ?? []), check];
   }
 }
 

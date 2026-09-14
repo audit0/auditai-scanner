@@ -58,6 +58,11 @@ export interface QueryFilter {
    * otherwise. When a value is also `inputDerived`, the input wins.
    */
   identity?: boolean;
+  /**
+   * For a comparison made by a helper: the caller's role test that lets the caller through without
+   * the comparison (`user.role === "admin"` in `canAccessRequest`). Absent when every path compares.
+   */
+  bypass?: string;
 }
 
 export type QueryOperation =
