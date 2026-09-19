@@ -132,32 +132,39 @@ application code gets no proposal, on purpose.
 
 ## How precise it is
 
-Measured by hand on public repositories the engine had never seen. The selection rule and the
-sample size were written down and committed before any repository was picked; the sample was drawn
-before any code was read. Precision is real ÷ (real + false positive); findings labeled `unsure` are
-left out of the denominator.
+Measured on public repositories the engine had never seen. The selection rule and the sample size
+were written down and committed before any repository was picked; the sample was drawn before any
+code was read. Every sampled finding is then read against the code and labeled with a one-sentence
+reason that cites the line. Precision is real ÷ (real + false positive); findings labeled `unsure`
+are left out of the denominator.
 
 | Blind sample | Repositories | Findings labeled | Precision | Blocking tier (high + critical) |
 |---|---:|---:|---:|---:|
-| 1st, 13 Sep 2026 | 20 | 100 | **36%** (36/100) | 35% (32/92) |
+| 1st, 13 Sep 2026 | 20 | 100 | 36% (36/100) | 35% (32/92) |
 | 2nd, 13 Sep 2026, after precision rounds 4–5 | 20 new | 100 | 46% (44/95, 95% interval 37–56%) | 49% (43/87) |
-| 3rd, 14 Sep 2026, after precision round 6 | 20 new | 100 | **31%** (31/99, 95% interval 23–41%) | 32% (29/92) |
+| 3rd, 14 Sep 2026, after precision round 6 | 20 new | 100 | 31% (31/99, 95% interval 23–41%) | 32% (29/92) |
+| 4th, 19 Sep 2026, after precision round 7 | 30 new | 100 | **30%** (29/96, 95% interval 22–40%) | 32% (27/85) |
 
-- **The latest number is the lowest.** The drop from 46% to 31% is statistically significant
-  (p ≈ 0.03; blocking tier p ≈ 0.015), so the second sample does not describe this engine on
-  unfamiliar code. Against the first sample (36%) the difference is within noise. The spread between
-  corpora is larger than the effect of any round of fixes, which is why every sample is published.
-- Where the third sample went wrong: SQL outside the migrations overriding them (a production schema
-  dump re-granted `EXECUTE` that later migrations had revoked: 13 false positives in one repository),
-  authorization done in code by loading the parent record and refusing another organization (18),
-  writes that row-level security already constrains (7), and public-by-design data (7).
-- Still strong: `SECURITY DEFINER` functions callable by anyone (18 real of 42, many in one ERP whose
-  financial functions take the tenant id as an argument). Weak: service-role reads by id (1 of 22).
-- The sample is concentrated: three repositories gave 60 of the 100 findings (the cap is 20 per
-  repository).
-- The engine in this repository carries precision round 7, made with the third sample's labels in
-  view, so its numbers on those labels are no longer blind. The next honest number comes from a
-  fourth sample.
+- **About a third of what it reports is a real hole, and the last round of fixes did not change
+  that.** Round 7 was made with the third sample's labels in view and lifted the figure on those
+  labels from 31% to 36%. On 30 repositories it had never seen, the same build scored 30% — no
+  difference from the third sample (p ≈ 0.87; blocking tier p ≈ 0.97). Fixes keep landing on the
+  shapes of the last corpus, and the next corpus brings the same classes in new shapes.
+- The fourth sample changed its design, and said so before it was picked: 30 repositories and at
+  most 10 findings from one (it was 20 and 20), because three repositories supplied 60 of the 100
+  findings of the third sample. A second labeller, who did not see the first labels, labeled 30 of
+  the 100 independently: the same label on 27 (90%, Cohen's kappa 0.81). The figures are the first
+  labeller's.
+- Where the fourth sample went wrong: an application-wide gate the engine does not recognise — a
+  `middleware.ts` with its own signed cookie, a role inside a signed session, an admin helper with an
+  early return (18 of 67 false positives); ownership established in code, such as a membership check
+  or a server-built storage path (12); policies that a later migration drops with dynamic SQL inside
+  a `DO` block, which the parser does not execute (7); reads that only decide a 404 or a 409 and are
+  never returned (9); public-by-design data and forms (7).
+- What held up: identity taken from a header the client writes, `SECURITY DEFINER` functions that
+  trust a caller-supplied user id, `USING (true)` policies, admin gates on a role users can write to
+  their own row, service-role routes with no login at all. Real findings came from 12 of the 22
+  repositories in the sample. Critical findings were right 28% of the time, high ones 47%.
 - Repository names and labels stay private: a real finding is a real vulnerability in someone's app.
 
 Live numbers, including every sample so far: [auditai.sh/stats](https://auditai.sh/stats). This is
