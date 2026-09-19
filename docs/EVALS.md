@@ -97,12 +97,12 @@ Never:
 
 ## Real-world labeled sample
 
-Fixtures measure recall on bugs we planted. Precision on code nobody planted is measured separately: a scan over public Next.js + Supabase repositories found through GitHub search, after which a person reads the code behind every finding and gives it one label.
+Fixtures measure recall on bugs we planted. Precision on code nobody planted is measured separately: a scan over public Next.js + Supabase repositories found through GitHub search, after which the code behind every finding is read and given one label. The reading is done by a model against the code, not by a person; a second labeller who does not see the first labels covers part of each sample, and the agreement between them is published.
 
 - `real`: an attacker in one tenant or user can reach another's data or a privileged action, or the finding names a control that is genuinely missing (for example a SECURITY DEFINER function that anon can execute).
 - `false_positive`: a control exists that the rule missed (an ownership check in code, RLS enabled through dynamic SQL, a credential check the rule does not recognize), or the data is public by design and the code or policy says so.
 - `unsure`: reading the code cannot settle it; the reason says what is missing.
 
-Precision is `real / (real + false_positive)`, per rule and overall; unsure labels are reported as a share but never enter the figure. The sample is not random (GitHub search), the labels come from reading code rather than running attacks, and a label can be wrong. The repositories, the findings and the labels stay in the private repository: they name third-party projects and some findings may be real vulnerabilities. Only the per-rule counts are published, on https://auditai.sh/stats under "Hand-labeled sample".
+Precision is `real / (real + false_positive)`, per rule and overall; unsure labels are reported as a share but never enter the figure. The sample is not random (GitHub search), the labels come from reading code rather than running attacks, and a label can be wrong. The repositories, the findings and the labels stay in the private repository: they name third-party projects and some findings may be real vulnerabilities. Only the per-rule counts are published, on https://auditai.sh/stats under "The older sample the engine was tuned against".
 
 When the scanner changes, the labels stay fixed and the published figures cover only the labeled findings the new build still reports (`node evals/realworld/summarize.mjs --results <dir> --commit <sha> --date <day>`); the sample records the results directory it is based on, and a finding labeled real must never disappear. Because those fixes were made while looking at the labels, such a figure is not a blind measurement; a fresh, unlabeled sample is required for that.
