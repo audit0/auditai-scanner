@@ -6,7 +6,7 @@ Set Shell "bash"
 Set FontSize 13
 Set FontFamily "Menlo"
 Set Width 1100
-Set Height 540
+Set Height 820
 Set Padding 24
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 40ms
@@ -14,7 +14,7 @@ Set TypingSpeed 40ms
 # Env must come after every Set: vhs ignores Set directives that follow other commands.
 Env NPM_CONFIG_LOGLEVEL "error"
 
-Type "npx auditai-scan evals/fixtures/001-cross-tenant-invoice-read/vulnerable --migrations evals/fixtures/001-cross-tenant-invoice-read/supabase"
+Type "npx auditai-scan --snapshot examples/snapshot.json"
 Sleep 600ms
 Enter
 Sleep 7s

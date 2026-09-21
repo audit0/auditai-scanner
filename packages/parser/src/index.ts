@@ -9,6 +9,14 @@ export {
   normalizeGlob,
   type PathMatcher,
 } from "./discover.js";
+export {
+  parseLiveSnapshot,
+  SNAPSHOT_FILE,
+  SNAPSHOT_LIMITS,
+  SNAPSHOT_REF,
+  type SnapshotModel,
+  type SnapshotResult,
+} from "./live-snapshot.js";
 export * from "./model.js";
 export {
   fileDirective,

@@ -31,10 +31,18 @@ jobs:
         run: npm run bundle
       - name: Smoke test the bundle (vulnerable fixture must fail, secure must pass)
         run: |
-          F=evals/fixtures/001-cross-tenant-invoice-read
-          if node npm/dist/auditai-scan.mjs "$F/vulnerable" --migrations "$F/supabase" --fail-on likely; then
+          F=evals/fixtures/002-rls-disabled-invoices-read
+          if node npm/dist/auditai-scan.mjs "$F/vulnerable" --fail-on likely; then
             echo "expected a finding on the vulnerable fixture" && exit 1
           fi
-          node npm/dist/auditai-scan.mjs "$F/secure" --migrations "$F/supabase" --fail-on likely
+          node npm/dist/auditai-scan.mjs "$F/secure" --fail-on likely
+          # A lead is reported and never fails the build (ADR-005): fixture 001's finding is inferred from code.
+          F=evals/fixtures/001-cross-tenant-invoice-read
+          out=$(node npm/dist/auditai-scan.mjs "$F/vulnerable" --migrations "$F/supabase" --fail-on likely)
+          grep -q "AUDIT-001  LEAD" <<<"$out" || { echo "expected AUDIT-001 as a lead"; exit 1; }
+          # The database check on the README's example snapshot: a table without RLS and an open write policy.
+          if node npm/dist/auditai-scan.mjs --snapshot examples/snapshot.json --fail-on likely; then
+            echo "expected findings in examples/snapshot.json" && exit 1
+          fi
       - name: Dependency audit
         run: npm audit --audit-level=high

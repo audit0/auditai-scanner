@@ -187,6 +187,7 @@ function applyStatement(state: SqlSchemaState, stmt: SqlStatement, rel: string):
     using,
     check,
     location: { file: rel, line: stmt.line },
+    ...(/\bas\s+restrictive\b/i.test(head) ? { permissive: false as const } : {}),
   });
 }
 

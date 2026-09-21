@@ -9,7 +9,7 @@ import {
 import { deterministicFix } from "@auditai/fixes";
 import { buildGraph } from "@auditai/graph";
 import { checkIgnoreGlobs, type ProjectModel, parseProject } from "@auditai/parser";
-import { defaultRules, runRules } from "@auditai/rules";
+import { applyTiers, defaultRules, runRules } from "@auditai/rules";
 import { errorCode, loadAuditConfig, repoMigrationDirs } from "./config.js";
 
 export { type AuditConfig, readAuditConfig } from "./config.js";
@@ -119,7 +119,8 @@ export function runScan(path: string, opts: ScanOptions = {}): ScanResult {
   // always echoed in the summary so a reviewer sees what it silenced.
   const publicTables = cfg.config.publicTables ?? [];
   const runOpts = { ...(opts.now === undefined ? {} : { now: opts.now }), publicTables };
-  const rulesFindings = runRules(defaultRules, model, graph, runOpts);
+  // The rules say what is wrong; the tiers say what the product may claim about it (ADR-005).
+  const rulesFindings = applyTiers(runRules(defaultRules, model, graph, runOpts));
   // A fix that follows from the schema alone is attached right here: no model, no network, and
   // the same proposal for everyone who scans this repository. Findings whose fix depends on
   // application code get none, which is deliberate.

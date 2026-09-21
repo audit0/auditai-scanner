@@ -69,12 +69,28 @@ export interface VerificationResult {
   finishedAt: string;
 }
 
+/**
+ * What the product claims about a finding (ADR-005, accepted 21 September 2026).
+ *
+ * - `headline`: a fact about the database the rules read directly — a policy, a grant, the RLS
+ *   switch. On four blind samples these rules were right 55% of the time, and a snapshot of the live
+ *   database takes the guessing out of them. They count, and they may block.
+ * - `lead`: an inference from application code about what reaches what. On the same samples these
+ *   were right about one time in four (25%). They are shown as places to look, never as holes we
+ *   found: capped at medium and never blocking. `ruleSeverity` keeps what the rule itself said.
+ */
+export type FindingTier = "headline" | "lead";
+
 export interface Finding {
   id: string;
   ruleId: string;
   title: string;
   status: FindingStatus;
   severity: Severity;
+  /** Absent in findings written before 21 September 2026; read it as `headline`. */
+  tier?: FindingTier;
+  /** For a lead whose severity was capped: the severity the rule assigned, kept for the record. */
+  ruleSeverity?: Severity;
   /** 0..1 */
   confidence: number;
   cwe?: string[];
@@ -186,6 +202,8 @@ export function isBlocking(
   policy: BlockingPolicy = DEFAULT_BLOCKING_POLICY,
 ): boolean {
   if (finding.status === "suppressed") return false;
+  // A lead is a place to look, not a hole we found: it never blocks, whatever its status says.
+  if (finding.tier === "lead") return false;
   if (finding.status === "verified") return true;
   if (finding.confidence < policy.minConfidence) return false;
   if (

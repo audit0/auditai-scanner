@@ -1,5 +1,5 @@
 import type { Evidence, Finding, Severity } from "@auditai/core";
-import type { FileRef, PolicyDetail, RlsTable } from "@auditai/parser";
+import type { FileRef, PolicyCommand, PolicyDetail, RlsTable } from "@auditai/parser";
 import type { Rule, RuleContext } from "../rule.js";
 
 /**
@@ -171,7 +171,9 @@ export const policiesWithoutRlsEnabled: Rule = {
   evaluate(ctx) {
     const out: Finding[] = [];
     for (const t of publicTables(ctx)) {
-      if (t.rlsEnabled || t.policyDetails.length === 0) continue;
+      if (t.rlsEnabled || t.policyDetails.length === 0 || isView(t)) continue;
+      // No API role holds any privilege on it: the Data API refuses before RLS would matter.
+      if (!apiReaches(t, [], PRIVILEGES.all)) continue;
       const names = t.policyDetails.map((p) => `"${p.name}" (${commandLabel(p)})`).join(", ");
       const evidence: Evidence[] = [
         {
@@ -217,20 +219,64 @@ export const policiesWithoutRlsEnabled: Rule = {
 // ---------------------------------------------------------------------------------------------
 
 /** `true`, `(true)`, `((true))` — a predicate that decides nothing. */
-function isTautology(expr: string | null): boolean {
+export function isTautology(expr: string | null): boolean {
   if (expr === null) return false;
-  return /^\(*\s*true\s*\)*$/i.test(expr.trim());
+  // `true` as written, or a number compared with itself (`(1 = 1)`, the way pg_policies prints `1=1`).
+  return /^\(*\s*(?:true|(\d+)\s*=\s*\1)\s*\)*$/i.test(expr.trim());
+}
+
+/** A RESTRICTIVE policy only narrows what the permissive ones allow: by itself it opens nothing. */
+export function opensAccess(p: PolicyDetail): boolean {
+  return p.permissive !== false;
+}
+
+const PRIVILEGES: Readonly<Record<PolicyCommand, readonly string[]>> = {
+  select: ["select"],
+  insert: ["insert"],
+  update: ["update"],
+  delete: ["delete"],
+  all: ["select", "insert", "update", "delete"],
+};
+
+/**
+ * Does one of the policy's roles hold a table privilege for one of these commands? Without it the
+ * Data API refuses before any policy runs. Grants unknown (every migration scan) means the Supabase
+ * default: anon and authenticated hold all four.
+ */
+export function apiReaches(
+  t: RlsTable,
+  roles: readonly string[],
+  privileges: readonly string[],
+): boolean {
+  const g = t.apiGrants;
+  if (!g) return true;
+  const everyone = roles.length === 0 || roles.includes("public");
+  const held = [
+    ...(everyone || roles.includes("anon") ? g.anon : []),
+    ...(everyone || roles.includes("authenticated") ? g.authenticated : []),
+  ];
+  return privileges.some((p) => held.includes(p));
+}
+
+/** The privileges a policy's command needs, writes only. */
+export function writePrivileges(command: PolicyCommand): readonly string[] {
+  return PRIVILEGES[command].filter((p) => p !== "select");
+}
+
+/** Row level security exists only for tables; a view or a materialized view never has it. */
+export function isView(t: RlsTable): boolean {
+  return t.kind === "view" || t.kind === "matview";
 }
 
 const ANON_ROLES = new Set(["anon", "public"]);
 
 /** Does the policy apply to the anonymous role? No TO clause means PUBLIC, which includes anon. */
-function reachableByAnon(p: PolicyDetail): boolean {
+export function reachableByAnon(p: PolicyDetail): boolean {
   if (p.roles.length === 0) return true;
   return p.roles.some((r) => ANON_ROLES.has(r.toLowerCase().replace(/^"|"$/g, "")));
 }
 
-const WRITE_COMMANDS = new Set(["insert", "update", "delete", "all"]);
+export const WRITE_COMMANDS: ReadonlySet<string> = new Set(["insert", "update", "delete", "all"]);
 
 /**
  * A write policy open to anon (or to PUBLIC) whose predicate is a tautology: anyone holding the
@@ -253,7 +299,8 @@ export const anonWritePolicy: Rule = {
       // table-without-rls; one root cause, one finding.
       if (!t.rlsEnabled) continue;
       for (const p of t.policyDetails) {
-        if (!WRITE_COMMANDS.has(p.command) || !reachableByAnon(p)) continue;
+        if (!WRITE_COMMANDS.has(p.command) || !reachableByAnon(p) || !opensAccess(p)) continue;
+        if (!apiReaches(t, p.roles, writePrivileges(p.command))) continue;
         const decides: Array<[string, string | null]> =
           p.command === "insert"
             ? [["WITH CHECK", p.check]]

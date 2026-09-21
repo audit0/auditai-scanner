@@ -1,0 +1,162 @@
+{
+  "snapshotVersion": 1,
+  "takenAt": "2026-09-21T08:00:00Z",
+  "postgres": "17.6",
+  "tables": [
+    {
+      "schema": "public",
+      "name": "invoices",
+      "rlsEnabled": false,
+      "rlsForced": false,
+      "kind": "table",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "notNull": true,
+          "hasDefault": true,
+          "references": null
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "notNull": true,
+          "hasDefault": false,
+          "references": {
+            "table": "auth.users",
+            "column": "id"
+          }
+        },
+        {
+          "name": "amount",
+          "type": "numeric",
+          "notNull": true,
+          "hasDefault": false,
+          "references": null
+        }
+      ],
+      "grants": [
+        {
+          "grantee": "anon",
+          "privilege": "SELECT"
+        },
+        {
+          "grantee": "authenticated",
+          "privilege": "SELECT"
+        },
+        {
+          "grantee": "anon",
+          "privilege": "INSERT"
+        },
+        {
+          "grantee": "authenticated",
+          "privilege": "INSERT"
+        },
+        {
+          "grantee": "anon",
+          "privilege": "UPDATE"
+        },
+        {
+          "grantee": "authenticated",
+          "privilege": "UPDATE"
+        },
+        {
+          "grantee": "anon",
+          "privilege": "DELETE"
+        },
+        {
+          "grantee": "authenticated",
+          "privilege": "DELETE"
+        }
+      ]
+    },
+    {
+      "schema": "public",
+      "name": "profiles",
+      "rlsEnabled": true,
+      "rlsForced": false,
+      "kind": "table",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "notNull": true,
+          "hasDefault": false,
+          "references": {
+            "table": "auth.users",
+            "column": "id"
+          }
+        },
+        {
+          "name": "plan",
+          "type": "text",
+          "notNull": true,
+          "hasDefault": true,
+          "references": null
+        }
+      ],
+      "grants": [
+        {
+          "grantee": "anon",
+          "privilege": "SELECT"
+        },
+        {
+          "grantee": "authenticated",
+          "privilege": "SELECT"
+        },
+        {
+          "grantee": "anon",
+          "privilege": "INSERT"
+        },
+        {
+          "grantee": "authenticated",
+          "privilege": "INSERT"
+        },
+        {
+          "grantee": "anon",
+          "privilege": "UPDATE"
+        },
+        {
+          "grantee": "authenticated",
+          "privilege": "UPDATE"
+        },
+        {
+          "grantee": "anon",
+          "privilege": "DELETE"
+        },
+        {
+          "grantee": "authenticated",
+          "privilege": "DELETE"
+        }
+      ]
+    }
+  ],
+  "policies": [
+    {
+      "schema": "public",
+      "table": "profiles",
+      "name": "profiles are editable",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "public"
+      ],
+      "command": "UPDATE",
+      "using": "true",
+      "withCheck": "true"
+    },
+    {
+      "schema": "public",
+      "table": "profiles",
+      "name": "own profile",
+      "permissive": "PERMISSIVE",
+      "roles": [
+        "authenticated"
+      ],
+      "command": "SELECT",
+      "using": "(auth.uid() = id)",
+      "withCheck": null
+    }
+  ],
+  "functions": [],
+  "buckets": []
+}

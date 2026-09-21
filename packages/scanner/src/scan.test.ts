@@ -22,13 +22,19 @@ describe("audit scan", () => {
       queries: 1,
       tablesKnown: 3,
       tablesWithRls: 3,
-      rules: 14,
+      rules: 15,
     });
     expect(r.findings.map((f) => f.status)).toEqual(["likely"]);
+    // A service-role read reached through application code is a lead (ADR-005): the rule rates it
+    // critical, the product claims no more than medium and never blocks on it.
+    expect(r.findings.map((f) => [f.tier, f.severity, f.ruleSeverity])).toEqual([
+      ["lead", "medium", "critical"],
+    ]);
     expect(r.blocking).toBe(false);
     const text = formatScanText(r);
+    expect(text).toContain("Leads (1). From your application code. We did not check these");
     expect(text).toContain(
-      'AUDIT-001  LIKELY  CRITICAL  Cross-tenant select on "invoices" via service-role client',
+      'AUDIT-001  LEAD  MEDIUM (rule: critical)  Cross-tenant select on "invoices" via service-role client',
     );
     expect(text).toContain("Entry   GET /api/invoices/[id]   app/api/invoices/[id]/route.ts:");
     expect(text).toContain(

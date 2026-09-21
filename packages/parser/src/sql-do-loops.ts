@@ -201,6 +201,50 @@ function loopHeader(tk: readonly Token[], declared: DeclaredLists): LoopHeader |
   return { variable, elements, rest };
 }
 
+/**
+ * The one query loop worth following: the signature lookup that a REVOKE sweep wraps around a literal
+ * list of function names.
+ *
+ *   foreach fn in array names loop
+ *     for sig in select format('public.%I(%s)', p.proname, pg_get_function_identity_arguments(p.oid))
+ *                from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+ *                where n.nspname = 'public' and p.proname = fn and p.prosecdef loop
+ *       execute format('revoke execute on function %s from public, anon, authenticated', sig);
+ *
+ * Every row it can yield is a function whose name is the outer element, so the inner variable is
+ * `<schema>.<name>` and the body can be unrolled. The shape is matched exactly — the select must name
+ * `pg_proc`, must restrict `prosecdef`, must compare `proname` with the outer variable, and must fix
+ * the schema to a literal — because anything looser is a query this parser cannot evaluate. A GRANT or
+ * REVOKE written without an argument list applies to every overload of the name, which is what the
+ * `prosecdef` restriction means here anyway.
+ */
+function signatureLoop(
+  tk: readonly Token[],
+  outerVar: string,
+): { variable: string; schema: string; rest: Token[] } | null {
+  if (!isWord(tk[0], "for")) return null;
+  const variable = identOf(tk[1])?.toLowerCase();
+  if (variable === undefined || !isWord(tk[2], "in")) return null;
+  const loopAt = findWord(tk, 3, "loop");
+  if (loopAt < 0) return null;
+  const expr = tk.slice(3, loopAt);
+  if (!expr.some((t) => isWord(t, "pg_proc")) || !expr.some((t) => isWord(t, "prosecdef")))
+    return null;
+  let schema: string | null = null;
+  let namesOuter = false;
+  for (let i = 0; i < expr.length; i++) {
+    const word = identOf(expr[i])?.toLowerCase();
+    if (word === undefined) continue;
+    const eq = expr[i + 1];
+    if (!(eq?.kind === "op" && eq.raw === "=")) continue;
+    const value = expr[i + 2];
+    if (word === "nspname" && value?.kind === "string") schema = value.value;
+    if (word === "proname" && identOf(value)?.toLowerCase() === outerVar) namesOuter = true;
+  }
+  if (schema === null || !namesOuter) return null;
+  return { variable, schema, rest: tk.slice(loopAt + 1) };
+}
+
 /** `declare v_tables text[] := array['a', 'b'];` (also `default`, `constant`): the literal list a loop may iterate. */
 function declaredList(tk: readonly Token[]): [string, string[]] | null {
   let i = 0;
@@ -255,28 +299,21 @@ export function expandDoBlock(stmt: SqlStatement): DoBlockExpansion {
   let conditional = 0;
   let loop: LoopHeader | null = null;
   const bodyStatements: Token[][] = [];
+  let sigLoop: { variable: string; schema: string; rest: Token[] } | null = null;
+  const sigBody: Token[][] = [];
   for (const tk of inner) {
     if (tk.length === 0) continue;
     if (loop) {
-      if (isWord(tk[0], "end") && isWord(tk[1], "loop")) {
-        if (loop.elements === null) out.dynamic = true;
-        else runLoop(loop, bodyStatements, emit);
-        loop = null;
-        bodyStatements.length = 0;
-        continue;
-      }
-      if (loopHeader(tk, declared)) {
-        // A nested loop is more than we follow: the outer body is not unrolled.
-        loop.elements = null;
-      }
-      bodyStatements.push(tk);
+      inLoop(tk);
       continue;
     }
     const header = loopHeader(tk, declared);
     if (header) {
       loop = header;
       if (conditional > 0) loop.elements = null;
-      if (header.rest.length > 0) bodyStatements.push(header.rest);
+      // The header and its first body statement share one statement when no semicolon separates
+      // them (`foreach t in array names loop execute ...`), so the tail goes through the same path.
+      if (header.rest.length > 0) inLoop(header.rest);
       continue;
     }
     conditional = Math.max(0, conditional + conditionalDelta(tk));
@@ -284,6 +321,61 @@ export function expandDoBlock(stmt: SqlStatement): DoBlockExpansion {
   }
   if (loop) out.dynamic = true;
   return out;
+
+  function inLoop(tk: Token[]): void {
+    if (!loop) return;
+    const ends = isWord(tk[0], "end") && isWord(tk[1], "loop");
+    // The inner loop closes first: its `end loop` is not the outer one's.
+    if (sigLoop) {
+      if (ends) {
+        runSignatureLoop(loop, sigLoop, sigBody, emit);
+        sigLoop = null;
+        sigBody.length = 0;
+        return;
+      }
+      if (loopHeader(tk, declared)) loop.elements = null;
+      sigBody.push(tk);
+      return;
+    }
+    if (ends) {
+      if (loop.elements === null) out.dynamic = true;
+      else runLoop(loop, bodyStatements, emit);
+      loop = null;
+      bodyStatements.length = 0;
+      return;
+    }
+    const sig = loop.elements === null ? null : signatureLoop(tk, loop.variable);
+    if (sig) {
+      sigLoop = sig;
+      if (sig.rest.length > 0) sigBody.push(sig.rest);
+      return;
+    }
+    if (loopHeader(tk, declared)) {
+      // A nested loop is more than we follow: the outer body is not unrolled.
+      loop.elements = null;
+    }
+    bodyStatements.push(tk);
+  }
+}
+
+/** The inner body, once per name of the outer literal list, with the signature variable bound. */
+function runSignatureLoop(
+  loop: LoopHeader,
+  sig: { variable: string; schema: string },
+  body: readonly Token[][],
+  emit: (sql: string | null) => void,
+): void {
+  const elements = loop.elements ?? [];
+  let conditional = 0;
+  for (const tk of body) {
+    conditional = Math.max(0, conditional + conditionalDelta(tk));
+    if (!isWord(tk[0], "execute")) continue;
+    if (conditional > 0) {
+      emit(null);
+      continue;
+    }
+    for (const element of elements) emit(executedSql(tk, sig.variable, `${sig.schema}.${element}`));
+  }
 }
 
 function runLoop(

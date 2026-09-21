@@ -34,6 +34,7 @@ import {
   rowNamesOf,
 } from "./guards.js";
 import type {
+  AdminApiCall,
   AuthCheck,
   AuthHelper,
   ClientFactory,
@@ -238,6 +239,7 @@ interface GuardableRead {
 interface Acc {
   inputs: InputSource[];
   authChecks: AuthCheck[];
+  adminApiCalls: AdminApiCall[];
   roleChecks: RoleCheck[];
   queries: SupabaseQuery[];
   metadataAccesses: MetadataAccess[];
@@ -818,6 +820,28 @@ function callTarget(
         thisProps: new Map(),
       };
     }
+    // `export const getProfile = cache(async () => {...})`: React's per-request memoisation, and the
+    // same idiom as unstable_cache or any wrapper taking the implementation inline. The call is the
+    // wrapper's, the body is the argument's, and without stepping through it every gate and every
+    // query written this way is invisible. Only an inline function counts — passing a name along is
+    // not the same thing as defining the work here.
+    if (sym?.kind === "var") {
+      const init = sym.init ? unwrap(sym.init) : undefined;
+      if (init && ts.isCallExpression(init)) {
+        const inner = init.arguments
+          .map((a) => unwrap(a))
+          .find((a) => ts.isArrowFunction(a) || ts.isFunctionExpression(a));
+        if (inner && (ts.isArrowFunction(inner) || ts.isFunctionExpression(inner))) {
+          return {
+            fn: inner,
+            facts: sym.facts,
+            name: sym.name,
+            cls: null,
+            thisProps: new Map(),
+          };
+        }
+      }
+    }
     return null;
   }
   if (!ts.isPropertyAccessExpression(callee)) return null;
@@ -1068,7 +1092,21 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
   // Auth checks.
   const isSessionCall = (call: ts.CallExpression): boolean => callsSession(p, call, sf, scope);
   for (const call of collect(body, ts.isCallExpression)) {
-    if (isSessionCall(call)) acc.authChecks.push({ ...loc(call), kind: "session" });
+    if (isSessionCall(call)) {
+      const method = sessionMethod(call, sf);
+      acc.authChecks.push({ ...loc(call), kind: "session", ...(method ? { method } : {}) });
+    }
+    const admin = /\.auth\.admin\.([A-Za-z]+)$/.exec(call.expression.getText(sf));
+    if (admin?.[1]) {
+      const arg = call.arguments[0];
+      acc.adminApiCalls.push({
+        ...loc(call),
+        method: admin[1],
+        argText: arg ? arg.getText(sf).slice(0, 120) : "",
+        inputDerived: arg ? derivedIn(frame, arg) : false,
+        identity: arg ? identityOf(frame, arg) !== undefined : false,
+      });
+    }
   }
   // Role gates (ADR-001): `if (!isAdminEmail(user.email)) return 401` on a session binding.
   // A row the caller's identity selected speaks for the session too (`profil.rolle` of the caller's
@@ -1085,6 +1123,20 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       source: gate.source,
       text: gate.node.expression.getText(sf).replace(/\s+/g, " ").slice(0, 160),
       ...(typeof table === "string" && column !== undefined ? { table, column } : {}),
+    });
+  }
+  // The same decision taken one level down: a permission helper whose answer comes from the caller's
+  // own identity, checked here with an early exit (see permissionHelperGate).
+  for (const call of collect(body, ts.isCallExpression)) {
+    const gate = permissionHelperGate(p, call, frame, scope);
+    if (!gate) continue;
+    acc.roleChecks.push({
+      ...loc(call),
+      source: gate.source,
+      text: call.getText(sf).replace(/\s+/g, " ").slice(0, 160),
+      ...(gate.table !== undefined && gate.column !== undefined
+        ? { table: gate.table, column: gate.column }
+        : {}),
     });
   }
   // A request credential compared with (or verified by) a server secret, deciding the request's fate.
@@ -1630,6 +1682,75 @@ function helperComparison(
  * row's value with the caller (see helperComparison). The helper's body is the evidence, never its
  * name.
  */
+/**
+ * A permission helper: a function of this repository whose answer is computed from who the caller is,
+ * and which the caller checks before going on — `if (!(await canManageStaff())) return forbidden()`.
+ *
+ * The evidence is never the name. It is that every branch the helper can return reads the caller's
+ * own identity, or a row that identity selected (`profile.perms.akun` where `profile` was loaded for
+ * the session), and that the call site exits when the answer is missing or false. A helper called
+ * `requireAdmin` that returns a constant still counts for nothing.
+ *
+ * This is the shape `roleGatesIn` cannot see, because the deciding `if` is at the call site while the
+ * value it decides on was computed one level down. Guard helpers written this way were the largest
+ * single cause of false positives in the fourth blind sample.
+ */
+function permissionHelperGate(
+  p: Project,
+  call: ts.CallExpression,
+  frame: Frame,
+  scope: Map<string, Sym>,
+): { source: string; table?: string; column?: string } | null {
+  if (frame.depth >= MAX_DEPTH) return null;
+  const exit = checkedResultExit(call);
+  if (exit === null || (exit === "return" && !frame.exitPropagates)) return null;
+  const target = callTarget(p, call, frame, scope);
+  if (!target?.fn.body) return null;
+  const child = childFrame(p, call, target, frame);
+  if (!child) return null;
+  bindDeclarations(p, child, {
+    inputs: [],
+    authChecks: [],
+    adminApiCalls: [],
+    roleChecks: [],
+    queries: [],
+    metadataAccesses: [],
+    visited: new Set(),
+    reads: [],
+  });
+  const returns = ownReturns(target.fn);
+  if (returns.length === 0) return null;
+  let found: { source: string; table?: string; column?: string } | null = null;
+  for (const ret of returns) {
+    for (const leaf of branchesOf(ret)) {
+      if (isLiteralValue(leaf)) continue;
+      // The answer may be the read itself or a comparison over it (`profile.role === "admin"`).
+      // It has to be a *claim* of the caller, not the caller: a helper that returns the session says
+      // who is calling and nothing about what they may do, however it is named. VDI-LeadSystem-MVP
+      // has exactly that shape - `requireAdmin` redirects anonymous callers and returns the user,
+      // while every signed-in portal user of another organisation passes it.
+      const reads = [leaf, ...collect(leaf, ts.isPropertyAccessExpression)];
+      const hit = reads.find(
+        (r) => ts.isPropertyAccessExpression(r) && identityOf(child, r) !== undefined,
+      );
+      if (!hit) return null;
+      if (found) continue;
+      const source = hit.getText(child.sf).replace(/\s+/g, " ").slice(0, 80);
+      // Which row the verdict was read off, so the rules can ask who is allowed to write that
+      // column (ADR-001). Dropping this is what makes a self-granted role look like a real gate.
+      const path = source.replace(/[?!]/g, "").split(".");
+      const root = path[0];
+      const column = path[path.length - 1];
+      const table = root === undefined ? undefined : child.identities.get(root);
+      found = {
+        source,
+        ...(typeof table === "string" && column !== undefined ? { table, column } : {}),
+      };
+    }
+  }
+  return found;
+}
+
 function helperRowChecks(
   p: Project,
   tail: ts.CallExpression,
@@ -1886,6 +2007,7 @@ function returnTaint(
   const scratch: Acc = {
     inputs: [],
     authChecks: [],
+    adminApiCalls: [],
     roleChecks: [],
     queries: [],
     metadataAccesses: [],
@@ -2160,6 +2282,16 @@ function returnsIdentity(p: Project, call: ts.CallExpression, scope: Map<string,
   return IDENTITY_CALLEE.test(calleePath(call.expression));
 }
 
+/**
+ * Which of the three direct Supabase calls this is, if any. `getSession` is the one that does not
+ * prove identity on the server: it reads the session out of the cookie without revalidating it.
+ * Returns undefined for an auth helper of this repository, whose body is analysed on its own.
+ */
+function sessionMethod(call: ts.CallExpression, sf: ts.SourceFile): AuthCheck["method"] {
+  const m = /\.auth\.(getUser|getSession|getClaims)$/.exec(call.expression.getText(sf));
+  return m ? (m[1] as AuthCheck["method"]) : undefined;
+}
+
 /** `supabase.auth.getUser()`, `getSession()`, `getClaims()`, or a call to an auth helper of this repository. */
 function callsSession(
   p: Project,
@@ -2302,6 +2434,7 @@ function returnIdentity(
   bindDeclarations(p, child, {
     inputs: [],
     authChecks: [],
+    adminApiCalls: [],
     roleChecks: [],
     queries: [],
     metadataAccesses: [],
@@ -2418,6 +2551,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
   const acc: Acc = {
     inputs: [],
     authChecks: [],
+    adminApiCalls: [],
     roleChecks: [],
     queries: [],
     metadataAccesses: [],
@@ -2496,6 +2630,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     metadataAccesses: acc.metadataAccesses,
     ignores,
     roleChecks: acc.roleChecks,
+    adminApiCalls: acc.adminApiCalls,
   };
 }
 
@@ -2639,6 +2774,7 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
   routes.sort((a, b) => a.entry.localeCompare(b.entry));
 
   const all = [...registry.values()];
+  const mw = middlewareVerifiesSession(source, sources);
   const schema = sqlSchemaFor(tables);
   warnings.push(...schema.warnings);
   return {
@@ -2655,7 +2791,57 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     sqlFunctions: schema.sqlFunctions,
     storageBuckets: schema.storageBuckets,
     ...(schema.triggers.length > 0 ? { sqlTriggers: schema.triggers } : {}),
+    ...(mw ? { middlewareVerifiesSession: mw } : {}),
   };
+}
+
+/**
+ * Does the project's middleware verify the session before a handler runs?
+ *
+ * It matters because `getSession()` downstream then reads a token somebody has already checked, and
+ * applications say so in as many words: klubb-app's `lib/auth-cache.ts` carries a comment explaining
+ * that getSession() is safe there "because middleware has verified the token's signature and exp
+ * against the project's JWKS before the page renders at all". Taking their word for the premise is
+ * wrong; reading the middleware is not.
+ *
+ * Conservative on purpose: a matcher may exclude routes, and this does not look at which. A project
+ * whose middleware verifies is simply not somewhere to raise the unverified-session finding.
+ */
+const MIDDLEWARE_VERIFIES =
+  /\.auth\.(getUser|getClaims)\s*\(|createRemoteJWKSet|jwtVerify|jose\.|verifyJwt/;
+
+function middlewareVerifiesSession(
+  files: readonly string[],
+  sources: Map<string, ts.SourceFile>,
+): { matcher: string[] } | null {
+  for (const rel of files) {
+    if (!/(^|\/)(src\/)?middleware\.(ts|tsx|js|mjs)$/.test(rel)) continue;
+    const sf = sources.get(rel);
+    if (!sf || !MIDDLEWARE_VERIFIES.test(sf.getFullText())) continue;
+    return { matcher: matcherOf(sf) };
+  }
+  return null;
+}
+
+/** The strings of `export const config = { matcher: [...] }`; empty when there is no matcher. */
+function matcherOf(sf: ts.SourceFile): string[] {
+  const out: string[] = [];
+  walkOwn(sf, (n) => {
+    if (!ts.isVariableDeclaration(n) || !ts.isIdentifier(n.name) || n.name.text !== "config")
+      return;
+    const init = n.initializer ? unwrap(n.initializer) : undefined;
+    if (!init || !ts.isObjectLiteralExpression(init)) return;
+    for (const prop of init.properties) {
+      if (!ts.isPropertyAssignment(prop) || prop.name.getText(sf) !== "matcher") continue;
+      const value = unwrap(prop.initializer);
+      const items = ts.isArrayLiteralExpression(value) ? value.elements : [value];
+      for (const e of items) {
+        const u = unwrap(e);
+        if (ts.isStringLiteralLike(u)) out.push(u.text);
+      }
+    }
+  });
+  return out;
 }
 
 interface FileOutputs {

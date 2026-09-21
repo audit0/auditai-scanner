@@ -1,4 +1,5 @@
 import type {
+  AdminApiCall,
   FileRef,
   MetadataAccess,
   PolicyDetail,
@@ -44,41 +45,64 @@ export interface GraphEdge {
   kind: EdgeKind;
 }
 
-/** Program Security Graph: routes, identities, clients, queries, tables and policies. See docs/ARCHITECTURE.md. */
+/**
+ * Program Security Graph: routes, identities, clients, queries, tables and policies. See
+ * docs/ARCHITECTURE.md. Edges are indexed by both ends and nodes by kind, so building and walking the
+ * graph stays linear in its size: a live snapshot turns every table into four Data API handlers, and a
+ * lookup that scanned every edge made a 2,000-table snapshot take a minute.
+ */
 export class SecurityGraph {
   readonly nodes = new Map<string, GraphNode>();
   readonly edges: GraphEdge[] = [];
+  private readonly edgeKeys = new Set<string>();
+  private readonly outgoing = new Map<string, GraphEdge[]>();
+  private readonly incoming = new Map<string, GraphEdge[]>();
+  private readonly byKind = new Map<NodeKind, GraphNode[]>();
 
   addNode(node: GraphNode): GraphNode {
     const existing = this.nodes.get(node.id);
     if (existing) return existing;
     this.nodes.set(node.id, node);
+    const same = this.byKind.get(node.kind);
+    if (same) same.push(node);
+    else this.byKind.set(node.kind, [node]);
     return node;
   }
 
   addEdge(from: string, to: string, kind: EdgeKind): void {
     if (!this.nodes.has(from) || !this.nodes.has(to))
       throw new Error(`edge ${kind} references unknown node: ${from} -> ${to}`);
-    if (!this.edges.some((e) => e.from === from && e.to === to && e.kind === kind))
-      this.edges.push({ from, to, kind });
+    const key = `${from}\u0000${to}\u0000${kind}`;
+    if (this.edgeKeys.has(key)) return;
+    this.edgeKeys.add(key);
+    const edge = { from, to, kind };
+    this.edges.push(edge);
+    SecurityGraph.index(this.outgoing, from, edge);
+    SecurityGraph.index(this.incoming, to, edge);
+  }
+
+  private static index(map: Map<string, GraphEdge[]>, id: string, edge: GraphEdge): void {
+    const list = map.get(id);
+    if (list) list.push(edge);
+    else map.set(id, [edge]);
   }
 
   nodesOfKind(kind: NodeKind): GraphNode[] {
-    return [...this.nodes.values()].filter((n) => n.kind === kind);
+    return [...(this.byKind.get(kind) ?? [])];
   }
 
   /** Targets of edges leaving `id`, optionally filtered by edge kind. */
   out(id: string, kind?: EdgeKind): GraphNode[] {
-    return this.edges
-      .filter((e) => e.from === id && (kind === undefined || e.kind === kind))
+    return (this.outgoing.get(id) ?? [])
+      .filter((e) => kind === undefined || e.kind === kind)
       .map((e) => this.nodes.get(e.to))
       .filter((n): n is GraphNode => n !== undefined);
   }
 
   /** Sources of edges entering `id`, optionally filtered by edge kind. */
   in(id: string, kind?: EdgeKind): GraphNode[] {
-    return this.edges
-      .filter((e) => e.to === id && (kind === undefined || e.kind === kind))
+    return (this.incoming.get(id) ?? [])
+      .filter((e) => kind === undefined || e.kind === kind)
       .map((e) => this.nodes.get(e.from))
       .filter((n): n is GraphNode => n !== undefined);
   }
@@ -114,6 +138,8 @@ export interface HandlerNodeData {
   metadataAccesses: MetadataAccess[];
   /** Role/claim predicates of the session that stop the handler (ADR-001). */
   roleChecks: RoleCheck[];
+  /** Calls to the Auth admin API, which no policy constrains. Absent in older models. */
+  adminApiCalls?: AdminApiCall[];
 }
 
 export interface TableNodeData {
@@ -183,6 +209,7 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
       inputs: h.inputs,
       metadataAccesses: h.metadataAccesses,
       roleChecks: h.roleChecks ?? [],
+      ...(h.adminApiCalls ? { adminApiCalls: h.adminApiCalls } : {}),
     };
     const handler = g.addNode({
       id: `handler:${h.location.file}:${h.location.line}`,
@@ -208,7 +235,7 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
         id: `auth:${a.file}:${a.line}:${kind}`,
         kind: "AuthCheck",
         label: `auth check (${kind})`,
-        data: { kind },
+        data: { kind, ...(a.method ? { method: a.method } : {}) },
         location: { file: a.file, line: a.line },
       });
       g.addEdge(handler.id, an.id, "AUTHENTICATED_BY");

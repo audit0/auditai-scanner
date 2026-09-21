@@ -24,29 +24,82 @@
 <p align="center">Deterministic security scanner for Next.js (App Router) + Supabase apps. No account, no model, no network. Seconds.</p>
 
 ```bash
-npx auditai-scan .
+npx auditai-scan --snapshot-query          # a read-only query: run it in the Supabase SQL editor
+npx auditai-scan --snapshot snapshot.json  # what your live database lets a stranger do
+npx auditai-scan .                         # your repository
 ```
 
-<p align="center"><img src="./demo.gif" alt="auditai-scan finding a cross-tenant read in a fixture app" width="900"></p>
+<p align="center"><img src="./demo.gif" alt="auditai-scan checking a Supabase database snapshot: a table without row level security and a write policy open to anyone, each with the migration that closes it" width="900"></p>
 
 ```
-Audit AI scan  evals/fixtures/001-cross-tenant-invoice-read/vulnerable
-Files 6 · Routes 1 · Supabase queries 1 · Tables with RLS 3/3 · Rules 14
+$ npx auditai-scan --snapshot examples/snapshot.json
+Audit AI database scan  taken 2026-09-21T08:00:00Z
+Postgres 17.6 · Tables 2 · With RLS 1/2 · Rules 15
 
-AUDIT-001  LIKELY  CRITICAL  Cross-tenant select on "invoices" via service-role client
-  Entry   GET /api/invoices/[id]   app/api/invoices/[id]/route.ts:6
-  Path    HTTP request -> GET /api/invoices/[id] -> id eq id (user-controlled) -> createServiceRoleClient (service role, bypasses RLS) -> public.invoices.select
-  Why     select on public.invoices filtered by user-controlled "id" through a service-role client, with no tenant/owner scoping. The handler authenticates the caller but never checks that the row belongs to them. RLS is enabled on public.invoices with 2 policies, but the service role bypasses it.
-  Where   app/api/invoices/[id]/route.ts:6, app/api/invoices/[id]/route.ts:14, lib/supabase.ts:7
-  Rule    supabase.service-role-object-access-without-tenant-scope · CWE-639, CWE-284 · confidence 0.85
+AUDIT-001  LIKELY  HIGH  Table "invoices" is exposed without RLS
+  Entry   GET /rest/v1/invoices (Supabase Data API), POST /rest/v1/invoices (Supabase Data API), PATCH /rest/v1/invoices (Supabase Data API), DELETE /rest/v1/invoices (Supabase Data API)
+  Path    HTTP request -> GET /rest/v1/invoices (Supabase Data API) -> supabase (publishable key) (anon, RLS would apply) -> public.invoices (RLS disabled)
+  Why     Row level security is off on public.invoices, and it is queried with the anon client. Anyone holding the public anon key can read every row directly through PostgREST. Reached from 4 entry points.
+  Rule    supabase.table-without-rls · CWE-284, CWE-862 · confidence 0.90
+  Fix     Enable row level security on public.invoices (supabase/migrations/20260921080000_fix_enable_rls_invoices.sql)
+          -- Turn on row level security for public.invoices
+          -- Proposed by Audit AI. Read it, then apply it with the rest of your migrations.
+          alter table public.invoices enable row level security;
+          
+          create policy "invoices: owner reads" on public.invoices
+            for select to authenticated
+            using (user_id = (select auth.uid()));
+          
+          create policy "invoices: owner writes" on public.invoices
+            for all to authenticated
+            using (user_id = (select auth.uid()))
+            with check (user_id = (select auth.uid()));
 
-Checked 1 risk in class authorization/RLS. Verified: 0. Confirmed (no sandbox): 0. Unverified: 0.
+AUDIT-002  LIKELY  HIGH  Policy "profiles are editable" lets anyone update "profiles"
+  Entry   Supabase Data API (PostgREST)
+  Path    Anyone with the public anon key -> PostgREST -> policy "profiles are editable" (for update, to public) -> public.profiles
+  Why     Policy "profiles are editable" on public.profiles is for update to public and decides with a tautology: USING true. Anyone holding the public anon key can update rows in public.profiles straight through PostgREST, without going through this application. Rows that belong to signed-in users can be changed or deleted by a stranger.
+  Rule    supabase.anon-write-policy · CWE-284, CWE-862 · confidence 0.85
+  Fix     Tie the write policy on public.profiles to the caller (supabase/migrations/20260921080000_fix_policy_profiles_update.sql)
+          -- Close the open write policy "profiles are editable" on public.profiles
+          -- Proposed by Audit AI. Read it, then apply it with the rest of your migrations.
+          drop policy "profiles are editable" on public.profiles;
+          
+          create policy "profiles are editable" on public.profiles
+            for update to authenticated
+            using (id = (select auth.uid()))
+            with check (id = (select auth.uid()));
+
+Checked 2 risks in class authorization/RLS. Verified: 0. Confirmed (no sandbox): 0. Unverified: 0.
+
+Note: Application code was not read: the entry points here are the Data API endpoints your database serves, so nothing is said about service-role queries, missing authentication or mass assignment in your own routes.
+Note: A clean result means the database refuses the accesses these rules test, not that the application is safe.
+Note: Views, materialized views and foreign tables are not judged: row level security does not apply to them, and whether a view runs with its owner's rights is not checked yet.
 ```
 
 This is the open-source engine behind [Audit AI](https://auditai.sh). The scanner gives you the
 deterministic part: every route, server action, page, Supabase client, query, RLS policy and
 database function, mapped and checked. The hosted product takes a finding from here and tries to
 prove it.
+
+## Check your live database
+
+What a stranger can do with your data is decided by the database as it runs, not by the migrations
+folder: a policy added in the dashboard, a table made by hand, a revoke that ran inside a `DO` block.
+`--snapshot-query` prints one read-only `SELECT` over the Postgres catalog: tables and whether row
+level security is on, policies, grants to `anon` and `authenticated`, functions and storage buckets.
+
+1. `npx auditai-scan --snapshot-query`, paste it into Supabase → SQL Editor → Run.
+2. Save the one cell it returns as `snapshot.json` (the editor's JSON or CSV export works too).
+3. `npx auditai-scan --snapshot snapshot.json`.
+
+The query reads the catalog and changes nothing. No row of your data is read; the source of a
+function is included only when the function is `SECURITY DEFINER`. Every finding comes with the
+migration that closes it. The same check runs in the browser at
+[auditai.sh/check](https://auditai.sh/check), where nothing you paste is stored.
+
+A clean result means the database refuses what these rules test, not that the application is safe:
+a snapshot says nothing about your own routes, which is what `npx auditai-scan .` reads.
 
 ## Try the whole loop
 
@@ -84,29 +137,34 @@ these because they do not understand the framework. This one does nothing else.
 Rule packs `supabase-authorization`, `supabase-storage-rpc` and `supabase-sql-policies`. Every rule
 ships with a vulnerable fixture that must fire and a secure fixture that must stay silent.
 
-| Rule | Severity | What it catches |
-|---|---|---|
-| `supabase.service-role-object-access-without-tenant-scope` | critical | Service-role client, or a direct Drizzle/Prisma connection, reads or writes a row by user-supplied id without tenant scope (IDOR / BOLA) |
-| `supabase.user-controlled-tenant-scope` | critical | Tenant scope comes from the request (body, query, params) instead of the session |
-| `supabase.service-role-query-without-authentication` | critical | Route or server action queries with the service role and never checks the caller |
-| `supabase.service-role-key-exposed-to-client` | critical | Service-role key reaches the browser (`NEXT_PUBLIC_*`, client components). Blocking. |
-| `supabase.table-without-rls` | high | Table queried by a user-facing client has row level security disabled |
-| `supabase.rls-policy-without-caller-predicate` | high | RLS policy grants rows without referencing the caller (`using (true)` and friends) |
-| `supabase.mass-assignment-from-request-body` | high | Request body written to a table without an allow-list, where RLS does not already refuse the write |
-| `supabase.role-check-from-user-metadata` | high | Authorization decided by `user_metadata`, which the user can edit |
-| `supabase.storage-object-access-without-owner-scope` | critical | Storage download/upload/signed URL/move/remove through the service role on a caller-supplied path that is never tied to the caller's user id |
-| `supabase.storage-policy-without-owner-check` | high | Policy on `storage.objects` that only checks `bucket_id`: every user reads, overwrites or deletes every file in the bucket |
-| `supabase.security-definer-function-without-caller-check` | high, critical if anon can execute | `SECURITY DEFINER` function (RLS skipped inside) that never reads `auth.uid()`, callable through `supabase.rpc()` |
-| `supabase.rls-policy-trusts-user-metadata` | critical | RLS policy decides access from a `user_metadata` claim, which the user writes themselves with `updateUser({ data })` |
-| `supabase.policies-without-rls-enabled` | high | A table carries policies and never got `enable row level security`, so none of them apply |
-| `supabase.anon-write-policy` | high, medium when insert-only | Insert/update/delete policy open to `anon` (or no `TO` clause) whose predicate is `true` |
+| Rule | Kind | Severity | What it catches |
+|---|---|---|---|
+| `supabase.table-without-rls` | headline | high | Table queried by a user-facing client, or served by the Data API, has row level security disabled |
+| `supabase.anon-write-policy` | headline | high, medium when insert-only | Insert/update/delete policy open to `anon` (or no `TO` clause) whose predicate is `true` |
+| `supabase.security-definer-function-without-caller-check` | headline | high, critical if anon can execute | `SECURITY DEFINER` function (RLS skipped inside) that never reads `auth.uid()`, callable through `supabase.rpc()` |
+| `supabase.rls-policy-trusts-user-metadata` | headline | critical | RLS policy decides access from a `user_metadata` claim, which the user writes themselves with `updateUser({ data })` |
+| `supabase.policies-without-rls-enabled` | headline | high | A table carries policies and never got `enable row level security`, so none of them apply |
+| `supabase.service-role-key-exposed-to-client` | headline | critical | Service-role key reaches the browser (`NEXT_PUBLIC_*`, client components) |
+| `supabase.service-role-object-access-without-tenant-scope` | lead | critical | Service-role client, or a direct Drizzle/Prisma connection, reads or writes a row by user-supplied id without tenant scope (IDOR / BOLA) |
+| `supabase.user-controlled-tenant-scope` | lead | critical | Tenant scope comes from the request (body, query, params) instead of the session |
+| `supabase.service-role-query-without-authentication` | lead | critical | Route or server action queries with the service role and never checks the caller |
+| `supabase.storage-object-access-without-owner-scope` | lead | critical | Storage download/upload/signed URL/move/remove through the service role on a caller-supplied path that is never tied to the caller's user id |
+| `supabase.rls-policy-without-caller-predicate` | lead | high | RLS policy grants rows without referencing the caller (`using (true)` and friends) |
+| `supabase.mass-assignment-from-request-body` | lead | high | Request body written to a table without an allow-list, where RLS does not already refuse the write |
+| `supabase.role-check-from-user-metadata` | lead | high | Authorization decided by `user_metadata`, which the user can edit |
+| `supabase.storage-policy-without-owner-check` | lead | high | Policy on `storage.objects` that only checks `bucket_id`: every user reads, overwrites or deletes every file in the bucket |
+| `supabase.server-trusts-unverified-session` | lead | high | A handler decides access from `supabase.auth.getSession()`, which reads the cookie without revalidating it, instead of `getUser()` or `getClaims()` |
+
+Severity is the rule's own rating. A lead is printed at medium at most, with this rating next to it.
 
 Findings are reported as `likely`, never `confirmed`: confirmation needs evidence, and evidence
 means a reproduced request. Suppressed findings stay in the output, marked `suppressed`.
 
-The last three rules read the migrations only: they need no query from your application, because
-PostgREST exposes the schema to anyone holding the public key. Their findings name the Data API
-as the entry point instead of a route.
+The database rules (`anon-write-policy`, `rls-policy-trusts-user-metadata`,
+`policies-without-rls-enabled`, and `security-definer-function-without-caller-check` for functions
+the app never calls) need no query from your application, because PostgREST exposes the schema to
+anyone holding the public key. Their findings name the Data API as the entry point instead of a
+route.
 
 ## Fixes it proposes
 
@@ -131,6 +189,14 @@ a proposed migration is resolved against the parsed schema. A finding whose fix 
 application code gets no proposal, on purpose.
 
 ## How precise it is
+
+**Headlines and leads.** Since 21 September 2026 the output keeps two kinds of claim apart, by what
+each rule reads. Rules that read a fact about the database (row level security off, a write policy
+open to anyone, a policy that trusts `user_metadata`, a `SECURITY DEFINER` function callable without
+a check on the caller) make **headlines**: on the four blind samples below they were right 78 times
+out of 141 (55%). Rules that infer from application code make **leads**: right 62 times out of 249
+(25%). A lead is printed under its own heading, capped at medium with the rule's own rating next to
+it, and never fails `--fail-on`.
 
 Measured on public repositories the engine had never seen. The selection rule and the sample size
 were written down and committed before any repository was picked; the sample was drawn before any
@@ -183,11 +249,14 @@ why the hosted product proves before it blocks: a `likely` finding is a lead, no
 
 ```bash
 npx auditai-scan [path] [--json] [--fail-on <status>] [--migrations <dir>]...
+npx auditai-scan --snapshot-query            print the read-only query to run in your SQL editor
+npx auditai-scan --snapshot <file> [--json]  scan your live database from that query's result
 
 --json               machine-readable output
 --fail-on <status>   exit 1 when a finding reaches this status (default: confirmed)
-                     one of: candidate, likely, confirmed, verified
+                     one of: candidate, likely, confirmed, verified. Leads never do.
 --migrations <dir>   extra directory with Supabase migration SQL (repeatable)
+--snapshot <file>    the JSON your SQL editor returned for --snapshot-query ("-" reads stdin)
 
 Exit code: 0 clean, 1 a finding reached --fail-on, 2 usage error or <path> is not a directory
 ```

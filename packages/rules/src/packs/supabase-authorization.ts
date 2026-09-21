@@ -16,6 +16,13 @@ import type {
 } from "@auditai/parser";
 import type { Rule, RuleContext } from "../rule.js";
 import { callerCheckingFunctions, callsFunctionIn } from "./sql-functions.js";
+import {
+  isTautology,
+  isView,
+  opensAccess,
+  reachableByAnon,
+  WRITE_COMMANDS,
+} from "./supabase-sql-policies.js";
 
 const SCOPE_COLUMNS = new Set([
   "tenant_id",
@@ -49,6 +56,34 @@ export function isObjectIdColumn(column: string | null): boolean {
 }
 
 /** Clients for which Row Level Security is not a defence: the service role and direct database connections. */
+/**
+ * Does a Next.js `config.matcher` cover this route? An empty matcher covers everything, which is
+ * what Next.js does when a middleware exports none.
+ *
+ * Three shapes appear in practice and each is read for what it is: a bare path, a path with a
+ * `:param` or `:path*` segment, and a full regular expression, which is how the "everything except
+ * static files" idiom is written. Anything that does not parse is treated as not covering the
+ * route — the finding then stands, and a reader can judge it.
+ */
+export function middlewareCovers(matcher: readonly string[], route: string): boolean {
+  if (matcher.length === 0) return true;
+  for (const raw of matcher) {
+    if (raw === route) return true;
+    const source = raw.includes("(")
+      ? raw
+      : raw
+          .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+          .replace(/\/:[A-Za-z_]+\*/g, "(?:/.*)?")
+          .replace(/:[A-Za-z_]+/g, "[^/]+");
+    try {
+      if (new RegExp(`^${source}$`).test(route)) return true;
+    } catch {
+      // A matcher we cannot compile protects nothing we can prove.
+    }
+  }
+  return false;
+}
+
 export function bypassesRls(kind: string | undefined): boolean {
   return kind === "service_role" || kind === "direct_db";
 }
@@ -64,10 +99,14 @@ function clientNoun(c: ClientNodeData | undefined): string {
   return c?.kind === "direct_db" ? "direct database connection" : "service-role client";
 }
 
-/** Does an RLS policy expression tie rows to the caller? */
+/**
+ * Does an RLS policy expression tie rows to the caller? `auth.email()` counts: it is the signed-in
+ * user's address out of the JWT, so `email = auth.email()` names one person exactly as `auth.uid()`
+ * does. `auth.role()` never counts — every signed-in user has the same role.
+ */
 export function policyScopesToCaller(expr: string | null): boolean {
   if (expr === null) return false;
-  return /auth\.uid\(\)|auth\.jwt\(\)|current_setting\(|current_tenant|current_user_id|is_member|has_role|tenant_id|owner_id|user_id|created_by/i.test(
+  return /auth\.uid\(\)|auth\.jwt\(\)|auth\.email\(\)|current_setting\(|current_tenant|current_user_id|is_member|has_role|tenant_id|owner_id|user_id|created_by/i.test(
     expr,
   );
 }
@@ -486,12 +525,16 @@ export const tableWithoutRls: Rule = {
   evaluate(ctx) {
     // One finding per table: the defect is the missing RLS, every handler that reaches it is evidence.
     const groups = new Map<string, Group>();
+    const relations = new Map(ctx.model.tables.map((t) => [t.table, t]));
     for (const h of handlerViews(ctx)) {
       for (const v of queryViews(ctx, h.handler)) {
         const c = v.clientData;
         if (c?.kind !== "anon" && c?.kind !== "user_scoped") continue;
         const t = v.tableData;
         if (!t?.known || t.rlsEnabled) continue;
+        // A view has no row level security to turn on.
+        const rel = relations.get(t.table);
+        if (rel && isView(rel)) continue;
         const g = group(groups, t.table, () => ({
           path: [
             "HTTP request",
@@ -499,7 +542,8 @@ export const tableWithoutRls: Rule = {
             `${c.name} (${c.kind}, RLS would apply)`,
             `public.${t.table} (RLS disabled)`,
           ],
-          summary: `public.${t.table} has no "enable row level security" in migrations but is queried with a ${c.kind} client. Anyone holding the public anon key can read every row directly through PostgREST.`,
+          // Worded to hold for both inputs: the migrations of a repository and a live snapshot.
+          summary: `Row level security is off on public.${t.table}, and it is queried with ${c.kind === "anon" ? "the anon" : "a user-scoped"} client. Anyone holding the public anon key can read every row directly through PostgREST.`,
           title: `Table "${t.table}" is exposed without RLS`,
           data: { deterministic: true, ruleId: this.id, table: t.table },
           tail: locations(v.table?.location),
@@ -605,11 +649,22 @@ export const rlsPolicyWithoutCallerPredicate: Rule = {
         const op = v.data.operation === "unknown" ? "select" : v.data.operation;
         for (const p of t.policyDetails) {
           if (p.command !== "all" && p.command !== op) continue;
+          if (!opensAccess(p)) continue;
           if (p.roles.length > 0 && !p.roles.some((r) => REQUEST_ROLES.has(r))) continue;
           const expr = op === "insert" ? p.check : p.using;
           if (expr === null || policyScopesToCaller(expr) || callsFunctionIn(expr, callerFns)) {
             continue;
           }
+          // An open insert/update/delete policy is already the subject of anon-write-policy, which
+          // says it more precisely and with deterministic evidence: one root cause, one finding.
+          // A `for all` policy stays here, because it opens reads too and that rule never says so.
+          if (
+            p.command !== "all" &&
+            WRITE_COMMANDS.has(p.command) &&
+            reachableByAnon(p) &&
+            isTautology(expr)
+          )
+            continue;
           const g = group(groups, `${t.table}:${p.name}:${p.command}`, () => ({
             path: [
               "HTTP request",
@@ -985,6 +1040,114 @@ export const massAssignmentFromRequestBody: Rule = {
   },
 };
 
+/**
+ * R9. `getSession()` on the server reads the session out of the cookie and does not revalidate it,
+ * so its claims are whatever the browser put there; `getUser()` asks the Auth server and
+ * `getClaims()` verifies the token's signature. Supabase's own guidance is "never trust
+ * supabase.auth.getSession() inside server code".
+ *
+ * Unverified on its own is not yet a hole, and this is the line the rule draws. A query made with
+ * the caller's own cookie client still passes through PostgREST, which checks the token's signature
+ * and refuses an edited one, and then through Row Level Security: there the forged id buys nothing.
+ * The claims decide the outcome in two shapes, and only those are reported:
+ *   - the identity scopes a query made with a client that bypasses Row Level Security
+ *     (service-role or a direct database connection), so the filter is the only thing standing
+ *     between the caller and another tenant's rows;
+ *   - the identity decides a role gate that guards the handler, so a forged claim walks through it.
+ * A handler that also calls `getUser()` or `getClaims()` is silent, and so is one whose only session
+ * check came from a helper we could not resolve to a call.
+ */
+const serverTrustsUnverifiedSession: Rule = {
+  id: "supabase.server-trusts-unverified-session",
+  title: "Server authorizes on a session it never verified",
+  description:
+    "The handler decides access from supabase.auth.getSession(), which reads the session out of the cookie without revalidating it. Use getUser() or getClaims() before trusting the claims.",
+  severity: "high",
+  confidence: 0.7,
+  cwe: ["CWE-287", "CWE-565"],
+  evaluate(ctx) {
+    const out: Finding[] = [];
+    // A middleware that checks the token before a handler runs leaves nothing to say about the
+    // handlers it covers: what getSession() reads downstream has been verified by then. klubb-app
+    // documents exactly this premise in lib/auth-cache.ts, and reading its middleware is how we
+    // confirm it rather than taking its word. Which handlers it covers is the matcher's answer, and
+    // it is often narrower than it looks.
+    const mw = ctx.model.middlewareVerifiesSession;
+    for (const h of handlerViews(ctx)) {
+      if (mw && middlewareCovers(mw.matcher, h.data.route)) continue;
+      const sessions = ctx.graph
+        .out(h.handler.id, "AUTHENTICATED_BY")
+        .filter((a) => (a.data.kind ?? "session") === "session");
+      const unverified = sessions.filter((a) => a.data.method === "getSession");
+      if (unverified.length === 0) continue;
+      if (sessions.some((a) => a.data.method === "getUser" || a.data.method === "getClaims"))
+        continue;
+
+      // What the unverified claims decide: a role gate on the session, or a query scoped by the
+      // caller's identity. Without either, the handler only asks whether somebody is signed in, and
+      // forging the cookie buys the attacker nothing this rule can point at.
+      const scoped = queryViews(ctx, h.handler).filter(
+        (v) =>
+          bypassesRls(v.clientData?.kind) &&
+          (v.data.filters ?? []).some((f) => f.identity === true),
+      );
+      const roleChecks = h.roleChecks;
+      if (scoped.length === 0 && roleChecks.length === 0) continue;
+
+      const decides =
+        roleChecks.length > 0
+          ? `the role gate ${JSON.stringify(roleChecks[0]?.text ?? "")} reads ${roleChecks[0]?.source ?? "the session"}`
+          : `${scoped.length} privileged quer${scoped.length === 1 ? "y is" : "ies are"} scoped by the caller's identity (${[
+              ...new Set(
+                scoped.flatMap((v) =>
+                  (v.data.filters ?? [])
+                    .filter((f) => f.identity === true)
+                    .map((f) => f.column ?? "identity"),
+                ),
+              ),
+            ].join(", ")})`;
+      const tables = [...new Set(scoped.map((v) => v.tableData?.table ?? v.data.table))];
+      const path = [
+        h.data.kind === "server_action" ? "Server action call" : "HTTP request",
+        h.data.entry,
+        "auth.getSession() (cookie, not revalidated)",
+        roleChecks.length > 0 ? "role gate on the session" : "identity filter",
+        ...(tables.length > 0 ? [`public.${tables.join(", public.")}`] : []),
+      ];
+      out.push(
+        finding(ctx, this, {
+          title: `${h.data.entry} trusts an unverified session`,
+          entrypoints: [h.data.entry],
+          sources: ["cookie:supabase-auth-token"],
+          sinks:
+            scoped.length > 0
+              ? scoped.map(
+                  (v) =>
+                    `supabase.${v.data.operation}:public.${v.tableData?.table ?? v.data.table}`,
+                )
+              : ["authorization:role-gate"],
+          path,
+          evidence: [
+            {
+              kind: "rule",
+              summary: `${h.data.entry} establishes the caller with supabase.auth.getSession() and never calls getUser() or getClaims(). getSession() reads the session out of the cookie without revalidating it, so the claims are whatever the browser sent, and here ${decides} — with nothing else checking the token, because Row Level Security is not in the way. Replace it with getUser() (asks the Auth server) or getClaims() (verifies the token signature) and take the identity and role from that.`,
+              locations: locations(
+                h.handler.location,
+                ...unverified.map((a) => a.location),
+                ...scoped.map((v) => v.query.location),
+                ...roleChecks.map((r) => ({ file: r.file, line: r.line })),
+              ),
+              data: { deterministic: false, ruleId: this.id },
+            },
+            { kind: "trace", summary: path.join(" -> ") },
+          ],
+        }),
+      );
+    }
+    return out;
+  },
+};
+
 export const supabaseAuthorizationPack: readonly Rule[] = [
   serviceRoleKeyExposedToClient,
   serviceRoleObjectAccessWithoutTenantScope,
@@ -994,4 +1157,5 @@ export const supabaseAuthorizationPack: readonly Rule[] = [
   roleFromUserMetadata,
   tableWithoutRls,
   rlsPolicyWithoutCallerPredicate,
+  serverTrustsUnverifiedSession,
 ];

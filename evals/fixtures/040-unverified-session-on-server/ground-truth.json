@@ -1,0 +1,38 @@
+{
+  "id": "040-unverified-session-on-server",
+  "vulnerabilityExists": true,
+  "class": [
+    "authentication",
+    "authorization",
+    "multi-tenancy"
+  ],
+  "cwe": [
+    "CWE-287",
+    "CWE-565"
+  ],
+  "severity": "high",
+  "vulnerablePath": [
+    "Anyone holding a session cookie of their own",
+    "edit the token payload so that sub names another user",
+    "GET /api/orders calls supabase.auth.getSession(), which reads the cookie without revalidating it",
+    "the query runs with the service-role key, so Row Level Security never sees the forged token",
+    "the filter is scoped to the forged user_id and returns that user's orders"
+  ],
+  "expectedSecureBehavior": "The server establishes the caller with getUser() (asks the Auth server) or getClaims() (verifies the token signature), so an edited token is rejected before any query runs; genuine sessions keep working.",
+  "acceptableFixes": [
+    "Replace getSession() with getUser() and take the id from the returned user",
+    "Replace getSession() with getClaims() and take the id from the verified claims",
+    "Read through the caller's own cookie client so Row Level Security checks the token"
+  ],
+  "unacceptableFixes": [
+    "Keeping getSession() and adding a second check that also reads the same cookie",
+    "Moving the identity filter into the client",
+    "Disabling Row Level Security so the difference stops showing"
+  ],
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "typescript",
+    "postgresql"
+  ]
+}

@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Finding } from "@auditai/core";
+import { tierOf } from "@auditai/rules";
 import { runScan } from "@auditai/scanner";
 import { describe, expect, it } from "vitest";
 
@@ -44,8 +45,14 @@ describe.each(fixtures)("fixture %s", (name) => {
     });
     const hits = r.findings.filter((f) => f.ruleId === expected.ruleId && reported(f));
     expect(hits.length, `expected rule ${expected.ruleId} to fire`).toBeGreaterThan(0);
+    // Every finding carries the tier the product assigns to its rule (ADR-005).
+    for (const h of hits) expect(h.tier, `${h.id} tier`).toBe(tierOf(expected.ruleId));
+    // A fixture tests the rule: that it finds the hole and rates it. A lead's product severity is
+    // capped (tiers.ts), so the rating under test is the one the rule gave, kept in ruleSeverity.
     const strong = hits.filter(
-      (h) => h.severity === expected.severity && h.confidence >= expected.minConfidence,
+      (h) =>
+        (h.ruleSeverity ?? h.severity) === expected.severity &&
+        h.confidence >= expected.minConfidence,
     );
     expect(
       strong.length,

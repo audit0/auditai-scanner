@@ -184,6 +184,14 @@ export type AuthCheckKind = "session" | "secret" | "credential";
 export interface AuthCheck extends FileRef {
   /** Absent in models written before 12 September 2026; read it as `session`. */
   kind?: AuthCheckKind;
+  /**
+   * Which Supabase call established a `session` check, when it was a direct one. It matters because
+   * the three are not equivalent on the server: `getUser` asks the Auth server and `getClaims`
+   * verifies the token's signature, while `getSession` only reads the session out of the cookie
+   * without revalidating it, so its claims are whatever the browser put there. Absent for auth
+   * helpers whose body is analysed separately, and in models written before 19 September 2026.
+   */
+  method?: "getUser" | "getSession" | "getClaims";
 }
 
 /**
@@ -205,6 +213,22 @@ export interface RoleCheck extends FileRef {
   column?: string;
 }
 
+/**
+ * A call to the Supabase Auth admin API (`auth.admin.deleteUser`, `updateUserById`, `getUserById`,
+ * ...). It only works with the service-role key and it acts on accounts rather than on rows, so no
+ * policy constrains it: whatever user id it is handed is the account it touches.
+ */
+export interface AdminApiCall extends FileRef {
+  /** The method after `auth.admin.`, e.g. `deleteUser`. */
+  method: string;
+  /** The first argument as written, for evidence. */
+  argText: string;
+  /** True when that argument is derived from a user-controlled input of the handler. */
+  inputDerived: boolean;
+  /** True when it is the caller's own identity (`user.id`), which is the legitimate shape. */
+  identity: boolean;
+}
+
 export interface RouteHandler {
   kind: EntryKind;
   /** Route path for routes and pages, function name for server actions. */
@@ -220,6 +244,8 @@ export interface RouteHandler {
   ignores: IgnoreDirective[];
   /** Role/claim predicates that stop the entry point (see RoleCheck). Absent in older models. */
   roleChecks?: RoleCheck[];
+  /** Calls to the Auth admin API. Absent in models written before 19 September 2026. */
+  adminApiCalls?: AdminApiCall[];
 }
 
 export type PolicyCommand = "select" | "insert" | "update" | "delete" | "all";
@@ -231,6 +257,11 @@ export interface PolicyDetail {
   using: string | null;
   check: string | null;
   location: FileRef;
+  /**
+   * False for `AS RESTRICTIVE`: such a policy can only narrow what the permissive ones allow, so by
+   * itself it opens nothing. Absent means permissive, the Postgres default.
+   */
+  permissive?: false;
 }
 
 /**
@@ -280,6 +311,14 @@ export interface SqlFunctionInfo {
    * the parameter list could not be read; overloads share one entry, and this is the first one seen.
    */
   args?: string;
+  /**
+   * The argument list exactly as Postgres identifies the function (`p_status "OrderStatus"`,
+   * `character varying, integer`), from a live snapshot. A fix names the function with it verbatim;
+   * `args` is lowercased and simplified and can name a type that does not exist.
+   */
+  identity?: string;
+  /** The function name exactly as Postgres stores it, when it differs from `name` (quoted mixed case). */
+  sqlName?: string;
   /**
    * Input parameters with their names, in order: what an rpc call body is keyed by. Absent when any
    * input parameter is unnamed or the list could not be read.
@@ -340,6 +379,17 @@ export interface RlsTable {
   /** Table name exactly as Postgres stores it, present only when it differs from `table` (quoted mixed case, e.g. Prisma's `"Invoice"`). */
   sqlName?: string;
   location: FileRef;
+  /**
+   * What the relation is, when a live snapshot says so. Row level security exists only for tables;
+   * a view or a materialized view never has it, and saying it is "off" there is wrong.
+   */
+  kind?: "table" | "partitioned" | "view" | "matview";
+  /**
+   * Table privileges the API roles hold, from a live snapshot (lowercase: select, insert, update,
+   * delete; PUBLIC counted for both). Absent when the source does not say, which is every migration
+   * scan: Supabase grants all four to both roles by default, and rules then assume that.
+   */
+  apiGrants?: { anon: string[]; authenticated: string[] };
 }
 
 export type ExposureKind = "service_role_in_client_component" | "public_env_service_role";
@@ -370,4 +420,17 @@ export interface ProjectModel {
   storageBuckets?: StorageBucket[];
   /** Triggers from migration SQL still in force; absent when there are none. */
   sqlTriggers?: SqlTrigger[];
+  /**
+   * The project's `middleware.ts` verifies the session before a handler runs: it calls
+   * `auth.getUser()` or `auth.getClaims()`, or checks the token's signature itself against the
+   * project's JWKS. Handlers it covers then read a token somebody has already checked, which is the
+   * documented reason applications keep using `getSession()` on the server.
+   *
+   * `matcher` is the entries of the middleware's exported `config.matcher`, and it decides which
+   * routes that protection reaches: an empty list means Next.js runs the middleware on everything.
+   * Reading it is not optional — GoalSquad verifies in middleware but lists only page prefixes, so
+   * its `/api` handlers get nothing, while klubb-app matches everything but a few static paths.
+   * Absent when there is no middleware, or in models written before 19 September 2026.
+   */
+  middlewareVerifiesSession?: { matcher: string[] };
 }

@@ -138,6 +138,24 @@ describe("row level security", () => {
     expect(fix?.sql).toContain("no policy is proposed");
   });
 
+  it("takes the one key into auth.users as the owner, whatever it is called", () => {
+    const sql = `create table public.profiles (id uuid primary key references auth.users (id) on delete cascade, plan text);
+create table public.reviews (id uuid primary key, author uuid references auth.users, reviewer uuid references auth.users, body text);
+`;
+    const profiles = sqlFixFor(
+      finding("supabase.table-without-rls", { table: "profiles" }),
+      model(sql),
+    );
+    expect(profiles?.sql).toContain("using (id = (select auth.uid()))");
+    // Two people on one row: which of them owns it is not something the columns say.
+    const reviews = sqlFixFor(
+      finding("supabase.table-without-rls", { table: "reviews" }),
+      model(sql),
+    );
+    expect(reviews?.sql).not.toContain("create policy");
+    expect(reviews?.sql).toContain("no policy is proposed");
+  });
+
   it("only turns RLS on when the table already carries policies", () => {
     const fix = sqlFixFor(
       finding("supabase.policies-without-rls-enabled", { table: "notes" }),
@@ -162,7 +180,46 @@ describe("open write policy", () => {
     );
     expect(fix?.sql).toContain('drop policy "notes: anyone updates" on public.notes;');
     expect(fix?.sql).toContain("for update to authenticated");
-    expect(fix?.sql).toContain("using (user_id = (select auth.uid()));");
+    // USING picks the rows, WITH CHECK what they may become: without it an owner could hand a row
+    // to someone else.
+    expect(fix?.sql).toContain(
+      "using (user_id = (select auth.uid()))\n  with check (user_id = (select auth.uid()));",
+    );
+  });
+
+  it("writes no fix for a policy name that is not one line, and escapes quotes in one that is", () => {
+    for (const ruleId of [
+      "supabase.anon-write-policy",
+      "supabase.rls-policy-trusts-user-metadata",
+    ]) {
+      const f = finding(ruleId, { table: "notes", policy: "open\ndrop table public.orders; --" });
+      expect(sqlFixFor(f, model())).toBeNull();
+    }
+    const quoted = sqlFixFor(
+      finding("supabase.anon-write-policy", {
+        table: "notes",
+        policy: 'say "hi"',
+        command: "delete",
+      }),
+      model(),
+    );
+    expect(quoted?.sql).toContain('drop policy "say ""hi""" on public.notes;');
+  });
+
+  it("names a mixed-case table the way Postgres stores it", () => {
+    const sql = `create table public."Post" (id uuid primary key, user_id uuid not null);\n`;
+    const fix = sqlFixFor(finding("supabase.table-without-rls", { table: "post" }), model(sql));
+    expect(fix?.sql).toContain('alter table public."Post" enable row level security;');
+  });
+
+  it("proposes no owner policy through a column that cannot hold a user id", () => {
+    const sql = "create table public.orders (id bigint primary key, user_id bigint not null);\n";
+    const fix = sqlFixFor(finding("supabase.table-without-rls", { table: "orders" }), model(sql));
+    expect(fix?.sql).toContain("alter table public.orders enable row level security;");
+    expect(fix?.sql).not.toContain("create policy");
+    const text = "create table public.notes2 (id uuid primary key, user_id text);\n";
+    const cast = sqlFixFor(finding("supabase.table-without-rls", { table: "notes2" }), model(text));
+    expect(cast?.sql).toContain("using (user_id = (select auth.uid())::text)");
   });
 
   it("uses with check for an insert policy", () => {

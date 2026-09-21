@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.server-trusts-unverified-session",
+  "title": "GET /api/orders trusts an unverified session",
+  "severity": "high",
+  "minConfidence": 0.65,
+  "entrypoints": ["GET /api/orders"],
+  "sources": ["cookie:supabase-auth-token"],
+  "sinks": ["supabase.select:public.orders"],
+  "mustMentionFiles": ["vulnerable/app/api/orders/route.ts"],
+  "mustNotFlag": ["secure/app/api/orders/route.ts"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "a cookie whose token payload names another user is believed, and the handler returns that user's rows",
+    "expectedAfter": "the same cookie is rejected with 401 and both users still read their own rows"
+  }
+}

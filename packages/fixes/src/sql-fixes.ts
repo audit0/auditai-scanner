@@ -69,6 +69,20 @@ function table(model: ProjectModel, name: string | undefined): RlsTable | undefi
   return t && IDENTIFIER.test(t.table) ? t : undefined;
 }
 
+/**
+ * The predicate that ties a row to the caller through this column, or null when its type cannot hold
+ * a user id. `auth.uid()` is a uuid: a uuid column compares directly, a text column through a cast,
+ * and anything else (a bigint `user_id` keyed to a profiles table) would make the migration fail.
+ * A column whose type the source does not say is taken as uuid, the Supabase convention.
+ */
+function ownerPredicate(t: RlsTable, column: string): string | null {
+  const type = (t.columnInfo ?? []).find((c) => c.name === column)?.type ?? "unknown";
+  if (type === "uuid" || type === "unknown") return `${column} = (select auth.uid())`;
+  if (type === "text" || /^(varchar|character varying)\b/.test(type))
+    return `${column} = (select auth.uid())::text`;
+  return null;
+}
+
 /** How a row of this table belongs to someone, as far as its columns tell. */
 type Ownership =
   | { kind: "person"; column: string }
@@ -78,8 +92,17 @@ type Ownership =
 function ownershipOf(t: RlsTable | undefined): Ownership {
   if (!t) return { kind: "none" };
   const cols = t.columns.map((c) => c.toLowerCase());
-  for (const c of PERSON_COLUMNS) if (cols.includes(c)) return { kind: "person", column: c };
+  for (const c of PERSON_COLUMNS)
+    if (cols.includes(c) && ownerPredicate(t, c) !== null) return { kind: "person", column: c };
   for (const c of TENANT_COLUMNS) if (cols.includes(c)) return { kind: "tenant", column: c };
+  // A key into auth.users is a person whatever it is called: `profiles.id` is the usual one. Only
+  // when there is exactly one, so that a table with both an author and a reviewer gets no guess.
+  const toUsers = (t.columnInfo ?? []).filter(
+    (c) =>
+      c.references?.table === "auth.users" && (c.references.column ?? "id") === "id" && !c.sqlName,
+  );
+  const only = toUsers.length === 1 ? toUsers[0] : undefined;
+  if (only && ownerPredicate(t, only.name) !== null) return { kind: "person", column: only.name };
   return { kind: "none" };
 }
 
@@ -93,23 +116,89 @@ function qualified(name: string): string {
   return name.includes(".") ? name : `public.${name}`;
 }
 
-function fn(model: ProjectModel, name: string | undefined): SqlFunctionInfo | undefined {
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+/** A name as SQL must spell it: bare when Postgres would fold it to itself, quoted otherwise. */
+function sqlIdent(name: string): string {
+  return /^[a-z_][a-z0-9_$]*$/.test(name) ? name : quoteIdent(name);
+}
+
+/** The relation as SQL names it: `public."Post"` for Prisma's `Post`, `public.orders` otherwise. */
+function relationSql(t: RlsTable): string {
+  if (t.table.includes(".")) return t.table;
+  return `public.${sqlIdent(t.sqlName ?? t.table)}`;
+}
+
+/**
+ * Database text placed in a `--` comment: one line, whatever the name holds. A newline in a policy
+ * name would end the comment and turn the rest of the name into a statement of the migration.
+ */
+function commentText(s: string): string {
+  return [...s].map((c) => (isControl(c) ? "?" : c)).join("");
+}
+
+/** C0 and C1 controls and the Unicode line and paragraph separators: characters that break a line. */
+function isControl(c: string): boolean {
+  const n = c.charCodeAt(0);
+  return n < 0x20 || (n >= 0x7f && n <= 0x9f) || n === 0x2028 || n === 0x2029;
+}
+
+/**
+ * A policy name a migration can carry: short and on one line. Postgres allows a newline inside a
+ * quoted name, but no real policy has one, and a migration read line by line would split it.
+ */
+function policyNameOk(name: string): boolean {
+  return name.length > 0 && name.length <= 200 && ![...name].some(isControl);
+}
+
+/**
+ * An argument list as Postgres prints it for a function's identity, if it looks like one: names,
+ * types, quotes, brackets and commas, balanced. Anything else (a `;`, a comment) is not what the
+ * catalog returns, and is never written into a statement.
+ */
+function identityOk(args: string): boolean {
+  if (!/^[\w$\s,."[\]()]*$/.test(args)) return false;
+  if ((args.match(/"/g) ?? []).length % 2 !== 0) return false;
+  let depth = 0;
+  for (const c of args) {
+    depth += c === "(" ? 1 : c === ")" ? -1 : 0;
+    if (depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+/**
+ * The function a finding is about. Overloads share a name, so the finding's own identity (the
+ * argument list the database printed) picks the one it judged; without it, the first by name.
+ */
+function fn(
+  model: ProjectModel,
+  name: string | undefined,
+  identity?: string,
+): SqlFunctionInfo | undefined {
   if (!name || !IDENTIFIER.test(name)) return undefined;
   const key = name.toLowerCase().replace(/^public\./, "");
-  const f = (model.sqlFunctions ?? []).find((x) => x.name.toLowerCase() === key);
+  const f = (model.sqlFunctions ?? []).find(
+    (x) => x.name.toLowerCase() === key && (identity === undefined || x.identity === identity),
+  );
   return f && IDENTIFIER.test(f.name) ? f : undefined;
 }
 
 /** `public.f(uuid, text)` — the signature REVOKE needs; without argument types it is ambiguous. */
 function signatureOf(f: SqlFunctionInfo): string {
-  const name = f.name.includes(".") ? f.name : `public.${f.name}`;
+  const name = f.name.includes(".") ? f.name : `public.${sqlIdent(f.sqlName ?? f.name)}`;
+  // The database's own identity list is exact (quoted enum types, `character varying`); the list
+  // read from migrations is lowercased and simplified, and used only when that is all there is.
+  if (f.identity !== undefined && identityOk(f.identity)) return `${name}(${f.identity})`;
   return f.args === undefined ? `${name}(...)` : `${name}(${f.args})`;
 }
 
 const COMMANDS = new Set(["select", "insert", "update", "delete", "all"]);
 
 const HEADER = (title: string): string =>
-  `-- ${title}\n-- Proposed by Audit AI. Read it, then apply it with the rest of your migrations.\n`;
+  `-- ${commentText(title)}\n-- Proposed by Audit AI. Read it, then apply it with the rest of your migrations.\n`;
 
 // ---------------------------------------------------------------------------------------------
 
@@ -133,8 +222,10 @@ function policedTables(f: SqlFunctionInfo, model: ProjectModel): string[] | null
 }
 
 function sqlFunctionFix(finding: Finding, model: ProjectModel): SqlFix | null {
-  const name = finding.evidence[0]?.data?.function;
-  const f = fn(model, typeof name === "string" ? name : undefined);
+  const data = finding.evidence[0]?.data ?? {};
+  const name = data.function;
+  const identity = typeof data.identity === "string" ? data.identity : undefined;
+  const f = fn(model, typeof name === "string" ? name : undefined, identity);
   if (!f) return null;
   const sig = signatureOf(f);
   const ambiguous = sig.endsWith("(...)");
@@ -174,9 +265,9 @@ function enableRlsFix(finding: Finding, model: ProjectModel, withPolicy: boolean
   const t = table(model, typeof asked === "string" ? asked : undefined);
   if (!t) return null;
   const name = t.table;
-  const full = qualified(name);
+  const full = relationSql(t);
   const own = ownershipOf(t);
-  const owner = own.kind === "person" ? own.column : null;
+  const owner = own.kind === "person" ? ownerPredicate(t, own.column) : null;
   const lines = [HEADER(`Turn on row level security for ${full}`)];
   lines.push(`alter table ${full} enable row level security;\n`);
   if (withPolicy) {
@@ -184,8 +275,8 @@ function enableRlsFix(finding: Finding, model: ProjectModel, withPolicy: boolean
       lines.push(`\n${tenantNote(full, own.column)}`);
     } else if (owner) {
       lines.push(
-        `\ncreate policy "${name}: owner reads" on ${full}\n  for select to authenticated\n  using (${owner} = (select auth.uid()));\n`,
-        `\ncreate policy "${name}: owner writes" on ${full}\n  for all to authenticated\n  using (${owner} = (select auth.uid()))\n  with check (${owner} = (select auth.uid()));\n`,
+        `\ncreate policy "${name}: owner reads" on ${full}\n  for select to authenticated\n  using (${owner});\n`,
+        `\ncreate policy "${name}: owner writes" on ${full}\n  for all to authenticated\n  using (${owner})\n  with check (${owner});\n`,
       );
     } else {
       lines.push(
@@ -212,12 +303,12 @@ function anonWriteFix(finding: Finding, model: ProjectModel): SqlFix | null {
   const policy = data.policy;
   const command = data.command;
   const t = table(model, typeof data.table === "string" ? data.table : undefined);
-  if (!t || typeof policy !== "string" || policy.length > 200) return null;
+  if (!t || typeof policy !== "string" || !policyNameOk(policy)) return null;
   if (command !== undefined && !COMMANDS.has(String(command))) return null;
   const name = t.table;
-  const full = qualified(name);
+  const full = relationSql(t);
   const own = ownershipOf(t);
-  const owner = own.kind === "person" ? own.column : null;
+  const owner = own.kind === "person" ? ownerPredicate(t, own.column) : null;
   const cmd = typeof command === "string" ? command : "all";
   const safeName = policy.replace(/"/g, '""');
   const lines = [HEADER(`Close the open write policy "${policy}" on ${full}`)];
@@ -227,9 +318,13 @@ function anonWriteFix(finding: Finding, model: ProjectModel): SqlFix | null {
     lines.push(
       `drop policy "${safeName}" on ${full};\n`,
       `\ncreate policy "${safeName}" on ${full}\n  for ${cmd} to authenticated\n`,
+      // USING decides which rows a caller may touch, WITH CHECK what a row may become: an update
+      // needs both, or the owner could hand a row to someone else.
       cmd === "insert"
-        ? `  with check (${owner} = (select auth.uid()));\n`
-        : `  using (${owner} = (select auth.uid()))${cmd === "all" ? `\n  with check (${owner} = (select auth.uid()))` : ""};\n`,
+        ? `  with check (${owner});\n`
+        : cmd === "delete"
+          ? `  using (${owner});\n`
+          : `  using (${owner})\n  with check (${owner});\n`,
     );
   } else {
     lines.push(
@@ -242,7 +337,7 @@ function anonWriteFix(finding: Finding, model: ProjectModel): SqlFix | null {
     sql: lines.join(""),
     summary: `Tie the write policy on ${full} to the caller`,
     rationale: owner
-      ? `The policy decides with a tautology and is open to anon, so anyone holding the public key can write ${full} straight through PostgREST. The replacement keeps the same command and ties the row to the signed-in caller through ${owner}. If this table is meant to accept rows from strangers (a contact form, a newsletter), keep the insert open but give it a predicate on the row's shape and a rate limit.`
+      ? `The policy decides with a tautology and is open to anon, so anyone holding the public key can write ${full} straight through PostgREST. The replacement keeps the same command and ties the row to the signed-in caller (${owner}). If this table is meant to accept rows from strangers (a contact form, a newsletter), keep the insert open but give it a predicate on the row's shape and a rate limit.`
       : own.kind === "tenant"
         ? `The policy decides with a tautology and is open to anon, so anyone holding the public key can write ${full} straight through PostgREST. Rows belong to a tenant through ${own.column}, and only your schema knows how a user becomes a member, so the migration removes the open policy and shows the shape of the membership check to write instead.`
         : `The policy decides with a tautology and is open to anon, so anyone holding the public key can write ${full} straight through PostgREST. Nothing in the table identifies an owner, so the honest fix is to remove the policy and write the table from your server after it has checked the caller.`,
@@ -253,9 +348,10 @@ function userMetadataFix(finding: Finding, model: ProjectModel): SqlFix | null {
   const data = finding.evidence[0]?.data ?? {};
   const policy = data.policy;
   const t = table(model, typeof data.table === "string" ? data.table : undefined);
-  if (!t || typeof policy !== "string" || policy.length > 200) return null;
+  if (!t || typeof policy !== "string" || !policyNameOk(policy)) return null;
   const name = t.table;
-  const full = qualified(name);
+  const full = relationSql(t);
+  const quoted = commentText(policy.replace(/"/g, '""'));
   return {
     file: `fix_policy_${name.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}_app_metadata.sql`,
     sql: [
@@ -265,8 +361,8 @@ function userMetadataFix(finding: Finding, model: ProjectModel): SqlFix | null {
       "--   (select auth.jwt()) -> 'user_metadata' ->> '<claim>'\n",
       "-- with\n",
       "--   (select auth.jwt()) -> 'app_metadata' ->> '<claim>'\n",
-      `--\n-- drop policy "${policy.replace(/"/g, '""')}" on ${full};\n`,
-      `-- create policy "${policy.replace(/"/g, '""')}" on ${full} ... using (...);\n`,
+      `--\n-- drop policy "${quoted}" on ${full};\n`,
+      `-- create policy "${quoted}" on ${full} ... using (...);\n`,
       "\n-- Then set the claim where the user cannot reach it, from a server with the service role:\n",
       "--   await admin.auth.admin.updateUserById(id, { app_metadata: { is_admin: true } });\n",
     ].join(""),

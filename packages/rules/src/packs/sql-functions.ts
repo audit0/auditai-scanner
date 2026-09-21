@@ -24,7 +24,10 @@ export function callerCheckingFunctions(model: ProjectModel): ReadonlySet<string
   );
 }
 
-const CALL = /(?:"?([A-Za-z_][A-Za-z0-9_$]*)"?\s*\.\s*)?"?([A-Za-z_][A-Za-z0-9_$]*)"?\s*\(/g;
+// A match may only start where an identifier starts: without the lookbehind, every position inside a
+// long identifier is tried and backtracks to its end, which is quadratic in the length of the text.
+const CALL =
+  /(?<![A-Za-z0-9_$"])(?:"?([A-Za-z_][A-Za-z0-9_$]*)"?\s*\.\s*)?"?([A-Za-z_][A-Za-z0-9_$]*)"?\s*\(/g;
 
 /** `public.f` -> `f`, `"Private"."f"` -> `private.f`: the spelling SqlFunctionInfo uses. */
 function qualified(schema: string | undefined, name: string | undefined): string {

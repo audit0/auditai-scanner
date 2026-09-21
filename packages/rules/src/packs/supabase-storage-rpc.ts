@@ -185,7 +185,9 @@ function constrainsPath(expr: string): boolean {
 export function bucketsIn(expr: string): string[] {
   const out: string[] = [];
   for (const m of expr.matchAll(/\bbucket_id\s*=\s*'([^']+)'/gi)) if (m[1]) out.push(m[1]);
-  for (const m of expr.matchAll(/\bbucket_id\s+in\s*\(([^)]*)\)/gi)) {
+  // The list stops at the next bracket of either kind, so an unclosed `in (` cannot scan to the end
+  // of the text once per occurrence.
+  for (const m of expr.matchAll(/\bbucket_id\s+in\s*\(([^()]*)\)/gi)) {
     for (const v of (m[1] ?? "").matchAll(/'([^']+)'/g)) if (v[1]) out.push(v[1]);
   }
   return unique(out);
@@ -199,6 +201,21 @@ function decidingExpr(p: PolicyDetail): { expr: string; clause: "using" | "with 
 }
 
 const EVERYONE = new Set(["anon", "public"]);
+
+/**
+ * A policy only the service role can satisfy grants nothing to a Storage API caller: the role is
+ * never a user session, and it bypasses RLS anyway, so the policy decides nothing for anyone.
+ * Written two ways in the wild — `for delete to service_role`, and a predicate that demands
+ * `auth.role() = 'service_role'` — and both were false positives in the fourth blind sample
+ * (docs/realworld/2026-09-19-blind-sample-4.md, findings 83, 84 and 85).
+ */
+function serviceRoleOnly(p: PolicyDetail, expr: string): boolean {
+  const roles = p.roles.map((r) => r.toLowerCase().replace(/^"|"$/g, ""));
+  if (roles.length > 0 && roles.every((r) => r === "service_role")) return true;
+  return /auth\s*\.\s*role\s*\(\s*\)\s*=\s*'service_role'|current_user\s*=\s*'service_role'/i.test(
+    expr,
+  );
+}
 
 /**
  * SELECT on a public bucket is by design (its objects are world-readable by URL anyway), and a SELECT
@@ -260,9 +277,12 @@ export const storagePolicyWithoutOwnerCheck: Rule = {
     for (const t of ctx.model.tables) {
       if (t.table.toLowerCase() !== STORAGE_OBJECTS) continue;
       for (const p of t.policyDetails) {
+        // RESTRICTIVE narrows what the permissive policies allow; it cannot open a bucket by itself.
+        if (p.permissive === false) continue;
         const { expr, clause } = decidingExpr(p);
         const buckets = bucketsIn(expr);
         if (hasOwnerCheck(expr) || constrainsPath(expr)) continue;
+        if (serviceRoleOnly(p, expr)) continue;
         if (intentionalPublicRead(p, buckets, declared)) continue;
         const ops = COMMAND_OPS[p.command];
         const reached = storageReaches.filter((r) => {
@@ -532,6 +552,8 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
                   deterministic: false,
                   ruleId: this.id,
                   function: fn.name,
+                  // Overloads share a name; the database's identity list says which one this is.
+                  ...(fn.identity !== undefined ? { identity: fn.identity } : {}),
                   grantedTo: [...fn.grantedTo],
                   ...(narrow ? { narrowResult: narrow } : {}),
                 },
