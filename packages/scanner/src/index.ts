@@ -27,4 +27,4 @@ export {
   scanSnapshot,
   unwrapSnapshot,
 } from "./scan-snapshot.js";
-export { SNAPSHOT_QUERY } from "./snapshot-query.js";
+export { SNAPSHOT_QUERY, WATCH_SNAPSHOT_QUERY } from "./snapshot-query.js";

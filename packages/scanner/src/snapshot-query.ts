@@ -83,3 +83,14 @@ select jsonb_build_object(
               from storage.buckets b)
 ) as snapshot;
 `;
+
+const BUCKETS = `  'buckets', (select coalesce(jsonb_agg(jsonb_build_object('id', b.id, 'public', b.public) order by b.id), '[]'::jsonb)
+              from storage.buckets b)`;
+
+/**
+ * The same query for the night watch, run as a role that holds no privilege at all. Everything it
+ * reads is the catalog, which every role may read; only storage.buckets is a table, and granting the
+ * watch role access to it would be the one grant the role otherwise does not need. Buckets feed only
+ * leads, so the watch goes without them and says so.
+ */
+export const WATCH_SNAPSHOT_QUERY = SNAPSHOT_QUERY.replace(BUCKETS, "  'buckets', '[]'::jsonb");
