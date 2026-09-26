@@ -25,8 +25,15 @@ create policy "subscribers: anyone subscribes" on public.subscribers
   for insert to anon, authenticated
   with check (position('@' in email) > 1 and char_length(email) <= 320);
 
+-- The admin page lists subscribers with the browser client, so the list is readable with the
+-- public key.
+create policy "subscribers: anyone reads the list" on public.subscribers
+  for select to anon, authenticated
+  using (true);
+
 -- Anyone with the public key can empty the subscriber list: `using (true)` decides nothing and the
--- policy is open to anon.
+-- policy is open to anon. A delete through the Data API reaches the rows the caller can read, and
+-- the policy above lets them read every row.
 create policy "subscribers: anyone unsubscribes" on public.subscribers
   for delete to anon, authenticated
   using (true);

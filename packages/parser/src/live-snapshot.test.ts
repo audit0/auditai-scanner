@@ -185,6 +185,36 @@ describe("parseLiveSnapshot", () => {
     ]);
   });
 
+  it("reads text parameters a definer body glues into EXECUTE", () => {
+    const m = ok(
+      snapshot({
+        functions: [
+          {
+            schema: "public",
+            name: "search_orders",
+            securityDefiner: true,
+            returns: "SETOF orders",
+            arguments: "p_status text, p_limit integer DEFAULT 20",
+            body: "begin return query execute 'select * from orders where status = ''' || p_status || ''' limit ' || p_limit; end",
+            executeGrants: ["PUBLIC"],
+          },
+          {
+            schema: "public",
+            name: "search_orders_safe",
+            securityDefiner: true,
+            returns: "SETOF orders",
+            arguments: "p_status text",
+            body: "begin return query execute 'select * from orders where status = $1' using p_status; end",
+            executeGrants: ["PUBLIC"],
+          },
+        ],
+      }),
+    );
+    // The integer is glued in too, but it cannot close a quote.
+    expect(m.sqlFunctions[0]?.sqlFromParams).toEqual(["p_status"]);
+    expect(m.sqlFunctions[1]?.sqlFromParams).toBeUndefined();
+  });
+
   it("sees the caller's identity in a body, in a default, and through a call", () => {
     const m = ok(
       snapshot({
@@ -288,5 +318,133 @@ describe("parseLiveSnapshot", () => {
     ]);
     expect(m.takenAt).toBe("2026-09-20T09:00:00Z");
     expect(m.postgres).toBe("17.11");
+  });
+
+  it("reads whether the Data API refuses an update or delete without a filter", () => {
+    const refuses = (apiSettings?: unknown) =>
+      ok(snapshot(apiSettings === undefined ? {} : { apiSettings })).dataApiRefusesUnfilteredWrites;
+    // A snapshot taken before the query read these settings says nothing: the rules assume Supabase.
+    expect(refuses()).toBeUndefined();
+    expect(refuses("not a list")).toBeUndefined();
+    // What authenticator holds on every Supabase project (measured on supabase/postgres 17.6.1.167).
+    expect(refuses(["session_preload_libraries=supautils, safeupdate"])).toBe(true);
+    expect(refuses(['session_preload_libraries="$libdir/safeupdate.so"'])).toBe(true);
+    // The owner switched it off; the most specific setting comes first and wins.
+    expect(
+      refuses(["safeupdate.enabled=off", "session_preload_libraries=supautils, safeupdate"]),
+    ).toBe(false);
+    expect(refuses(["safeupdate.enabled=0", "session_preload_libraries=safeupdate"])).toBe(false);
+    expect(
+      refuses([
+        "safeupdate.enabled=on",
+        "safeupdate.enabled=off",
+        "session_preload_libraries=safeupdate",
+      ]),
+    ).toBe(true);
+    // A PostgREST pre-request function can switch it off for each request; the server's own value
+    // (ALTER SYSTEM) comes last, after every role and database setting.
+    expect(
+      refuses([
+        "pgrst.db_pre_request=public.before_request",
+        "session_preload_libraries=supautils, safeupdate",
+      ]),
+    ).toBe(false);
+    expect(
+      refuses(["pgrst.db_pre_request=", "session_preload_libraries=supautils, safeupdate"]),
+    ).toBe(true);
+    expect(
+      refuses(["session_preload_libraries=supautils, safeupdate", "safeupdate.enabled=off"]),
+    ).toBe(false);
+    expect(
+      refuses(["session_preload_libraries=supautils, safeupdate", "safeupdate.enabled="]),
+    ).toBe(true);
+    // Not preloaded at all, or no setting the snapshot can see.
+    expect(refuses(["session_preload_libraries=supautils"])).toBe(false);
+    expect(refuses([])).toBe(false);
+    expect(refuses([42, null, "session_preload_libraries=safeupdate"])).toBe(true);
+  });
+
+  it("reads the tables a function that is not SECURITY DEFINER changes, as the database reports them", () => {
+    const fn = (name: string, changes: unknown) => ({
+      schema: "public",
+      name,
+      securityDefiner: false,
+      returns: "void",
+      arguments: "",
+      identity: "",
+      body: null,
+      readsCaller: false,
+      executeGrants: ["PUBLIC"],
+      changes,
+    });
+    const m = ok(
+      snapshot({
+        functions: [
+          fn("wipe", ["public.notes", '"Orders"', "set", "private.audit", "*"]),
+          fn("reader", []),
+          fn("old_snapshot", undefined),
+        ],
+      }),
+    );
+    const byName = Object.fromEntries(m.sqlFunctions.map((f) => [f.name, f.changes]));
+    expect(byName).toEqual({
+      wipe: ["notes", "orders", "private.audit", "*"],
+      reader: undefined,
+      old_snapshot: undefined,
+    });
+  });
+});
+
+describe("views in a live snapshot", () => {
+  it("keeps security_invoker and the sources of a view, and never for a table", () => {
+    const text = snapshot({
+      tables: [
+        table({ name: "invoices", securityInvoker: true, sources: ["nothing"] }),
+        {
+          schema: "public",
+          name: "invoice_totals",
+          rlsEnabled: false,
+          kind: "view",
+          columns: [],
+          grants: SUPABASE_GRANTS,
+          securityInvoker: false,
+          sources: ["Invoices", "auth.users"],
+        },
+        {
+          schema: "public",
+          name: "daily",
+          rlsEnabled: false,
+          kind: "matview",
+          columns: [],
+          grants: SUPABASE_GRANTS,
+          securityInvoker: true,
+          sources: ["invoices"],
+        },
+        {
+          schema: "public",
+          name: "old_view",
+          rlsEnabled: false,
+          kind: "view",
+          columns: [],
+          grants: SUPABASE_GRANTS,
+        },
+      ],
+    });
+    const r = parseLiveSnapshot(text);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const by = new Map(r.model.tables.map((t) => [t.table, t]));
+    expect(by.get("invoices")?.viewSecurityInvoker).toBeUndefined();
+    expect(by.get("invoices")?.viewSources).toBeUndefined();
+    expect(by.get("invoice_totals")).toMatchObject({
+      kind: "view",
+      viewSecurityInvoker: false,
+      viewSources: ["invoices", "auth.users"],
+    });
+    // A materialized view is a stored copy whatever the option says.
+    expect(by.get("daily")?.viewSecurityInvoker).toBe(false);
+    // A snapshot taken before the query read views says nothing about them.
+    expect(by.get("old_view")?.viewSecurityInvoker).toBeUndefined();
+    expect(by.get("old_view")?.viewSources).toBeUndefined();
   });
 });

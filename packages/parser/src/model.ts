@@ -100,6 +100,13 @@ export interface StorageAccess {
    * (`${user.id}/${name}`), or is checked against it (`path.startsWith(`${user.id}/`)`).
    */
   pathScopedToCaller: boolean;
+  /**
+   * True when every user-controlled path argument is a key minted in this request: its last segment
+   * carries a random token the handler generated (`${folder}/${crypto.randomUUID()}.jpg`), nothing
+   * after the token can open a new segment and nothing the caller sends before it can end the URL
+   * path. Such a key names an object that did not exist before the request.
+   */
+  pathServerMinted?: boolean;
 }
 
 /**
@@ -246,6 +253,12 @@ export interface RouteHandler {
   roleChecks?: RoleCheck[];
   /** Calls to the Auth admin API. Absent in models written before 19 September 2026. */
   adminApiCalls?: AdminApiCall[];
+  /**
+   * The handler returns (or throws) first thing when NODE_ENV is "production", the value Next.js
+   * inlines into every production build: a development-only route. Computed only for entry points
+   * that authenticate nothing themselves.
+   */
+  productionExit?: FileRef;
 }
 
 export type PolicyCommand = "select" | "insert" | "update" | "delete" | "all";
@@ -332,12 +345,28 @@ export interface SqlFunctionInfo {
   /** Tables the body writes (`update t`, `insert into t`, `delete from t`); same caveats as `tables`. */
   writes?: string[];
   /**
+   * Tables the body can change existing rows of: `update t`, `delete from t`, `merge into t`,
+   * `truncate t` (which RLS does not see at all, and Supabase grants to the API roles), and
+   * `*` when it runs dynamic SQL (EXECUTE) next to one of those words, so any table may be meant.
+   * A SECURITY INVOKER function that writes without reading a column (`where true`, a BEGIN ATOMIC
+   * body, MERGE) is not stopped by safeupdate, and no SELECT policy limits it. From a live snapshot
+   * only for functions that are not SECURITY DEFINER; same text-match caveats as `tables`.
+   */
+  changes?: string[];
+  /**
    * Parameters compared with a column in a WHERE/ON/AND/OR/IF clause of the body: `where i.id =
    * p_invoice_id` gives `{ param: "p_invoice_id", table: "invoices", column: "id" }`.
    */
   keys?: Array<{ param: string; table: string; column: string }>;
   /** Migration functions the body calls, spelled like `name`; absent when it calls none. */
   calls?: string[];
+  /**
+   * Text parameters that reach the statement text of an EXECUTE unquoted (`'...' || p`, `format('%s',
+   * p)`, `execute p`), directly or through a local variable: the caller writes part of the SQL the
+   * function runs. Absent when none does. See `paramsReachingExecute` in `sql-dynamic.ts`; from a live
+   * snapshot only for SECURITY DEFINER functions, whose bodies the query sends.
+   */
+  sqlFromParams?: string[];
 }
 
 /** A trigger from migration SQL, kept for what RLS cannot express: columns a row's owner may not change. */
@@ -385,11 +414,33 @@ export interface RlsTable {
    */
   kind?: "table" | "partitioned" | "view" | "matview";
   /**
+   * Views only: true when the view runs with the caller's rights (`with (security_invoker = on)`),
+   * so the row level security of the tables under it applies; false when it runs with its owner's,
+   * which on Supabase is postgres, and no policy applies. A materialized view is always false: it is
+   * a stored copy. Absent for a table, and for a snapshot taken before the query read it.
+   */
+  viewSecurityInvoker?: boolean;
+  /** Views only: the relations the definition selects from, as model keys (`invoices`, `auth.users`). */
+  viewSources?: string[];
+  /**
    * Table privileges the API roles hold, from a live snapshot (lowercase: select, insert, update,
    * delete; PUBLIC counted for both). Absent when the source does not say, which is every migration
    * scan: Supabase grants all four to both roles by default, and rules then assume that.
    */
   apiGrants?: { anon: string[]; authenticated: string[] };
+  /**
+   * Column privileges the API roles hold on some column of the table (`grant update (v) on t to
+   * authenticated`), from a live snapshot; same shape as `apiGrants`. A PATCH that only sets those
+   * columns goes through even without the table privilege.
+   */
+  apiColumnGrants?: { anon: string[]; authenticated: string[] };
+  /**
+   * A policy statement the parser does not evaluate names this table: CREATE, ALTER or DROP POLICY
+   * inside a DO block (a conditional `if not exists ... create policy`), or ALTER POLICY. The policies
+   * listed may then differ from the database's, so nothing may be concluded from a policy being
+   * absent. Migration scans only; absent otherwise.
+   */
+  policiesUnread?: true;
 }
 
 export type ExposureKind = "service_role_in_client_component" | "public_env_service_role";
@@ -433,4 +484,26 @@ export interface ProjectModel {
    * Absent when there is no middleware, or in models written before 19 September 2026.
    */
   middlewareVerifiesSession?: { matcher: string[] };
+  /**
+   * The Data API refuses UPDATE and DELETE without a WHERE clause: `authenticator`, the role PostgREST
+   * logs in as, preloads safeupdate. Then every change through the API carries a filter that reads a
+   * column, and Postgres applies the table's SELECT policies to the rows it changes too — a stranger
+   * changes only rows they can read. Supabase has preloaded it on every project since January 2022
+   * (supabase/postgres migration 20220118070449); the project owner can switch it off with `alter role
+   * authenticator set safeupdate.enabled = off`. Read only from a live snapshot; absent means the
+   * Supabase default.
+   */
+  dataApiRefusesUnfilteredWrites?: boolean;
+  /**
+   * Some DO block creates, alters or drops policies through dynamic SQL (`execute format('create
+   * policy ... on %I', t)`), so any table's policies may differ from what the migrations show; see
+   * `RlsTable.policiesUnread`. Migration scans only.
+   */
+  policiesUnread?: true;
+  /**
+   * The model was read off a live database (a snapshot), not rebuilt from files. Only then is a
+   * policy's absence a fact: a migration scan does not see policies created in the dashboard, by a
+   * function the migrations call, or in SQL it does not evaluate.
+   */
+  fromLiveDatabase?: true;
 }

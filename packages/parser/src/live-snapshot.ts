@@ -11,6 +11,7 @@ import type {
   StorageBucket,
   SupabaseQuery,
 } from "./model.js";
+import { paramsReachingExecute } from "./sql-dynamic.js";
 
 /**
  * A snapshot of a live Postgres database, read by the query in
@@ -49,6 +50,8 @@ export interface SnapshotModel {
   postgres: string;
   /** What the snapshot could not express, in words for the report. */
   notes: string[];
+  /** See `ProjectModel.dataApiRefusesUnfilteredWrites`; absent when the snapshot predates the field. */
+  dataApiRefusesUnfilteredWrites?: boolean;
 }
 
 export type SnapshotResult = { ok: true; model: SnapshotModel } | { ok: false; error: string };
@@ -242,7 +245,54 @@ function readTable(v: unknown): RlsTable | null {
   if (kind === "table" || kind === "partitioned" || kind === "view" || kind === "matview")
     table.kind = kind;
   if (Array.isArray(v.grants)) table.apiGrants = apiGrants(v.grants);
+  if (Array.isArray(v.columnGrants)) table.apiColumnGrants = apiGrants(v.columnGrants);
+  if ((kind === "view" || kind === "matview") && typeof v.securityInvoker === "boolean")
+    table.viewSecurityInvoker = kind === "view" ? v.securityInvoker : false;
+  if ((kind === "view" || kind === "matview") && Array.isArray(v.sources))
+    table.viewSources = strings(v.sources).map((r) => r.toLowerCase());
   return table;
+}
+
+/** Words after UPDATE that name no table: `do update set`, `for update of|skip|nowait`, `update on`. */
+const NOT_A_RELATION = new Set(["set", "of", "skip", "nowait", "only", "on", "or"]);
+
+/** The words Postgres reads as false for a boolean setting, unique prefixes included. */
+const OFF = /^(f|fa|fal|fals|false|n|no|of|off|0)$/i;
+
+/**
+ * Does the Data API refuse UPDATE and DELETE without WHERE? It does when `authenticator` preloads
+ * safeupdate and nobody switched it off; `settings` come most specific first, as the query orders
+ * them. No preload setting at all means the library is not loaded as far as the snapshot can tell.
+ * Undefined when the snapshot has no such field (it was taken before the query read it).
+ */
+function refusesUnfilteredWrites(v: unknown): boolean | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const settings = strings(v);
+  const first = (name: string): string | undefined => {
+    const s = settings.find((x) => x.startsWith(`${name}=`));
+    return s?.slice(name.length + 1).trim();
+  };
+  // A PostgREST pre-request function runs before every request and can switch safeupdate off for it
+  // (a SECURITY DEFINER one owned by postgres can, measured 24 September 2026); what it does is not
+  // in the snapshot, so its presence alone means safeupdate cannot be counted on.
+  const preRequest = first("pgrst.db_pre_request");
+  if (preRequest !== undefined && preRequest.replace(/^['"]|['"]$/g, "") !== "") return false;
+  const preload = first("session_preload_libraries");
+  if (preload === undefined) return false;
+  const loaded = preload
+    .replace(/^"|"$/g, "")
+    .split(",")
+    .map((lib) =>
+      lib
+        .trim()
+        .replace(/^['"]|['"]$/g, "")
+        .replace(/^.*\//, "")
+        .replace(/\.so$/, "")
+        .toLowerCase(),
+    )
+    .includes("safeupdate");
+  const enabled = first("safeupdate.enabled");
+  return loaded && !(enabled !== undefined && OFF.test(enabled.replace(/^['"]|['"]$/g, "")));
 }
 
 const API_PRIVILEGES = new Set(["select", "insert", "update", "delete"]);
@@ -288,9 +338,30 @@ function readFunction(v: unknown): SqlFunctionInfo | null {
   if (typeof v.arguments === "string") fn.args = args;
   if (typeof v.identity === "string") fn.identity = v.identity;
   if (exact !== bare) fn.sqlName = exact;
-  if (params !== null) fn.params = params;
+  if (params !== null) {
+    fn.params = params;
+    const injected = paramsReachingExecute(body, params);
+    if (injected.length > 0) fn.sqlFromParams = injected;
+  }
   const tables = relationsIn(body);
   if (tables.length > 0) fn.tables = tables;
+  // Tables a function that is not SECURITY DEFINER updates, deletes from or merges into, as the
+  // query reads them off its definition; `*` when it runs dynamic SQL next to such a word.
+  const changes = [
+    ...new Set(
+      strings(v.changes).map((c) => {
+        if (c === "*") return c;
+        const parts = c
+          .split(".")
+          .map((x) => (x.startsWith('"') ? x.slice(1, -1) : x.toLowerCase()));
+        const [first, second] = parts;
+        return second === undefined || first === "public"
+          ? (second ?? first ?? "").toLowerCase()
+          : `${first}.${second}`.toLowerCase();
+      }),
+    ),
+  ].filter((c) => c !== "" && !NOT_A_RELATION.has(c));
+  if (changes.length > 0) fn.changes = changes;
   return fn;
 }
 
@@ -492,6 +563,7 @@ export function parseLiveSnapshot(text: string): SnapshotResult {
     .map((b) => ({ id: str(b.id), public: bool(b.public), location: SNAPSHOT_REF }))
     .filter((b) => b.id !== "");
 
+  const refuses = refusesUnfilteredWrites(raw.apiSettings);
   return {
     ok: true,
     model: {
@@ -502,6 +574,7 @@ export function parseLiveSnapshot(text: string): SnapshotResult {
       takenAt: str(raw.takenAt),
       postgres: str(raw.postgres),
       notes,
+      ...(refuses === undefined ? {} : { dataApiRefusesUnfilteredWrites: refuses }),
     },
   };
 }

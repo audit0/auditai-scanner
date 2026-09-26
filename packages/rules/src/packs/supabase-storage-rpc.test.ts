@@ -126,6 +126,102 @@ export async function GET(req: Request) {
     const findings = runRules(supabaseStorageRpcPack, model, buildGraph(model), { now: NOW });
     expect(findings).toEqual([]);
   });
+
+  it("stays silent for a key minted in the request, and flags the caller-named twin beside it", () => {
+    const dir = tempProject({
+      "lib/supabase.ts": ADMIN_LIB,
+      "app/api/uploads/route.ts": `import { randomUUID } from "node:crypto";
+import { admin, getUserFromRequest } from "@/lib/supabase";
+export async function POST(req: Request) {
+  const user = await getUserFromRequest(req);
+  const form = await req.formData();
+  const todoId = String(form.get("todoId"));
+  const ext = String(form.get("ext")).replace(/[^a-z0-9]/gi, "");
+  if (!/^[0-9a-f-]{36}$/i.test(todoId)) return new Response(null, { status: 400 });
+  const key = \`\${todoId}/\${randomUUID()}.\${ext}\`;
+  await admin().storage.from("attachments").upload(key, new Blob([]));
+  return Response.json({ key, by: user?.id });
+}
+`,
+      "app/api/uploads/[name]/route.ts": `import { randomUUID } from "node:crypto";
+import { admin, getUserFromRequest } from "@/lib/supabase";
+export async function POST(req: Request) {
+  const user = await getUserFromRequest(req);
+  const form = await req.formData();
+  const todoId = String(form.get("todoId"));
+  const name = String(form.get("name"));
+  if (!/^[0-9a-f-]{36}$/i.test(todoId)) return new Response(null, { status: 400 });
+  const key = \`\${todoId}/\${randomUUID()}/\${name}\`;
+  await admin().storage.from("attachments").upload(key, new Blob([]));
+  return Response.json({ key, by: user?.id });
+}
+`,
+    });
+    const model = parseProject(dir);
+    const findings = runRules(supabaseStorageRpcPack, model, buildGraph(model), { now: NOW });
+    // `${name}` after the token can be `../../<victim>/file.pdf`: the fresh folder does not hold it.
+    expect(findings.map((f) => [f.ruleId, f.entrypoints])).toEqual([
+      [storageObjectAccessWithoutOwnerScope.id, ["POST /api/uploads/[name]"]],
+    ]);
+  });
+
+  // Counterexamples of the first review (scratchpad verify-W2/ce/app/api/ce6 and ce7): a minted key
+  // that a destructuring assignment or a `for (key of …)` loop later replaces with the caller's own.
+  const CE_ROUTE = (
+    reassign: string,
+    use: string,
+  ): string => `import { randomUUID } from "node:crypto";
+import { admin, getUserFromRequest } from "@/lib/supabase";
+export async function POST(req: Request) {
+  const user = await getUserFromRequest(req);
+  if (!user) return new Response(null, { status: 401 });
+  const body = await req.json();
+  const folder = String(body.folder);
+  if (!/^[a-z0-9-]+$/.test(folder)) return new Response(null, { status: 400 });
+  let key = \`\${folder}/\${randomUUID()}.pdf\`;
+${reassign}
+${use}
+}
+`;
+  const SIGN = `  const { data } = await admin().storage.from("docs").createSignedUrl(key, 3600);
+  return Response.json({ url: data?.signedUrl, key });`;
+
+  function storageEntries(route: string): string[] {
+    const dir = tempProject({ "lib/supabase.ts": ADMIN_LIB, "app/api/sign/route.ts": route });
+    const model = parseProject(dir);
+    return runRules([storageObjectAccessWithoutOwnerScope], model, buildGraph(model), {
+      now: NOW,
+    }).flatMap((f) => f.entrypoints);
+  }
+
+  it("CE6: flags a minted key replaced by a destructuring assignment", () => {
+    expect(storageEntries(CE_ROUTE("  if (body.path) ({ path: key } = body);", SIGN))).toEqual([
+      "POST /api/sign",
+    ]);
+    expect(storageEntries(CE_ROUTE("  if (body.path) [key] = body.paths;", SIGN))).toEqual([
+      "POST /api/sign",
+    ]);
+    expect(
+      storageEntries(CE_ROUTE('  if (body.path) ({ a: { b: key = "x" } } = body);', SIGN)),
+    ).toEqual(["POST /api/sign"]);
+    // The secure twin: the key is never replaced.
+    expect(storageEntries(CE_ROUTE("", SIGN))).toEqual([]);
+  });
+
+  it("CE7: flags a minted key that a `for (key of …)` loop walks over the caller's list", () => {
+    const loop = (head: string): string =>
+      CE_ROUTE(
+        "",
+        `  const urls: string[] = [];
+  ${head} {
+    const { data } = await admin().storage.from("docs").createSignedUrl(key, 3600);
+    if (data) urls.push(data.signedUrl);
+  }
+  return Response.json({ urls });`,
+      );
+    expect(storageEntries(loop("for (key of [key, ...body.more])"))).toEqual(["POST /api/sign"]);
+    expect(storageEntries(loop("for (key in body.more)"))).toEqual(["POST /api/sign"]);
+  });
 });
 
 describe("supabase.storage-policy-without-owner-check", () => {

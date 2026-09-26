@@ -7,6 +7,7 @@ import {
   qualifiedKey,
   readQualifiedName,
 } from "./sql-columns.js";
+import { paramsReachingExecute } from "./sql-dynamic.js";
 import {
   groupEnd,
   isPunct,
@@ -161,6 +162,57 @@ function initialAcl(reg: FunctionRegistry, schema: string | null): Acl {
 }
 
 /** CREATE [OR REPLACE] FUNCTION. Procedures are not callable through PostgREST and are skipped. */
+const TYPE_ALIASES: Record<string, string> = {
+  int: "integer",
+  int4: "integer",
+  int8: "bigint",
+  int2: "smallint",
+  bool: "boolean",
+  float: "doubleprecision",
+  float8: "doubleprecision",
+  float4: "real",
+  decimal: "numeric",
+  char: "character",
+  varchar: "charactervarying",
+  timestamptz: "timestampwithtimezone",
+  timestamp: "timestampwithouttimezone",
+  timetz: "timewithtimezone",
+};
+
+/** A type as Postgres identifies it in a signature: no modifier, no schema, canonical name, arrays kept. */
+function canonicalType(t: string): string {
+  let k = t.toLowerCase().replace(/["\s]+/g, "");
+  const dims = (k.match(/\[\d*\]/g) ?? []).length;
+  k = k.replace(/\[\d*\]/g, "").replace(/\(.*\)$/, "");
+  k = k.slice(k.lastIndexOf(".") + 1);
+  return (TYPE_ALIASES[k] ?? k) + "[]".repeat(dims);
+}
+
+/** Two argument lists name the same types, as Postgres compares signatures. */
+function sameArgs(a: string | null | undefined, b: string | null): boolean {
+  if (a === undefined) return true;
+  if (a === null || b === null) return false;
+  const norm = (x: string): string => splitTypes(x).map(canonicalType).join(",");
+  return norm(a) === norm(b);
+}
+
+/** Split an argument type list at top-level commas (`numeric(10,2), text`). */
+function splitTypes(x: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of x) {
+    if (ch === "(") depth += 1;
+    if (ch === ")") depth -= 1;
+    if (ch === "," && depth === 0) {
+      out.push(cur);
+      cur = "";
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
 export function applyCreateFunction(reg: FunctionRegistry, stmt: SqlStatement, file: string): void {
   const tk = stmt.tokens;
   let i = 1;
@@ -214,7 +266,13 @@ export function applyCreateFunction(reg: FunctionRegistry, stmt: SqlStatement, f
     params,
     body: code,
     directCheck: CALLER_CHECKS.some((re) => re.test(code)),
-    acl: reg.byKey.get(key)?.acl ?? initialAcl(reg, q.schema),
+    // CREATE OR REPLACE keeps the privileges of the function it replaces, which is the one with the
+    // same argument types; with other types it creates another overload, which starts from the
+    // defaults. The registry keeps one entry per name, so a different or unreadable argument list
+    // takes the defaults rather than a revoke made on another overload.
+    acl: sameArgs(reg.byKey.get(key)?.args, args)
+      ? (reg.byKey.get(key)?.acl ?? initialAcl(reg, q.schema))
+      : initialAcl(reg, q.schema),
     location: { file, line: stmt.line },
   };
   reg.byKey.set(key, fn);
@@ -325,7 +383,8 @@ function readParams(
     for (let i = from; i < to; i++) {
       const t = tokens[i];
       if (!t) continue;
-      if (isWord(t, "default") || (t.kind === "punct" && t.value === "=")) {
+      // The lexer reads `=` as an operator; `default` and `=` both start a default.
+      if (isWord(t, "default") || ((t.kind === "punct" || t.kind === "op") && t.value === "=")) {
         hasDefault = true;
         const last = tokens[to - 1];
         const text = last ? stmt.text.slice(t.end - stmt.start, last.end - stmt.start) : "";
@@ -344,12 +403,16 @@ function readParams(
     }
     // A parameter is `[mode] [name] type`, and only a type name tells the two apart: `p_at
     // timestamp with time zone` has a name, `timestamp with time zone` and `text[]` do not.
+    // `supabase db diff` quotes both: `"p_email" "text"`. A quoted first token followed by `.` is a
+    // schema-qualified type (`"public"."my_type"`), not a name.
     const firstWord = words[k];
+    const isName = (w: Token | undefined): boolean => w?.kind === "word" || w?.kind === "ident";
     const named =
       firstWord !== undefined &&
-      firstWord.kind === "word" &&
-      !TYPE_WORD.has(firstWord.value.toLowerCase()) &&
-      words.slice(k + 1).some((w) => w.kind === "word");
+      isName(firstWord) &&
+      !(firstWord.kind === "word" && TYPE_WORD.has(firstWord.value.toLowerCase())) &&
+      !isPunct(words[k + 1], ".") &&
+      words.slice(k + 1).some(isName);
     const typeStart = named ? k + 1 : k;
     const first = words[typeStart];
     const last = words[words.length - 1];
@@ -678,7 +741,7 @@ function callsWithCallerDefault(
 const RELATION =
   /(?<![A-Za-z0-9_$])(?:from|join)\s+(?:only\s+)?(?:"?([A-Za-z_][A-Za-z0-9_$]{0,62})"?\s*\.\s*)?"?([A-Za-z_][A-Za-z0-9_$]{0,62})"?(?![A-Za-z0-9_$"]|\s*[.(])/gi;
 
-function relationsOf(body: string): string[] {
+export function relationsOf(body: string): string[] {
   const out: string[] = [];
   for (const m of body.matchAll(RELATION)) {
     const schema = m[1]?.toLowerCase();
@@ -712,6 +775,32 @@ function writesOf(body: string): string[] {
     const key = schema === undefined || schema === "public" ? name : `${schema}.${name}`;
     if (!out.includes(key)) out.push(key);
   }
+  return out;
+}
+
+const CHANGE = new RegExp(
+  `(?<![A-Za-z0-9_$])(?:update|delete\\s+from|merge\\s+into|truncate(?:\\s+table)?)\\s+(?:only\\s+)?(?:"?(${IDENT_SRC})"?\\s*\\.\\s*)?"?(${IDENT_SRC})"?(?![A-Za-z0-9_$"]|\\s*\\.)`,
+  "gi",
+);
+
+/**
+ * Dynamic SQL (EXECUTE): what it changes cannot be read off the text, even when no word that changes
+ * rows appears in it (`execute query`, the statement passed in by the caller).
+ */
+const DYNAMIC = /(?<![A-Za-z0-9_$])execute(?![A-Za-z0-9_$])/i;
+
+/** See `SqlFunctionInfo.changes`. Comments go first: `update /* all *\/ t` still names t. */
+export function changesOf(source: string): string[] {
+  const body = source.replace(/\/\*[\s\S]*?\*\/|--[^\n]*/g, " ");
+  const out: string[] = [];
+  for (const m of body.matchAll(CHANGE)) {
+    const schema = m[1]?.toLowerCase();
+    const name = m[2]?.toLowerCase();
+    if (!name || NOT_A_RELATION.has(name)) continue;
+    const key = schema === undefined || schema === "public" ? name : `${schema}.${name}`;
+    if (!out.includes(key)) out.push(key);
+  }
+  if (DYNAMIC.test(body)) out.push("*");
   return out;
 }
 
@@ -896,6 +985,8 @@ export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
         params.map((x) => x.name),
       );
       if (keys.length > 0) info.keys = keys;
+      const injected = paramsReachingExecute(f.body, params);
+      if (injected.length > 0) info.sqlFromParams = injected;
     }
     const tables = relationsOf(f.body);
     if (tables.length > 0) info.tables = tables;
@@ -903,6 +994,8 @@ export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
     if (called.length > 0) info.calls = called;
     const writes = writesOf(f.body);
     if (writes.length > 0) info.writes = writes;
+    const changes = changesOf(f.body);
+    if (changes.length > 0) info.changes = changes;
     return info;
   });
 }

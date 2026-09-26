@@ -22,7 +22,7 @@ describe("audit scan", () => {
       queries: 1,
       tablesKnown: 3,
       tablesWithRls: 3,
-      rules: 15,
+      rules: 17,
     });
     expect(r.findings.map((f) => f.status)).toEqual(["likely"]);
     // A service-role read reached through application code is a lead (ADR-005): the rule rates it

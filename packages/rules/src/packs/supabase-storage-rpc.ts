@@ -118,6 +118,8 @@ export const storageObjectAccessWithoutOwnerScope: Rule = {
       const s: StorageAccess | undefined = r.data.storage;
       if (!s || !bypassesRls(r.clientData?.kind)) continue;
       if (!s.pathInputDerived || s.pathScopedToCaller || !r.authenticated) continue;
+      // A key minted in this request cannot name another user's existing object.
+      if (s.pathServerMinted === true) continue;
       const verb = OP_VERB[s.op] ?? "access";
       const bucket = s.bucket ?? "(dynamic)";
       const client = r.clientData?.name ?? "client";
@@ -569,8 +571,106 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
   },
 };
 
+/**
+ * S4. A function the Data API exposes builds SQL text out of a text parameter and runs it with
+ * EXECUTE (`'... = ''' || p_status || ''''`, `format('%s', p)`, `execute p_sql`), so whoever calls
+ * `supabase.rpc()` or POST /rest/v1/rpc/<fn> writes part of the statement. Under SECURITY DEFINER the
+ * statement runs with the owner's rights and RLS does not apply: critical when anon or PUBLIC can
+ * execute it, high when only signed-in users can. A SECURITY INVOKER function still runs the
+ * caller's SQL, but only with the caller's own grants and under RLS: medium. The parser decides which
+ * parameters count (`SqlFunctionInfo.sqlFromParams`): USING, quote_* and format %L / %I are safe.
+ */
+export const dynamicSqlFromFunctionParameter: Rule = {
+  id: "supabase.dynamic-sql-from-function-parameter",
+  title: "Function builds dynamic SQL from a parameter without quoting",
+  description:
+    "A public-schema function callable through supabase.rpc() glues a text parameter into the SQL it runs with EXECUTE, instead of passing it through USING or quoting it with format %L / %I. The caller can append their own SQL; under SECURITY DEFINER it runs with the owner's rights and skips Row Level Security.",
+  severity: "critical",
+  confidence: 0.8,
+  cwe: ["CWE-89"],
+  evaluate(ctx) {
+    const rpcByName = new Map<string, Reach[]>();
+    for (const r of reaches(ctx)) {
+      if (r.data.operation !== "rpc") continue;
+      const key = r.data.table.toLowerCase();
+      rpcByName.set(key, [...(rpcByName.get(key) ?? []), r]);
+    }
+    const out: Finding[] = [];
+    for (const fn of sqlFunctionsOf(ctx.model)) {
+      const injected = fn.sqlFromParams ?? [];
+      if (injected.length === 0) continue;
+      // Other schemas are not exposed through PostgREST by default; trigger functions cannot be called.
+      if (fn.name.includes(".")) continue;
+      if (fn.returns === "trigger" || fn.returns === "event_trigger") continue;
+      const roles = fn.grantedTo.filter((r) => API_ROLES.has(r));
+      if (roles.length === 0) continue;
+      const anonymous = roles.includes("anon") || roles.includes("public");
+      const severity: Severity = !fn.securityDefiner ? "medium" : anonymous ? "critical" : "high";
+      const sites = rpcByName.get(fn.name) ?? [];
+      const entries = unique(sites.map((s) => s.handlerData.entry));
+      const endpoint = `POST /rest/v1/rpc/${fn.name}`;
+      const params = injected.join(", ");
+      const who = anonymous
+        ? "Anonymous visitors can call it with the public anon key"
+        : "Any signed-in user can call it";
+      const rights = fn.securityDefiner
+        ? "The function is SECURITY DEFINER, so the injected SQL runs with its owner's rights and Row Level Security does not apply: every row the owner can read or change is exposed."
+        : "The function is SECURITY INVOKER, so the injected SQL runs with the caller's own grants and Row Level Security still applies; it still lets the caller run statements the Data API would not, such as reading other tables through UNION or calling any function they may execute.";
+      const callNote =
+        entries.length > 0
+          ? ` The app calls it with supabase.rpc("${fn.name}") from ${entries.join(", ")}.`
+          : "";
+      const path = [
+        entries[0] ?? endpoint,
+        `supabase.rpc("${fn.name}") (EXECUTE: ${roles.join(", ")})`,
+        `public.${fn.name}() ${fn.securityDefiner ? "SECURITY DEFINER" : "SECURITY INVOKER"}`,
+        `EXECUTE with ${params} glued into the statement text`,
+      ];
+      out.push(
+        finding(
+          ctx,
+          this,
+          {
+            title: `SQL injection through ${injected.length > 1 ? "parameters" : "parameter"} ${injected.map((p) => `"${p}"`).join(", ")} of "${fn.name}"`,
+            entrypoints: [...entries, endpoint],
+            sources: unique([
+              ...sites.flatMap((s) => s.inputs.map((i) => `${i.kind}:${i.name}`)),
+              "rpc arguments",
+            ]),
+            sinks: [`postgres.execute:public.${fn.name}`],
+            path,
+            evidence: [
+              {
+                kind: "rule",
+                summary: `public.${fn.name}() puts ${params} into the text of a statement it runs with EXECUTE, without USING, quote_literal / quote_ident or format %L / %I. A caller who sends a quote in ${injected.length > 1 ? "one of them" : "it"} ends the literal and appends their own SQL. ${rights} ${who} at ${endpoint}.${callNote} Pass values with EXECUTE ... USING $1, quote dynamic identifiers with format('%I'), or check them against a fixed list before building the statement.`,
+                locations: locations(
+                  fn.location,
+                  ...sites.flatMap((s) => [s.handler.location, s.query.location]),
+                ),
+                data: {
+                  deterministic: false,
+                  ruleId: this.id,
+                  function: fn.name,
+                  ...(fn.identity !== undefined ? { identity: fn.identity } : {}),
+                  parameters: [...injected],
+                  securityDefiner: fn.securityDefiner,
+                  grantedTo: [...fn.grantedTo],
+                },
+              },
+              { kind: "trace", summary: path.join(" -> ") },
+            ],
+          },
+          severity,
+        ),
+      );
+    }
+    return out;
+  },
+};
+
 export const supabaseStorageRpcPack: readonly Rule[] = [
   storageObjectAccessWithoutOwnerScope,
   storagePolicyWithoutOwnerCheck,
   securityDefinerFunctionWithoutCallerCheck,
+  dynamicSqlFromFunctionParameter,
 ];

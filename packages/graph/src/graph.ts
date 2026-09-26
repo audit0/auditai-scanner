@@ -140,6 +140,8 @@ export interface HandlerNodeData {
   roleChecks: RoleCheck[];
   /** Calls to the Auth admin API, which no policy constrains. Absent in older models. */
   adminApiCalls?: AdminApiCall[];
+  /** The handler returns first thing in a production build: a development-only route. */
+  productionExit?: FileRef;
 }
 
 export interface TableNodeData {
@@ -210,6 +212,7 @@ export function buildGraph(model: ProjectModel): SecurityGraph {
       metadataAccesses: h.metadataAccesses,
       roleChecks: h.roleChecks ?? [],
       ...(h.adminApiCalls ? { adminApiCalls: h.adminApiCalls } : {}),
+      ...(h.productionExit ? { productionExit: h.productionExit } : {}),
     };
     const handler = g.addNode({
       id: `handler:${h.location.file}:${h.location.line}`,

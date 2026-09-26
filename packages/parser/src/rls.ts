@@ -1,11 +1,19 @@
 import type { PolicyCommand, RlsTable } from "./model.js";
 import { qualifiedKey } from "./sql-columns.js";
-import { expandDoBlock } from "./sql-do-loops.js";
+import {
+  expandDoBlock,
+  type FunctionSweep,
+  grantsInDoBlock,
+  renderFunctionSweep,
+  sweepSignature,
+} from "./sql-do-loops.js";
 import { isWord, type SqlStatement, splitSqlStatements } from "./sql-lexer.js";
 import {
   applySchemaStatement,
   ensureTable,
   finishSchema,
+  markUnreadPolicies,
+  noteApiSettings,
   type SqlSchemaExtras,
   type SqlSchemaState,
   schemaStateFor,
@@ -120,14 +128,74 @@ export function appliedSqlFiles(rels: readonly string[]): string[] {
 export function parseSqlForRls(rel: string, text: string, into: Map<string, RlsTable>): void {
   if (!isAppliedSqlFile(rel)) return;
   const state = schemaStateFor(into);
+  noteApiSettings(state, text);
   for (const stmt of splitSqlStatements(text)) {
     applyStatement(state, stmt, rel);
+    // A function or procedure that creates, alters or drops a policy when a later statement calls it
+    // (arco, fifth blind sample): the parser does not run it, so what it names is not concluded from.
+    if (
+      (isWord(stmt.tokens[0], "create") || isWord(stmt.tokens[0], "alter")) &&
+      /\b(?:function|procedure)\b/i.test(stmt.text.slice(0, 200)) &&
+      /\b(?:create|alter|drop)\s+policy\b/i.test(stmt.text)
+    )
+      markUnreadPolicies(state, stmt.text);
     if (!isWord(stmt.tokens[0], "do")) continue;
     // `foreach t in array array['a', 'b'] loop execute format('alter table %I ...', t)`: the loop
     // is unrolled and each expanded statement applied like a top-level one.
     const expanded = expandDoBlock(stmt);
-    for (const s of expanded.statements) applyStatement(state, s, rel);
+    const sweeps = expanded.functionSweeps;
+    expanded.statements.forEach((s, i) => {
+      for (const sweep of sweeps)
+        if (sweep.before === i) runFunctionSweep(state, sweep, stmt.line, rel);
+      applyStatement(state, s, rel);
+    });
+    for (const sweep of sweeps)
+      if (sweep.before >= expanded.statements.length)
+        runFunctionSweep(state, sweep, stmt.line, rel);
+    for (const g of grantsInDoBlock(stmt)) applyStatement(state, g, rel);
     if (expanded.dynamic) warnDynamicSql(state, rel);
+    // Policies a DO block creates or drops under a condition are not in the model: what it names
+    // cannot be concluded from a policy's absence.
+    markUnreadPolicies(state, stmt.text);
+  }
+}
+
+/**
+ * A loop over `pg_proc` that grants or revokes on every SECURITY DEFINER function of a schema: run
+ * against the functions the model knows at this point. A function created later is not touched, as
+ * in Postgres.
+ */
+function runFunctionSweep(
+  state: SqlSchemaState,
+  sweep: FunctionSweep,
+  line: number,
+  rel: string,
+): void {
+  // Only migrations the Supabase CLI applies in order have a known place in the history: SQL run by
+  // hand (outside supabase/migrations, or without a version prefix) is read first here but may have
+  // run after the loop, so neither a loop in such a file nor a function defined there is swept.
+  const dirOf = (file: string): string =>
+    file
+      .split("\\")
+      .join("/")
+      .replace(/\/[^/]*$/, "");
+  const inOrder = (file: string): boolean => CLI_MIGRATION.test(file.split("\\").join("/"));
+  if (!inOrder(rel)) return;
+  const targets = [...state.functions.byKey.values()].filter(
+    (fn) =>
+      fn.securityDefiner &&
+      (fn.schema ?? "public") === sweep.schema &&
+      inOrder(fn.location.file) &&
+      // Another supabase/migrations folder (a monorepo) is another database.
+      dirOf(fn.location.file) === dirOf(rel),
+  );
+  for (const fn of targets) {
+    const statements = renderFunctionSweep(
+      sweep,
+      sweepSignature(fn.schema ?? "public", fn.name, fn.args),
+      line,
+    );
+    for (const s of statements ?? []) applyStatement(state, s, rel);
   }
 }
 
@@ -150,6 +218,11 @@ function headEnd(rest: string): number {
 
 /** CREATE POLICY goes to the table's policy list; everything else to the schema handlers. */
 function applyStatement(state: SqlSchemaState, stmt: SqlStatement, rel: string): void {
+  // ALTER POLICY (new roles, a new USING, a new name) is not applied to the model.
+  if (/^\s*alter\s+policy\b/i.test(stmt.text)) {
+    markUnreadPolicies(state, stmt.text);
+    return;
+  }
   const cp = CREATE_POLICY.exec(stmt.text);
   if (!cp?.[1] || !cp[4]) {
     dropPolicy(state, stmt) || applySchemaStatement(state, stmt, rel);

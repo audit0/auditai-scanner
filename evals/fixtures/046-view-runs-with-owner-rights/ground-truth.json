@@ -1,0 +1,35 @@
+{
+  "id": "046-view-runs-with-owner-rights",
+  "vulnerabilityExists": true,
+  "class": [
+    "authorization",
+    "rls",
+    "configuration"
+  ],
+  "cwe": [
+    "CWE-284",
+    "CWE-862"
+  ],
+  "severity": "high",
+  "vulnerablePath": [
+    "Anyone holding the public anon key",
+    "PostgREST",
+    "public.invoice_totals: a view without security_invoker, run as postgres",
+    "every tenant's invoice total, whatever the policy on invoices says"
+  ],
+  "expectedSecureBehavior": "`with (security_invoker = on)` on the view, so the caller's policies apply inside it and a tenant sees only its own total.",
+  "acceptableFixes": [
+    "Set security_invoker on the view",
+    "Revoke select on the view from anon and authenticated if only the server reads it"
+  ],
+  "unacceptableFixes": [
+    "Filtering in the application while the view stays selectable through the Data API",
+    "Dropping row level security on the table"
+  ],
+  "stack": [
+    "nextjs-app-router",
+    "supabase",
+    "typescript",
+    "postgresql"
+  ]
+}

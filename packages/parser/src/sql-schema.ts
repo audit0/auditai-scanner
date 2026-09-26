@@ -23,6 +23,7 @@ import {
   finishFunctions,
   functionBodyOf,
   newFunctionRegistry,
+  relationsOf,
 } from "./sql-functions.js";
 import {
   findWord,
@@ -81,6 +82,17 @@ export interface SqlSchemaState {
   triggers: Map<string, TriggerState>;
   /** Parser warnings for the model, e.g. a DO block with dynamic SQL; one per file and cause. */
   warnings: string[];
+  /**
+   * The migrations switch safeupdate off somewhere (any role or level, in a DO block too), or set a
+   * PostgREST pre-request function, which can switch it off for each request. Once seen, it stays:
+   * which setting Postgres applies after resets and wrappers is not worked out here, so no mention of
+   * it can make the Data API look stricter than it may be.
+   */
+  apiRole: { safeupdateOff: boolean; preRequest: boolean };
+  /** Tables a policy statement the parser does not evaluate names (see `RlsTable.policiesUnread`). */
+  unreadPolicies: Set<string>;
+  /** A DO block changes policies with dynamic SQL: no table's policy list can be trusted as complete. */
+  dynamicPolicies: boolean;
 }
 
 export interface SqlSchemaExtras {
@@ -89,6 +101,10 @@ export interface SqlSchemaExtras {
   storageBuckets: StorageBucket[];
   triggers: SqlTrigger[];
   warnings: string[];
+  /** False when the migrations switch safeupdate off for the Data API; absent otherwise. */
+  dataApiRefusesUnfilteredWrites?: false;
+  /** See `ProjectModel.policiesUnread`. */
+  policiesUnread?: true;
 }
 
 /** Side state per table map, so `parseSqlForRls(rel, text, into)` keeps its signature across files. */
@@ -106,6 +122,9 @@ export function schemaStateFor(tables: Map<string, RlsTable>): SqlSchemaState {
       buckets: newBucketRegistry(),
       triggers: new Map(),
       warnings: [],
+      apiRole: { safeupdateOff: false, preRequest: false },
+      unreadPolicies: new Set(),
+      dynamicPolicies: false,
     };
     STATES.set(tables, state);
   }
@@ -514,6 +533,106 @@ function alterTable(
   }
 }
 
+/** The words Postgres reads as true for a boolean option, unique prefixes included. */
+const OPTION_ON = /^(t|tr|tru|true|on|y|ye|yes|1)$/i;
+
+/**
+ * `security_invoker` inside a `with (...)` option list of CREATE VIEW or ALTER VIEW ... SET: true,
+ * false, or undefined when the option is not there. `security_invoker` alone means on.
+ */
+function securityInvokerOption(inner: readonly Token[]): boolean | undefined {
+  let out: boolean | undefined;
+  for (const part of splitTopLevelTokens(inner)) {
+    const name = identOf(part[0]);
+    if (name === null || name.toLowerCase() !== "security_invoker") continue;
+    // `=` is an operator token, not punctuation.
+    if (part[1]?.value !== "=") {
+      out = true;
+      continue;
+    }
+    const v = part[2];
+    out = v !== undefined && OPTION_ON.test(v.value);
+  }
+  return out;
+}
+
+/**
+ * CREATE [OR REPLACE] [MATERIALIZED | RECURSIVE] VIEW [IF NOT EXISTS] name [(cols)] [WITH (opts)] AS
+ * query. A view is a relation the Data API serves like a table, so it lives in the same map with
+ * `kind` set; what it selects from and whether it runs with the caller's rights are what
+ * view-runs-with-owner-rights judges. A temporary view lives in one session and is skipped.
+ */
+function createView(state: SqlSchemaState, stmt: SqlStatement, file: string): void {
+  const tk = stmt.tokens;
+  let i = 1;
+  if (isWord(tk[i], "or") && isWord(tk[i + 1], "replace")) i += 2;
+  if (isWord(tk[i], "temp") || isWord(tk[i], "temporary")) return;
+  let kind: "view" | "matview" = "view";
+  if (isWord(tk[i], "materialized")) {
+    kind = "matview";
+    i += 1;
+  }
+  if (isWord(tk[i], "recursive")) i += 1;
+  if (!isWord(tk[i], "view")) return;
+  i += 1;
+  if (isWord(tk[i], "if") && isWord(tk[i + 1], "not") && isWord(tk[i + 2], "exists")) i += 3;
+  const q = readQualifiedName(tk, i);
+  if (!q) return;
+  const key = qualifiedKey(q);
+  const t = ensureTable(state, key, file, stmt.line);
+  t.location = { file, line: stmt.line };
+  const exact = qualifiedExact(q);
+  if (exact !== key) t.sqlName = exact;
+  else delete t.sqlName;
+  t.kind = kind;
+  i = q.next;
+  if (isPunct(tk[i], "(")) i = groupEnd(tk, i) + 1;
+  let invoker = false;
+  if (isWord(tk[i], "with") && isPunct(tk[i + 1], "(")) {
+    invoker = securityInvokerOption(groupInner(tk, i + 1)) ?? false;
+    i = groupEnd(tk, i + 1) + 1;
+  }
+  // A materialized view is a stored copy: whoever may select it reads what the owner saw.
+  t.viewSecurityInvoker = kind === "view" ? invoker : false;
+  const as = findWord(tk, i, "as");
+  const body = as >= 0 ? stmt.text.slice((tk[as]?.end ?? stmt.start) - stmt.start) : "";
+  t.viewSources = relationsOf(body).filter((r) => r !== key);
+}
+
+/** ALTER [MATERIALIZED] VIEW [IF EXISTS] name SET (security_invoker = on) | RESET (security_invoker). */
+function alterView(state: SqlSchemaState, stmt: SqlStatement): void {
+  const tk = stmt.tokens;
+  let i = 2;
+  if (isWord(tk[1], "materialized")) i += 1;
+  if (isWord(tk[i], "if") && isWord(tk[i + 1], "exists")) i += 2;
+  const q = readQualifiedName(tk, i);
+  if (!q) return;
+  const t = state.tables.get(qualifiedKey(q));
+  if (t?.kind !== "view") return;
+  i = q.next;
+  if (isWord(tk[i], "set") && isPunct(tk[i + 1], "(")) {
+    const v = securityInvokerOption(groupInner(tk, i + 1));
+    if (v !== undefined) t.viewSecurityInvoker = v;
+  } else if (isWord(tk[i], "reset") && isPunct(tk[i + 1], "(")) {
+    if (securityInvokerOption(groupInner(tk, i + 1)) !== undefined) t.viewSecurityInvoker = false;
+  }
+}
+
+/** DROP [MATERIALIZED] VIEW [IF EXISTS] a, b [CASCADE]. */
+function dropView(state: SqlSchemaState, stmt: SqlStatement): void {
+  const tk = stmt.tokens;
+  let i = 2;
+  if (isWord(tk[1], "materialized")) i += 1;
+  if (isWord(tk[i], "if") && isWord(tk[i + 1], "exists")) i += 2;
+  for (const part of splitTopLevelTokens(tk.slice(i))) {
+    const q = readQualifiedName(part, 0);
+    if (!q) continue;
+    const key = qualifiedKey(q);
+    if (state.tables.get(key)?.kind === undefined) continue;
+    state.tables.delete(key);
+  }
+}
+
 function dropTable(state: SqlSchemaState, stmt: SqlStatement): void {
   const tk = stmt.tokens;
   let i = 2;
@@ -784,17 +903,27 @@ export function applySchemaStatement(
   if (w0 === "create") {
     const kind = w1 === "or" && isWord(tk[2], "replace") ? (tk[3]?.value ?? "") : w1;
     if (kind === "table" || kind === "unlogged") createTable(state, stmt, file);
+    else if (
+      kind === "view" ||
+      kind === "materialized" ||
+      kind === "recursive" ||
+      kind === "temp" ||
+      kind === "temporary"
+    )
+      createView(state, stmt, file);
     else if (kind === "type") createType(state, stmt);
     else if (kind === "function") applyCreateFunction(state.functions, stmt, file);
     else if (kind === "unique") createUniqueIndex(state, stmt);
     else if (kind === "trigger" || kind === "constraint") createTrigger(state, stmt, file);
   } else if (w0 === "alter") {
     if (w1 === "table") alterTable(state, stmt, file, false);
+    else if (w1 === "view" || w1 === "materialized") alterView(state, stmt);
     else if (w1 === "type") alterType(state, stmt);
     else if (w1 === "function" || w1 === "routine") applyAlterFunction(state.functions, stmt);
     else if (w1 === "default") applyDefaultPrivileges(state.functions, stmt);
   } else if (w0 === "drop") {
     if (w1 === "table") dropTable(state, stmt);
+    else if (w1 === "view" || w1 === "materialized") dropView(state, stmt);
     else if (w1 === "type") dropType(state, stmt);
     else if (w1 === "function" || w1 === "routine") applyDropFunction(state.functions, stmt);
     else if (w1 === "trigger") dropTrigger(state, stmt);
@@ -807,8 +936,78 @@ export function applySchemaStatement(
   }
 }
 
+/** `safeupdate.enabled = off`, `"safeupdate"."enabled" to 'false'`, `... from current`. */
+const SAFEUPDATE_SET =
+  /\bsafeupdate"?\s*\.\s*"?enabled"?\s*(?:(?:=|\bto\b)\s*['"]?([A-Za-z0-9]+)|\bfrom\s+current\b)/gi;
+const PRELOAD_SET = /\bsession_preload_libraries"?\s*(?:=|\bto\b)\s*([^;]*)/gi;
+const PRE_REQUEST_SET = /\bdb_pre_request"?\s*(?:=|\bto\b)\s*['"]?([^'"\s;]*)/gi;
+
+/** Postgres reads these as false for a boolean setting, unique prefixes included. */
+const SETTING_OFF = /^(?:f|fa|fal|fals|false|n|no|of|off|0)$/i;
+
+/**
+ * Reads one applied SQL file for settings that switch safeupdate off for the Data API (see
+ * `SqlSchemaState.apiRole`). The owner can run `alter role authenticator set safeupdate.enabled = off`
+ * on hosted Supabase (measured 24 September 2026); comments do not count.
+ */
+export function noteApiSettings(state: SqlSchemaState, text: string): void {
+  const code = text.replace(/\/\*[\s\S]*?\*\/|--[^\n]*/g, " ");
+  for (const m of code.matchAll(SAFEUPDATE_SET)) {
+    // `from current` copies whatever the session had, which is how it is switched off in two steps.
+    if (m[1] === undefined || SETTING_OFF.test(m[1])) state.apiRole.safeupdateOff = true;
+  }
+  for (const m of code.matchAll(PRE_REQUEST_SET)) if (m[1]) state.apiRole.preRequest = true;
+  // A preload list set without safeupdate (a superuser can, on a self-hosted project).
+  for (const m of code.matchAll(PRELOAD_SET))
+    if (!/safeupdate/i.test(m[1] ?? "")) state.apiRole.safeupdateOff = true;
+}
+
+/** CREATE, ALTER or DROP POLICY ... ON <table>, wherever it appears in a statement's text. */
+const POLICY_STATEMENT =
+  /\b(?:create|alter|drop)\s+policy\s+(?:if\s+exists\s+)?(?:"(?:[^"]|"")*"|[^\s"]+)\s+on\s+(?:only\s+)?((?:"[^"]+"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][\w$]*))?(?![\w$".%]))?/gi;
+
+/**
+ * A statement whose policy changes the parser does not evaluate (a DO block, ALTER POLICY): the tables
+ * it names get `policiesUnread`, and one whose table is not a literal (`on %I`, `on ' || t`) makes
+ * every table unread.
+ */
+export function markUnreadPolicies(state: SqlSchemaState, source: string): void {
+  // Comments inside a dollar-quoted body are still text here: `create policy "x" -- note` + `on t`.
+  const text = source.replace(/\/\*[\s\S]*?\*\/|--[^\n]*/g, " ");
+  const mentions = text.match(/\b(?:create|alter|drop)\s+policy\b/gi)?.length ?? 0;
+  let placed = 0;
+  for (const m of text.matchAll(POLICY_STATEMENT)) {
+    const rel = m[1];
+    if (!rel) {
+      state.dynamicPolicies = true;
+      continue;
+    }
+    placed++;
+    const parts = rel.split(".").map((x) => x.trim().replace(/^"|"$/g, ""));
+    const [a, b] = parts;
+    const key = qualifiedKey(
+      b === undefined ? { schema: null, name: a ?? "" } : { schema: a ?? null, name: b },
+    );
+    state.unreadPolicies.add(key);
+    // On the table itself too, so a later rename carries it.
+    const t = state.tables.get(key);
+    if (t) t.policiesUnread = true;
+  }
+  // A policy statement whose table could not be read (`'create policy ' || name || ' on t'`).
+  if (placed < mentions) state.dynamicPolicies = true;
+}
+
 export function finishSchema(state: SqlSchemaState): SqlSchemaExtras {
+  const api = state.apiRole;
+  for (const key of state.unreadPolicies) {
+    const t = state.tables.get(key);
+    if (t) t.policiesUnread = true;
+  }
   return {
+    ...(api.safeupdateOff || api.preRequest
+      ? { dataApiRefusesUnfilteredWrites: false as const }
+      : {}),
+    ...(state.dynamicPolicies ? { policiesUnread: true as const } : {}),
     // fromEntries defines own properties, so a hostile type name like "__proto__" stays a plain key.
     enums: Object.fromEntries([...state.enums].map(([k, v]) => [k, [...v]])),
     sqlFunctions: finishFunctions(state.functions),

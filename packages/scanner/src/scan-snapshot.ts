@@ -92,7 +92,7 @@ export type SnapshotScanOutcome =
 const LIMITS = [
   "Application code was not read: the entry points here are the Data API endpoints your database serves, so nothing is said about service-role queries, missing authentication or mass assignment in your own routes.",
   "A clean result means the database refuses the accesses these rules test, not that the application is safe.",
-  "Views, materialized views and foreign tables are not judged: row level security does not apply to them, and whether a view runs with its owner's rights is not checked yet.",
+  "A view that runs with its owner's rights over a table with row level security is a lead, not a headline: a view is often meant to publish a subset, and you decide. Foreign tables are not judged.",
 ];
 
 /**
@@ -190,6 +190,10 @@ export function scanSnapshot(
     warnings: snap.notes,
     sqlFunctions: snap.sqlFunctions,
     storageBuckets: snap.storageBuckets,
+    fromLiveDatabase: true,
+    ...(snap.dataApiRefusesUnfilteredWrites === undefined
+      ? {}
+      : { dataApiRefusesUnfilteredWrites: snap.dataApiRefusesUnfilteredWrites }),
   };
   const graph = buildGraph(model);
   const publicTables = opts.publicTables ?? [];

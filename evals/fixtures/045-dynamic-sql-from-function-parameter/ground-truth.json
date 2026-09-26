@@ -1,0 +1,25 @@
+{
+  "id": "045-dynamic-sql-from-function-parameter",
+  "vulnerabilityExists": true,
+  "class": ["injection", "sql-injection", "security-definer", "rls-bypass", "multi-tenancy"],
+  "cwe": ["CWE-89"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "postgresql", "typescript"],
+  "vulnerablePath": [
+    "POST /rest/v1/rpc/search_invoices with the public anon key (or GET /api/invoices/search?q=...)",
+    "p_customer (caller-controlled text)",
+    "public.search_invoices() glues p_customer into the statement text and runs it with RETURN QUERY EXECUTE",
+    "SECURITY DEFINER: the invoice policies do not apply, so `%' or true --` drops the tenant filter",
+    "EXECUTE granted to anon"
+  ],
+  "expectedSecureBehavior": "The search text only ever matches customer names: a quote in it is a literal character, anonymous callers are refused, and no search returns another tenant's invoices.",
+  "acceptableFixes": [
+    "Pass the search text with EXECUTE ... USING (or write the query without EXECUTE), with SECURITY INVOKER so the invoice policies still apply",
+    "Quote the value with format('%L') or quote_literal() and keep the tenant filter; revoke EXECUTE from anon"
+  ],
+  "unacceptableFixes": [
+    "Stripping or escaping quotes in the route handler while the function stays callable straight through PostgREST",
+    "Revoking anon only: any signed-in user can still read every tenant's invoices with the same input",
+    "Switching to SECURITY INVOKER while still gluing the text in: RLS then limits the damage, but the caller still writes the SQL"
+  ]
+}

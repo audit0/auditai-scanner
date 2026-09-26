@@ -150,6 +150,29 @@ describe("scanSnapshot", () => {
     expect(fix).not.toContain("p_id bigint");
   });
 
+  it("reports a definer function that glues a text parameter into EXECUTE", () => {
+    const findings = reported(
+      snapshot({
+        functions: [
+          {
+            schema: "public",
+            name: "run_report",
+            securityDefiner: true,
+            returns: "SETOF record",
+            arguments: "p_filter text",
+            body: "begin return query execute 'select * from reports where owner = auth.uid() and ' || p_filter; end",
+            readsCaller: true,
+            executeGrants: ["authenticated"],
+          },
+        ],
+      }),
+    );
+    // It reads auth.uid(), so S3 is silent; the caller still writes the rest of the WHERE clause.
+    expect(findings.map((f) => [f.ruleId, f.ruleSeverity ?? f.severity])).toEqual([
+      ["supabase.dynamic-sql-from-function-parameter", "high"],
+    ]);
+  });
+
   it("prints database text so it cannot forge a line or drive the terminal", () => {
     const esc = String.fromCharCode(27);
     const forged = {
@@ -285,9 +308,12 @@ describe("the query the user runs", () => {
       "aclexplode(coalesce(pr.proacl, acldefault('f', pr.proowner)))",
     );
     // The whole promise on the page rests on this: a select, and nothing that changes anything.
+    // String literals are patterns the query matches text against (`'\\m(?:update|delete...'`), not
+    // statements, so they are left out before looking for a statement word.
     const code = SNAPSHOT_QUERY.split("\n")
       .filter((l) => !l.trim().startsWith("--"))
       .join("\n")
+      .replace(/'(?:[^']|'')*'/g, "''")
       .toLowerCase();
     expect(code.trim().startsWith("select")).toBe(true);
     for (const verb of [
@@ -306,9 +332,11 @@ describe("the query the user runs", () => {
       "call",
     ])
       expect(code, verb).not.toMatch(new RegExp(`\\b${verb}\\b`));
-    // Function source travels only for SECURITY DEFINER functions.
+    // Function source travels only for SECURITY DEFINER functions; for the rest, the names of the
+    // tables they change, read off the definition inside the database.
     expect(SNAPSHOT_QUERY).toContain(
       "case when pr.prosecdef then left(coalesce(pr.prosrc, ''), 8000) else null end",
     );
+    expect(SNAPSHOT_QUERY).not.toMatch(/'def'|'definition'/);
   });
 });

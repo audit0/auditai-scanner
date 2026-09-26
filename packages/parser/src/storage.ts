@@ -214,13 +214,18 @@ function splitHead(e: ts.Expression): string | null {
   return ts.isIdentifier(target) ? target.text : null;
 }
 
-/** Describes the object path(s) of a storage call: where they come from and whether they are tied to the caller. */
+/**
+ * Describes the object path(s) of a storage call: where they come from, whether they are tied to the
+ * caller, and whether every user-controlled one is a key minted in this request (`fresh`, see
+ * fresh-keys.ts).
+ */
 export function storageAccessOf(
   op: ChainSegment,
   bucket: string | null,
   sf: ts.SourceFile,
   scope: CallerScope,
   derived: (e: ts.Expression) => boolean,
+  fresh: (e: ts.Expression) => boolean,
 ): StorageAccess {
   const pathArgs = op.args.slice(0, TWO_PATHS.has(op.name) ? 2 : 1);
   // Array literals (`remove([a, b])`) are judged element by element.
@@ -230,6 +235,7 @@ export function storageAccessOf(
   });
   const tainted = parts.filter((p) => derived(p));
   const judged = tainted.length > 0 ? tainted : parts;
+  const minted = tainted.length > 0 && tainted.every((p) => fresh(p));
   return {
     bucket,
     op: op.name,
@@ -240,5 +246,6 @@ export function storageAccessOf(
       .slice(0, 200),
     pathInputDerived: tainted.length > 0,
     pathScopedToCaller: judged.length > 0 && judged.every((p) => scope.covers(p)),
+    ...(minted ? { pathServerMinted: true } : {}),
   };
 }

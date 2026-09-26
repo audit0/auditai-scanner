@@ -11,6 +11,7 @@ import {
   exportedFunctions,
   type FunctionLike,
   flattenChain,
+  identifiersIn,
   isChainTail,
   isFunctionLikeNode,
   lineOf,
@@ -22,8 +23,14 @@ import {
   walk,
   walkOwn,
 } from "./ast.js";
-import { isCredentialColumn, isSessionProviderImport, secretChecksIn } from "./auth-evidence.js";
+import {
+  isCredentialColumn,
+  isSessionProviderImport,
+  secretChecksIn,
+  webauthnChecksIn,
+} from "./auth-evidence.js";
 import { discoverFiles } from "./discover.js";
+import { type Binding, isFreshKey, type KeyContext, reassignedIn } from "./fresh-keys.js";
 import {
   callResultChecked,
   checkedResultExit,
@@ -78,6 +85,7 @@ import {
   parsePrismaSchema,
   prismaWhereFilters,
 } from "./orm.js";
+import { productionExitOf } from "./production-exit.js";
 import { Resolver } from "./resolve.js";
 import { appliedSqlFiles, parseSqlForRls, sqlSchemaFor } from "./rls.js";
 import { roleGatesIn, sessionNamesIn } from "./role-gates.js";
@@ -181,6 +189,8 @@ interface Project {
   returnTaints: Map<string, ReturnTaint | null>;
   /** Memo of returnIdentity: `false` when the helper returns something other than an identity. */
   returnIdentities: Map<string, { who: string | null } | false>;
+  /** Memo of returnFresh by helper and bindings; null marks a helper being analysed (recursion). */
+  returnFreshKeys: Map<string, boolean | null>;
   /** Tables from the migrations, for foreign keys between a guard read and the row it guards. */
   tables: ReadonlyMap<string, RlsTable>;
   warnings: string[];
@@ -215,11 +225,18 @@ interface Frame {
   /** A `return` in this frame ends the entry point: every call site up to it checks the result. */
   exitPropagates: boolean;
   /**
+   * This frame runs on every request: each call from the entry point down to it is a statement of
+   * its caller's body, under no condition, loop or `try`.
+   */
+  unconditional: boolean;
+  /**
    * Identifiers holding the caller's identity or a row it selected: the session user (null), the
    * account a request credential looked up or a row filtered by an identity (its table), a part of
    * such a row (""). See identityOf.
    */
   identities: Map<string, string | null>;
+  /** Parameters the caller bound to a storage key minted in this request (see fresh-keys.ts). */
+  fresh: Set<string>;
 }
 
 /** A query as a possible guard: the value keys of its filters, its place in the call order, its stop. */
@@ -1248,8 +1265,13 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       payload: null,
       location: loc(op.node),
       text: call.getText(sf).replace(/\s+/g, " ").slice(0, 200),
-      storage: storageAccessOf(op, bucketName(st.bucketArg, sf), sf, callerScope, (e) =>
-        derivedIn(frame, e),
+      storage: storageAccessOf(
+        op,
+        bucketName(st.bucketArg, sf),
+        sf,
+        callerScope,
+        (e) => derivedIn(frame, e),
+        (e) => freshIn(p, frame, scope, e, 0),
       ),
     };
     if (frame.via.length > 0) query.via = frame.via;
@@ -1485,6 +1507,23 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     }
   }
 
+  // A passkey assertion verified against the credential's stored public key, gating the request. It
+  // decides every request only in a frame every request runs (review cx14: a helper called under
+  // `if (body.strict)` is not), and the key must be one of the rows this frame read, not something
+  // the request sends (cx14d: the caller would sign with a key of their own).
+  if (frame.unconditional) {
+    const rows = new Set<string>();
+    for (const r of acc.reads) if (r.frame === frame.key) for (const n of r.rows) rows.add(n);
+    const storedKey = (key: ts.Expression): boolean =>
+      !derivedIn(frame, key) && [...identifiersIn(key)].some((n) => rows.has(n));
+    for (const call of webauthnChecksIn(fn, frame.facts.imports, {
+      returnEndsRequest: frame.exitPropagates,
+      storedKey,
+    })) {
+      acc.authChecks.push({ ...loc(call), kind: "credential" });
+    }
+  }
+
   // Follow calls into helpers, services and methods of this repository.
   if (frame.depth >= MAX_DEPTH) return;
   for (const call of collect(body, ts.isCallExpression)) {
@@ -1492,6 +1531,7 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
     if (!target) continue;
     const child = childFrame(p, call, target, frame);
     if (!child) continue;
+    bindFreshParams(p, call, target, frame, scope, child, true, 0);
     // Same helper, same bindings: analysed once per handler.
     const key = `${target.facts.file}#${target.name}#${frameSignature(child)}`;
     if (acc.visited.has(key)) continue;
@@ -1832,6 +1872,41 @@ function membershipChecks(
   }
 }
 
+/**
+ * The call is a statement of the function's own body, awaited or not, bare, bound to a name,
+ * returned or tested by an `if` of the body (`if (!(await check())) return 401`): it runs whenever
+ * the body gets that far, under no condition, short circuit, loop or `try`.
+ */
+function isBodyStatementCall(call: ts.CallExpression, fn: FunctionLike): boolean {
+  const body = fn.body;
+  if (!body || !ts.isBlock(body)) return false;
+  let cur: ts.Node = call;
+  while (
+    ts.isAwaitExpression(cur.parent) ||
+    ts.isParenthesizedExpression(cur.parent) ||
+    ts.isNonNullExpression(cur.parent) ||
+    ts.isAsExpression(cur.parent) ||
+    ts.isSatisfiesExpression(cur.parent) ||
+    (ts.isPrefixUnaryExpression(cur.parent) &&
+      cur.parent.operator === ts.SyntaxKind.ExclamationToken)
+  ) {
+    cur = cur.parent;
+  }
+  const p = cur.parent;
+  let stmt: ts.Node | null = null;
+  if (ts.isExpressionStatement(p) || ts.isReturnStatement(p)) stmt = p;
+  else if (ts.isIfStatement(p) && p.expression === cur) stmt = p;
+  else if (
+    ts.isVariableDeclaration(p) &&
+    p.initializer === cur &&
+    ts.isVariableDeclarationList(p.parent) &&
+    ts.isVariableStatement(p.parent.parent)
+  ) {
+    stmt = p.parent.parent;
+  }
+  return stmt !== null && stmt.parent === body;
+}
+
 /** The callee's frame for one call site: parameters bound to what the caller passes. */
 function childFrame(
   p: Project,
@@ -1860,7 +1935,9 @@ function childFrame(
     aliases: new Map(),
     pathPos: [...frame.pathPos, call.getStart(frame.sf)],
     exitPropagates: frame.exitPropagates && callResultChecked(call),
+    unconditional: frame.unconditional && isBodyStatementCall(call, frame.fn),
     identities: new Map(),
+    fresh: new Set(),
   };
   const cx = wholeContext(p, frame);
   target.fn.parameters.forEach((param, i) => {
@@ -1900,6 +1977,7 @@ function frameSignature(child: Frame): string {
     ...[...child.partialInputs].map(([n, s]) => `${n}.{${[...s].sort().join("|")}}`),
     ...[...child.reqNames].map((n) => `${n}?`),
     ...[...child.identities].map(([n, t]) => `${n}@${t ?? ""}`),
+    ...[...child.fresh].map((n) => `${n}#fresh`),
     ...[...child.thisProps].map(([n, b]) => `this.${n}=${b.client?.kind ?? "-"}`),
     ...[...child.aliases].map(([n, k]) => `${n}~${k}`),
     `exit=${child.exitPropagates}`,
@@ -2024,6 +2102,182 @@ function returnTaint(
     }
   }
   p.returnTaints.set(key, out);
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Storage keys minted in the request (see fresh-keys.ts).
+
+interface LocalNames {
+  /** Sole initializer of a never-reassigned local; null when the name is declared but unresolvable. */
+  inits: Map<string, ts.Expression | null>;
+  reassigned: Set<string>;
+}
+
+const localNamesMemo = new WeakMap<ts.Node, LocalNames>();
+
+/**
+ * The locals of a function body. A name declared twice, destructured, reassigned, or also bound
+ * by a nested function's parameter, a nested function or a class is unresolvable (null): which
+ * binding a use refers to would need scopes, and guessing is how a caller's value passes as ours.
+ */
+function localNamesOf(body: ts.Node): LocalNames {
+  const cached = localNamesMemo.get(body);
+  if (cached) return cached;
+  const reassigned = reassignedIn(body);
+  const inits = new Map<string, ts.Expression | null>();
+  walk(body, (n) => {
+    if (ts.isVariableDeclaration(n)) {
+      for (const nm of boundNames(n.name)) {
+        const sole = !inits.has(nm) && ts.isIdentifier(n.name) && !reassigned.has(nm);
+        inits.set(nm, sole && n.initializer ? n.initializer : null);
+      }
+    } else if (ts.isParameter(n)) {
+      for (const nm of boundNames(n.name)) inits.set(nm, null);
+    } else if ((ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n)) && n.name) {
+      inits.set(n.name.text, null);
+    }
+    return undefined;
+  });
+  const out = { inits, reassigned };
+  localNamesMemo.set(body, out);
+  return out;
+}
+
+/** The initializer of a module-level `const` of this module, or of one it imports from this repository. */
+function moduleConstInit(
+  p: Project,
+  facts: ModuleFacts,
+  name: string,
+  depth: number,
+): ts.Expression | undefined {
+  if (depth > 3) return undefined;
+  const sf = p.sources.get(facts.file);
+  if (!sf) return undefined;
+  for (const st of sf.statements) {
+    if (!ts.isVariableStatement(st) || !(st.declarationList.flags & ts.NodeFlags.Const)) continue;
+    for (const d of st.declarationList.declarations) {
+      if (ts.isIdentifier(d.name) && d.name.text === name && d.initializer) return d.initializer;
+    }
+  }
+  const ref = facts.imports.get(name);
+  if (!ref || ref.imported === "*" || ref.imported === "default") return undefined;
+  const target = p.resolver.resolve(ref.spec, facts.file);
+  const tf = target ? p.registry.get(target) : undefined;
+  return tf ? moduleConstInit(p, tf, ref.imported, depth + 1) : undefined;
+}
+
+function keyContext(p: Project, frame: Frame, scope: Map<string, Sym>, depth: number): KeyContext {
+  const body: ts.Node = frame.fn.body ?? frame.fn;
+  const params = new Set(frame.fn.parameters.flatMap((pr) => boundNames(pr.name)));
+  const locals = localNamesOf(body);
+  const resolve = (name: string): Binding => {
+    if (locals.inits.has(name)) {
+      const init = locals.inits.get(name);
+      return init && !params.has(name) ? { kind: "local", init } : { kind: "unknown" };
+    }
+    if (params.has(name)) {
+      return {
+        kind: "param",
+        fresh: frame.fresh.has(name),
+        reassigned: locals.reassigned.has(name),
+      };
+    }
+    const init = moduleConstInit(p, frame.facts, name, 0);
+    return init ? { kind: "module", init } : { kind: "unknown" };
+  };
+  return {
+    body,
+    resolve,
+    importOf: (name) => frame.facts.imports.get(name),
+    derived: (e) => derivedIn(frame, e),
+    helperReturnsFresh: (call) => returnFresh(p, call, frame, scope, depth + 1),
+  };
+}
+
+/** The expression is a storage key minted in this request, read in this frame. */
+function freshIn(
+  p: Project,
+  frame: Frame,
+  scope: Map<string, Sym>,
+  e: ts.Expression,
+  depth: number,
+): boolean {
+  if (depth > MAX_RETURN_DEPTH) return false;
+  return isFreshKey(e, keyContext(p, frame, scope, depth));
+}
+
+/**
+ * Marks the callee's parameters that receive a minted key. For the frames the entry point walks
+ * through, only user-controlled arguments are asked (`taintedOnly`): a path the caller cannot touch
+ * raises nothing that the proof would have to answer.
+ */
+function bindFreshParams(
+  p: Project,
+  call: ts.CallExpression,
+  target: CallTarget,
+  frame: Frame,
+  scope: Map<string, Sym>,
+  child: Frame,
+  taintedOnly: boolean,
+  depth: number,
+): void {
+  target.fn.parameters.forEach((param, i) => {
+    const arg = call.arguments[i];
+    if (!arg || !ts.isIdentifier(param.name) || param.dotDotDotToken) return;
+    if (taintedOnly && !derivedIn(frame, arg)) return;
+    if (freshIn(p, frame, scope, arg, depth)) child.fresh.add(param.name.text);
+  });
+}
+
+/** `return null` when there is nothing to return: not a key at all. */
+function isEmptyLiteral(e: ts.Expression): boolean {
+  return (
+    e.kind === ts.SyntaxKind.NullKeyword ||
+    e.kind === ts.SyntaxKind.TrueKeyword ||
+    e.kind === ts.SyntaxKind.FalseKeyword ||
+    (ts.isIdentifier(e) && e.text === "undefined")
+  );
+}
+
+/**
+ * Every value a helper of this repository returns is a key minted in this request
+ * (`videoPath(loc, crypto.randomUUID(), ext)` -> `${loc}/${id}.${cleanExt}`), with the caller's
+ * arguments bound: which of them are minted keys, and which carry input.
+ */
+function returnFresh(
+  p: Project,
+  call: ts.CallExpression,
+  frame: Frame,
+  scope: Map<string, Sym>,
+  depth: number,
+): boolean {
+  if (depth > MAX_RETURN_DEPTH) return false;
+  const target = callTarget(p, call, frame, scope);
+  if (!target) return false;
+  const child = childFrame(p, call, target, frame);
+  if (!child) return false;
+  bindFreshParams(p, call, target, frame, scope, child, false, depth);
+  const key = `${target.facts.file}#${target.name}#${frameSignature(child)}`;
+  const cached = p.returnFreshKeys.get(key);
+  if (cached !== undefined) return cached === true;
+  p.returnFreshKeys.set(key, null);
+  bindDeclarations(p, child, {
+    inputs: [],
+    authChecks: [],
+    adminApiCalls: [],
+    roleChecks: [],
+    queries: [],
+    metadataAccesses: [],
+    visited: new Set(),
+    reads: [],
+  });
+  const childScope = scopeOf(p, child.facts);
+  const leaves = ownReturns(target.fn)
+    .flatMap((r) => branchesOf(r))
+    .filter((l) => !isEmptyLiteral(unwrap(l)));
+  const out = leaves.length > 0 && leaves.every((l) => freshIn(p, child, childScope, l, depth));
+  p.returnFreshKeys.set(key, out);
   return out;
 }
 
@@ -2579,7 +2833,9 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     aliases: new Map(),
     pathPos: [],
     exitPropagates: true,
+    unconditional: true,
     identities: new Map(),
+    fresh: new Set(),
   };
   const first = fn.parameters[0];
   if (h.kind === "route" && first) {
@@ -2605,6 +2861,12 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
   }
   analyzeFrame(p, frame, acc);
   linkGuards(acc.reads, p.tables);
+  // A development-only route (`if (process.env.NODE_ENV === "production") return 404` first thing)
+  // does not exist in a production build.
+  const productionExit =
+    h.kind !== "server_action" && acc.authChecks.length === 0
+      ? productionExitOf(sf, fn, rel)
+      : null;
 
   const entry =
     h.kind === "route"
@@ -2631,6 +2893,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     ignores,
     roleChecks: acc.roleChecks,
     adminApiCalls: acc.adminApiCalls,
+    ...(productionExit ? { productionExit } : {}),
   };
 }
 
@@ -2752,6 +3015,7 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     prismaModels,
     returnTaints: new Map(),
     returnIdentities: new Map(),
+    returnFreshKeys: new Map(),
     tables,
     warnings,
   };
@@ -2772,7 +3036,6 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     }
   }
   routes.sort((a, b) => a.entry.localeCompare(b.entry));
-
   const all = [...registry.values()];
   const mw = middlewareVerifiesSession(source, sources);
   const schema = sqlSchemaFor(tables);
@@ -2792,6 +3055,10 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
     storageBuckets: schema.storageBuckets,
     ...(schema.triggers.length > 0 ? { sqlTriggers: schema.triggers } : {}),
     ...(mw ? { middlewareVerifiesSession: mw } : {}),
+    ...(schema.dataApiRefusesUnfilteredWrites === false
+      ? { dataApiRefusesUnfilteredWrites: false }
+      : {}),
+    ...(schema.policiesUnread ? { policiesUnread: true } : {}),
   };
 }
 

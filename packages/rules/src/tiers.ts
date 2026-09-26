@@ -35,7 +35,7 @@ export const RULE_TIERS: Readonly<Record<string, RuleTier>> = {
   "supabase.anon-write-policy": {
     tier: "headline",
     measured: { real: 19, falsePositive: 11 },
-    why: "a write policy for anon or PUBLIC decides with a tautology",
+    why: "a write policy for anon or PUBLIC decides with a tautology; an UPDATE or DELETE one on a table the same roles cannot read changes nothing through the Data API, and the rule makes that finding a lead itself",
   },
   "supabase.security-definer-function-without-caller-check": {
     tier: "headline",
@@ -91,6 +91,16 @@ export const RULE_TIERS: Readonly<Record<string, RuleTier>> = {
     measured: null,
     why: "code-level inference, not yet measured on a blind sample",
   },
+  "supabase.dynamic-sql-from-function-parameter": {
+    tier: "lead",
+    measured: null,
+    why: "SQL text read off the function body; on 26 September 2026 it found one function across the six corpora (155 repositories), a real injection read by hand, which is too few to claim more",
+  },
+  "supabase.view-runs-with-owner-rights": {
+    tier: "lead",
+    measured: null,
+    why: "the view's reloptions and grants are facts, but a view is often meant to publish a subset of a protected table; unmeasured on 26 September 2026",
+  },
   "supabase.storage-object-access-without-owner-scope": {
     tier: "lead",
     measured: { real: 0, falsePositive: 9 },
@@ -111,10 +121,14 @@ export function tierOf(ruleId: string): FindingTier {
  * What the product says about each finding. A rule the table does not know is treated as a lead:
  * an unmeasured claim is the weaker one. The rule's own severity is kept on a capped lead, so nothing
  * it said is lost — only what the product asserts changes.
+ *
+ * A headline rule may mark one of its findings a lead itself, when the fact it reads holds but does
+ * not reach anything today (an open UPDATE policy on a table nobody may read). That only ever lowers
+ * the claim: no finding is raised above its rule's tier.
  */
 export function applyTiers(findings: readonly Finding[]): Finding[] {
   return findings.map((f) => {
-    const tier = tierOf(f.ruleId);
+    const tier = f.tier === "lead" ? "lead" : tierOf(f.ruleId);
     if (tier === "headline") return { ...f, tier };
     if (RANK[f.severity] <= RANK[LEAD_SEVERITY_CAP]) return { ...f, tier };
     return { ...f, tier, severity: LEAD_SEVERITY_CAP, ruleSeverity: f.severity };

@@ -1,0 +1,24 @@
+{
+  "id": "044-definer-revoked-by-catalog-loop",
+  "vulnerabilityExists": true,
+  "class": ["authorization", "security-definer", "data-exposure"],
+  "cwe": ["CWE-285", "CWE-862"],
+  "severity": "critical",
+  "vulnerablePath": [
+    "Anyone holding the public anon key",
+    "POST /rest/v1/rpc/find_profile_by_email",
+    "SECURITY DEFINER function created after the hardening loop, so it keeps Supabase's default EXECUTE for anon",
+    "another person's phone number, bypassing the owner-only policy on profiles"
+  ],
+  "expectedSecureBehavior": "The hardening loop over pg_proc revokes EXECUTE from PUBLIC, anon and authenticated on every SECURITY DEFINER function that exists when it runs; a function defined before it is callable only by the service role.",
+  "acceptableFixes": [
+    "Revoke EXECUTE on the function from public, anon and authenticated in the migration that creates it",
+    "Run the hardening loop again after the function is created",
+    "Make the function SECURITY INVOKER so the profiles policy applies"
+  ],
+  "unacceptableFixes": [
+    "Relying on a hardening loop that ran before the function existed",
+    "Hiding the RPC name in the application"
+  ],
+  "stack": ["supabase", "postgresql"]
+}

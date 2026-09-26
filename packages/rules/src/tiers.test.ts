@@ -90,4 +90,14 @@ describe("rule tiers", () => {
     expect(isBlocking(h as Finding)).toBe(true);
     expect(tierOf("supabase.a-rule-nobody-measured")).toBe("lead");
   });
+
+  it("keeps a lead that a headline rule marked itself, capped like any lead, and never raises one", () => {
+    const [own] = applyTiers([{ ...finding("supabase.anon-write-policy", "high"), tier: "lead" }]);
+    expect(own).toMatchObject({ tier: "lead", severity: LEAD_SEVERITY_CAP, ruleSeverity: "high" });
+    expect(isBlocking(own as Finding)).toBe(false);
+    const [raised] = applyTiers([
+      { ...finding("supabase.mass-assignment-from-request-body", "high"), tier: "headline" },
+    ]);
+    expect(raised).toMatchObject({ tier: "lead", severity: LEAD_SEVERITY_CAP });
+  });
 });

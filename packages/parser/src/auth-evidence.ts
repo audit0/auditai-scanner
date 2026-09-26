@@ -214,13 +214,167 @@ function throwsOnBadCredential(call: ts.CallExpression): boolean {
 }
 /** Next.js navigation helpers throw: calling one ends the request. */
 const THROWING_NAV = /^(redirect|permanentRedirect|notFound|unauthorized|forbidden)$/;
+/** The module they throw from. A helper of the same name elsewhere may just return a Response. */
+const NEXT_NAVIGATION = "next/navigation";
+
+interface NavImports {
+  /** Local name -> exported name, for named imports from next/navigation. */
+  named: Map<string, string>;
+  /** `import * as nav from "next/navigation"`. */
+  namespaces: Set<string>;
+  /** Names bound anywhere in the file other than by those imports: a use may mean another binding. */
+  rebound: Set<string>;
+}
+
+const navImportsMemo = new WeakMap<ts.SourceFile, NavImports>();
+
+function navImportsOf(sf: ts.SourceFile): NavImports {
+  const cached = navImportsMemo.get(sf);
+  if (cached) return cached;
+  const named = new Map<string, string>();
+  const namespaces = new Set<string>();
+  const fromNav = new Set<ts.Node>();
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || !ts.isStringLiteral(st.moduleSpecifier)) continue;
+    if (st.moduleSpecifier.text !== NEXT_NAVIGATION) continue;
+    const clause = st.importClause;
+    if (!clause || clause.isTypeOnly) continue;
+    const bindings = clause.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings)) {
+      namespaces.add(bindings.name.text);
+      fromNav.add(bindings.name);
+    } else if (bindings && ts.isNamedImports(bindings)) {
+      for (const el of bindings.elements) {
+        if (el.isTypeOnly) continue;
+        named.set(el.name.text, (el.propertyName ?? el.name).text);
+        fromNav.add(el.name);
+      }
+    }
+  }
+  const rebound = new Set<string>();
+  const bind = (name: ts.Node | undefined): void => {
+    if (!name || fromNav.has(name)) return;
+    if (ts.isIdentifier(name)) rebound.add(name.text);
+    else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+      for (const el of name.elements) if (!ts.isOmittedExpression(el)) bind(el.name);
+    }
+  };
+  if (named.size > 0 || namespaces.size > 0) {
+    const visit = (n: ts.Node): void => {
+      if (
+        ts.isVariableDeclaration(n) ||
+        ts.isParameter(n) ||
+        ts.isBindingElement(n) ||
+        ts.isFunctionDeclaration(n) ||
+        ts.isFunctionExpression(n) ||
+        ts.isClassDeclaration(n) ||
+        ts.isClassExpression(n) ||
+        ts.isImportSpecifier(n) ||
+        ts.isNamespaceImport(n) ||
+        ts.isImportClause(n) ||
+        ts.isImportEqualsDeclaration(n)
+      ) {
+        bind(n.name);
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(sf);
+  }
+  const out = { named, namespaces, rebound };
+  navImportsMemo.set(sf, out);
+  return out;
+}
+
+/**
+ * Does the call throw the way Next.js `redirect()`, `notFound()`, `forbidden()` and friends do? Only
+ * when the callee is imported from next/navigation (by name, renamed, or through a namespace import)
+ * and the name is not bound again anywhere in the file. A local or repository helper called
+ * `forbidden` that returns a Response does not stop anything when its result is dropped.
+ */
+export function isThrowingNavCall(call: ts.CallExpression): boolean {
+  const callee = unwrap(call.expression);
+  const sf = call.getSourceFile();
+  if (ts.isIdentifier(callee)) {
+    const nav = navImportsOf(sf);
+    const imported = nav.named.get(callee.text);
+    return imported !== undefined && THROWING_NAV.test(imported) && !nav.rebound.has(callee.text);
+  }
+  if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)) {
+    const nav = navImportsOf(sf);
+    const ns = callee.expression.text;
+    return nav.namespaces.has(ns) && !nav.rebound.has(ns) && THROWING_NAV.test(callee.name.text);
+  }
+  return false;
+}
+
+/**
+ * Does a statement always stop the function, on every path through it? `return …`, `throw …`, a
+ * Next.js `redirect()`/`notFound()` from next/navigation, or a block whose last statement is one of
+ * those. Unlike exitKind, `{ if (x) return; log(); }` does not count: it falls through when `x` is
+ * false.
+ */
+export function alwaysStops(stmt: ts.Statement): boolean {
+  if (ts.isReturnStatement(stmt) || ts.isThrowStatement(stmt)) return true;
+  if (ts.isExpressionStatement(stmt)) {
+    let e: ts.Expression = stmt.expression;
+    while (ts.isAwaitExpression(e) || ts.isParenthesizedExpression(e)) e = e.expression;
+    return ts.isCallExpression(e) && isThrowingNavCall(e);
+  }
+  if (!ts.isBlock(stmt)) return false;
+  const last = stmt.statements[stmt.statements.length - 1];
+  return last !== undefined && alwaysStops(last);
+}
+
+const NAV_IMPORTS = new WeakMap<ts.SourceFile, Map<string, string>>();
+
+/** Names a module imports from next/navigation: local name -> imported name, `*` for a namespace. */
+function navigationImports(sf: ts.SourceFile): Map<string, string> {
+  const cached = NAV_IMPORTS.get(sf);
+  if (cached) return cached;
+  const out = new Map<string, string>();
+  for (const s of sf.statements) {
+    if (
+      !ts.isImportDeclaration(s) ||
+      !ts.isStringLiteral(s.moduleSpecifier) ||
+      s.moduleSpecifier.text !== "next/navigation" ||
+      !s.importClause ||
+      s.importClause.isTypeOnly
+    ) {
+      continue;
+    }
+    const nb = s.importClause.namedBindings;
+    if (nb && ts.isNamespaceImport(nb)) out.set(nb.name.text, "*");
+    else if (nb) {
+      for (const el of nb.elements) out.set(el.name.text, (el.propertyName ?? el.name).text);
+    }
+  }
+  NAV_IMPORTS.set(sf, out);
+  return out;
+}
+
+/**
+ * `redirect()`, `notFound()` and their kin imported from next/navigation throw, so calling one ends
+ * the request. A method of the same name does not: `NextResponse.redirect(url)` and
+ * `Response.redirect(url)` build a response, which ends nothing unless it is returned (review cx14c).
+ */
+export function throwsNavigation(call: ts.CallExpression): boolean {
+  const c = call.expression;
+  const nav = navigationImports(call.getSourceFile());
+  if (ts.isIdentifier(c)) return THROWING_NAV.test(nav.get(c.text) ?? "");
+  return (
+    ts.isPropertyAccessExpression(c) &&
+    ts.isIdentifier(c.expression) &&
+    nav.get(c.expression.text) === "*" &&
+    THROWING_NAV.test(c.name.text)
+  );
+}
 
 /** Does a statement stop the function (return, throw, or a Next.js redirect/notFound)? */
 export function exitKind(stmt: ts.Node): "throw" | "return" | null {
   let kind: "throw" | "return" | null = null;
   walkOwn(stmt, (n) => {
     if (ts.isThrowStatement(n)) kind = "throw";
-    else if (ts.isCallExpression(n) && THROWING_NAV.test(calleeName(n.expression))) kind = "throw";
+    else if (ts.isCallExpression(n) && throwsNavigation(n)) kind = "throw";
     else if (ts.isReturnStatement(n) && kind === null) kind = "return";
   });
   return kind;
@@ -400,4 +554,258 @@ const CREDENTIAL_COLUMN =
 
 export function isCredentialColumn(column: string | null): boolean {
   return column !== null && CREDENTIAL_COLUMN.test(column.toLowerCase().replace(/_/g, ""));
+}
+
+/** WebAuthn assertion verifiers, by package: the signature is checked against a stored public key. */
+const WEBAUTHN_VERIFIERS: ReadonlyArray<{ spec: string; name: string }> = [
+  { spec: "@simplewebauthn/server", name: "verifyAuthenticationResponse" },
+];
+
+/** `!v.verified`, `!v?.verified`, `v.verified === false`, `v.verified !== true`. */
+function deniesUnverified(cond: ts.Expression, name: string): boolean {
+  const u = unwrap(cond);
+  const isVerified = (e: ts.Expression): boolean => {
+    const x = unwrap(e);
+    if (!ts.isPropertyAccessExpression(x) || x.name.text !== "verified") return false;
+    const recv = unwrap(x.expression);
+    return ts.isIdentifier(recv) && recv.text === name;
+  };
+  if (ts.isPrefixUnaryExpression(u) && u.operator === ts.SyntaxKind.ExclamationToken) {
+    return isVerified(u.operand);
+  }
+  if (ts.isBinaryExpression(u) && isVerified(u.left)) {
+    const op = u.operatorToken.kind;
+    const r = unwrap(u.right).kind;
+    return (
+      (op === ts.SyntaxKind.EqualsEqualsEqualsToken && r === ts.SyntaxKind.FalseKeyword) ||
+      (op === ts.SyntaxKind.ExclamationEqualsEqualsToken && r === ts.SyntaxKind.TrueKeyword)
+    );
+  }
+  return false;
+}
+
+/** How a statement always ends: its own `return`/`throw`, or one at the top level of its block. */
+function alwaysExits(stmt: ts.Statement): "throw" | "return" | null {
+  if (ts.isThrowStatement(stmt)) return "throw";
+  if (ts.isReturnStatement(stmt)) return "return";
+  if (
+    ts.isExpressionStatement(stmt) &&
+    ts.isCallExpression(unwrap(stmt.expression)) &&
+    throwsNavigation(unwrap(stmt.expression) as ts.CallExpression)
+  ) {
+    return "throw";
+  }
+  if (!ts.isBlock(stmt)) return null;
+  for (const s of stmt.statements) {
+    const k = alwaysExits(s);
+    if (k !== null) return k;
+  }
+  return null;
+}
+
+/** The statement runs code or changes `name`: a call, `new`, `await`, a tagged template, an assignment to it. */
+function runsCodeOrAssigns(stmt: ts.Node, name: string): boolean {
+  let hit = false;
+  walkOwn(stmt, (n) => {
+    if (hit) return;
+    if (
+      ts.isCallExpression(n) ||
+      ts.isNewExpression(n) ||
+      ts.isAwaitExpression(n) ||
+      ts.isTaggedTemplateExpression(n) ||
+      ts.isYieldExpression(n) ||
+      ts.isDeleteExpression(n)
+    ) {
+      hit = true;
+    } else if (
+      ts.isBinaryExpression(n) &&
+      n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      n.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      identifiersIn(n.left).has(name)
+    ) {
+      hit = true;
+    } else if (
+      (ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
+      (n.operator === ts.SyntaxKind.PlusPlusToken ||
+        n.operator === ts.SyntaxKind.MinusMinusToken) &&
+      identifiersIn(n.operand).has(name)
+    ) {
+      hit = true;
+    }
+  });
+  return hit;
+}
+
+/**
+ * Where an awaited verification sits: the statement of the function body that runs it, and the
+ * statements between it and the rest of the body. Only two places count, both run unconditionally:
+ *
+ *   - a statement of the body itself (`const v = await verify…`);
+ *   - a statement of the `try` block of a `try` of the body, whose `catch` always leaves the function
+ *     (`let v; try { v = await verify… } catch { return 401 }`), so reaching the next statement means
+ *     the verification returned.
+ *
+ * Anything nested in a condition, a loop or a `catch` is not counted.
+ */
+function verificationPlace(
+  stmt: ts.Statement,
+  top: readonly ts.Statement[],
+  returnEndsRequest: boolean,
+): { index: number; tail: readonly ts.Statement[] } | null {
+  const index = top.indexOf(stmt);
+  if (index >= 0) return { index, tail: [] };
+  const block = stmt.parent;
+  if (!ts.isBlock(block) || !ts.isTryStatement(block.parent)) return null;
+  const t = block.parent;
+  if (t.tryBlock !== block || t.finallyBlock) return null;
+  // A catch that returns ends the request only when every caller checks what it returns: a helper
+  // whose `return null` the handler ignores lets a malformed assertion through (review cx14b).
+  const caught = t.catchClause ? alwaysExits(t.catchClause.block) : "throw";
+  if (caught === null || (caught === "return" && !returnEndsRequest)) return null;
+  const tIndex = top.indexOf(t);
+  if (tIndex < 0) return null;
+  return { index: tIndex, tail: block.statements.slice(block.statements.indexOf(stmt) + 1) };
+}
+
+/**
+ * Some statement that runs before `stmt` can leave the function with a `return`: a statement of the
+ * body before the verification's place, or one before it in the same `try` block.
+ */
+function returnsBefore(stmt: ts.Statement, top: readonly ts.Statement[], index: number): boolean {
+  const before: ts.Node[] = [...top.slice(0, index)];
+  const block = stmt.parent;
+  if (ts.isBlock(block) && top.indexOf(stmt) < 0) {
+    before.push(...block.statements.slice(0, block.statements.indexOf(stmt)));
+  }
+  let hit = false;
+  for (const s of before) {
+    walkOwn(s, (n) => {
+      if (ts.isReturnStatement(n)) hit = true;
+    });
+  }
+  return hit;
+}
+
+/**
+ * The public key a verification checks the assertion against: `credential.publicKey` (v10 and
+ * later) or `authenticator.credentialPublicKey` (before), as written in the options; the credential
+ * object itself when it is not written out; null when there is none to see.
+ */
+function verifiedKey(call: ts.CallExpression): ts.Expression | null {
+  const opts = call.arguments[0] ? unwrap(call.arguments[0]) : null;
+  if (!opts || !ts.isObjectLiteralExpression(opts)) return null;
+  const prop = (o: ts.ObjectLiteralExpression, name: string): ts.Expression | null => {
+    for (const p of o.properties) {
+      if (ts.isSpreadAssignment(p)) return null;
+      const n =
+        p.name && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) ? p.name.text : null;
+      if (n !== name) continue;
+      if (ts.isPropertyAssignment(p)) return p.initializer;
+      if (ts.isShorthandPropertyAssignment(p)) return p.name;
+      return null;
+    }
+    return null;
+  };
+  for (const [holder, key] of [
+    ["credential", "publicKey"],
+    ["authenticator", "credentialPublicKey"],
+  ] as const) {
+    const h = prop(opts, holder);
+    if (!h) continue;
+    const u = unwrap(h);
+    return ts.isObjectLiteralExpression(u) ? prop(u, key) : h;
+  }
+  return null;
+}
+
+/**
+ * A passkey login: `verifyAuthenticationResponse(...)` of @simplewebauthn/server, awaited, and denied
+ * by `if (!verification.verified) return/throw`. The assertion is checked against the credential's
+ * public key, which must be the one stored for the account (`storedKey`, which the caller answers
+ * from the rows it read and the request input it tracks): with a key the request supplies, the
+ * caller signs with a key of their own (review cx14d). It then identifies an account, as an API key
+ * looked up by its hash does.
+ *
+ * The denial counts only where it decides every request that goes on: it is a statement of the
+ * function body (never inside another condition), it comes after the verification (see
+ * verificationPlace), and nothing runs between the two. That says nothing about what runs before
+ * the verification: a query there, in a branch that answers early, is not covered (review w2, the
+ * same gap getUser() checks have). Where the caller ignores the result, no `return` may come before
+ * the verification at all (review w1). A `return`
+ * ends the request only when every caller up to the entry point checks the result
+ * (`returnEndsRequest`); a `throw` always does, and so does `redirect()` of next/navigation, never a
+ * `NextResponse.redirect()` that is not returned. A verification whose result nothing checks, or one
+ * checked in some branch only, is not counted.
+ */
+export function webauthnChecksIn(
+  fn: FunctionLike,
+  imports: ReadonlyMap<string, { spec: string; imported: string }>,
+  opts: { returnEndsRequest: boolean; storedKey: (key: ts.Expression) => boolean },
+): ts.CallExpression[] {
+  if (!fn.body || !ts.isBlock(fn.body)) return [];
+  const body = fn.body;
+  const top = body.statements;
+  const local = new Set<string>();
+  for (const [name, ref] of imports) {
+    if (WEBAUTHN_VERIFIERS.some((v) => v.spec === ref.spec && v.name === ref.imported)) {
+      local.add(name);
+    }
+  }
+  if (local.size === 0) return [];
+  const out: ts.CallExpression[] = [];
+  walkOwn(body, (n) => {
+    if (!ts.isCallExpression(n) || !ts.isIdentifier(n.expression)) return;
+    if (!local.has(n.expression.text)) return;
+    let cur: ts.Node = n.parent;
+    while (ts.isParenthesizedExpression(cur)) cur = cur.parent;
+    if (!ts.isAwaitExpression(cur)) return;
+    const holder = cur.parent;
+    let name: string | null = null;
+    let stmt: ts.Statement | null = null;
+    if (
+      ts.isVariableDeclaration(holder) &&
+      ts.isIdentifier(holder.name) &&
+      holder.initializer === cur &&
+      ts.isVariableDeclarationList(holder.parent) &&
+      holder.parent.declarations.length === 1 &&
+      ts.isVariableStatement(holder.parent.parent)
+    ) {
+      name = holder.name.text;
+      stmt = holder.parent.parent;
+    } else if (
+      ts.isBinaryExpression(holder) &&
+      holder.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      holder.right === cur &&
+      ts.isIdentifier(holder.left) &&
+      ts.isExpressionStatement(holder.parent)
+    ) {
+      name = holder.left.text;
+      stmt = holder.parent;
+    }
+    if (name === null || stmt === null) return;
+    const v = name;
+    const key = verifiedKey(n);
+    if (!key || !opts.storedKey(key)) return;
+    const place = verificationPlace(stmt, top, opts.returnEndsRequest);
+    if (!place) return;
+    // Where the caller ignores what this function returns, a `return` before the verification lets
+    // the request go on unverified (`if (!body.response) return null;` first thing, review w1).
+    if (!opts.returnEndsRequest && returnsBefore(stmt, top, place.index)) return;
+    // The first statement after the verification that denies an unverified assertion; everything
+    // before it must run nothing (no query, no call) and leave the result alone.
+    const between: ts.Statement[] = [...place.tail];
+    let j = place.index + 1;
+    for (; j < top.length; j++) {
+      const s = top[j];
+      if (s && ts.isIfStatement(s) && deniesUnverified(s.expression, v)) break;
+      if (s) between.push(s);
+    }
+    const deny = top[j];
+    if (!deny || !ts.isIfStatement(deny)) return;
+    if (between.some((s) => runsCodeOrAssigns(s, v))) return;
+    const exit = alwaysExits(deny.thenStatement);
+    if (exit === null || (exit === "return" && !opts.returnEndsRequest)) return;
+    out.push(n);
+  });
+  return out;
 }

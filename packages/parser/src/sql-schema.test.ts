@@ -944,6 +944,65 @@ describe("fixtures", () => {
   });
 });
 
+describe("views: owner's rights, security_invoker and what they select from", () => {
+  const BASE = `create table public.invoices (id uuid primary key, tenant_id uuid not null, total numeric);
+alter table public.invoices enable row level security;
+create policy "own invoices" on public.invoices for select using (tenant_id = auth.uid());
+`;
+
+  it("records a view as a relation of its own kind, with its sources and no security_invoker", () => {
+    const { tables } = parse(`${BASE}
+create view public.invoice_totals as
+  select i.tenant_id, sum(i.total) as total from public.invoices i join public.tenants t on t.id = i.tenant_id group by 1;`);
+    const v = tables.get("invoice_totals");
+    expect(v?.kind).toBe("view");
+    expect(v?.viewSecurityInvoker).toBe(false);
+    expect(v?.viewSources).toEqual(["invoices", "tenants"]);
+    expect(v?.rlsEnabled).toBe(false);
+    expect(tables.get("invoices")?.kind).toBeUndefined();
+  });
+
+  it("reads security_invoker from CREATE VIEW WITH (...), ALTER VIEW SET and RESET, in every spelling", () => {
+    const { tables } = parse(
+      `${BASE}
+create or replace view "Totals" (tenant, total) with (security_invoker = true, check_option = local) as select tenant_id, total from public.invoices;
+create view public.plain as select * from public.invoices;
+alter view public.plain set (security_invoker = on);
+create view public.reset_later with (security_invoker) as select * from invoices;
+alter view if exists public.reset_later reset (security_invoker);
+create view public.off with (security_invoker = 'false') as select * from invoices;`,
+    );
+    expect(tables.get("totals")?.sqlName).toBe("Totals");
+    expect(tables.get("totals")?.viewSecurityInvoker).toBe(true);
+    expect(tables.get("plain")?.viewSecurityInvoker).toBe(true);
+    expect(tables.get("reset_later")?.viewSecurityInvoker).toBe(false);
+    expect(tables.get("off")?.viewSecurityInvoker).toBe(false);
+  });
+
+  it("treats a materialized view as a stored copy, drops views, and skips temporary ones", () => {
+    const { tables } = parse(`${BASE}
+create materialized view public.daily as select tenant_id, count(*) from public.invoices group by 1;
+create temp view scratch as select 1;
+create view public.gone as select * from public.invoices;
+drop view if exists public.gone, public.missing cascade;
+drop table public.invoices;`);
+    expect(tables.get("daily")?.kind).toBe("matview");
+    expect(tables.get("daily")?.viewSecurityInvoker).toBe(false);
+    expect(tables.get("daily")?.viewSources).toEqual(["invoices"]);
+    expect(tables.has("scratch")).toBe(false);
+    expect(tables.has("gone")).toBe(false);
+    // DROP VIEW never removes a table of the same name, and DROP TABLE never removes a view.
+    expect(tables.has("invoices")).toBe(false);
+    expect(tables.has("daily")).toBe(true);
+  });
+
+  it("does not read a function call or a CTE name after FROM as a source", () => {
+    const { tables } = parse(`create table public.t (id int);
+create view public.v as with recent as (select * from public.t) select * from recent, generate_series(1, 3) g;`);
+    expect(tables.get("v")?.viewSources).toEqual(["t", "recent"]);
+  });
+});
+
 describe("malformed SQL", () => {
   it("never throws and keeps what it can read", () => {
     const junk = [

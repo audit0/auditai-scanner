@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.security-definer-function-without-caller-check",
+  "title": "Anonymous-callable SECURITY DEFINER function \"find_profile_by_email\" without a caller check",
+  "severity": "critical",
+  "minConfidence": 0.7,
+  "entrypoints": ["POST /rest/v1/rpc/find_profile_by_email"],
+  "sources": ["rpc arguments"],
+  "sinks": ["postgres.function:public.find_profile_by_email"],
+  "mustMentionFiles": ["vulnerable/supabase/migrations/0003_invite_lookup.sql"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "the anon key calls find_profile_by_email with another person's address and gets their phone number",
+    "expectedAfter": "the same call is refused (permission denied for function) and the service role can still call it"
+  }
+}

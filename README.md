@@ -144,6 +144,7 @@ ships with a vulnerable fixture that must fire and a secure fixture that must st
 | `supabase.security-definer-function-without-caller-check` | headline | high, critical if anon can execute | `SECURITY DEFINER` function (RLS skipped inside) that never reads `auth.uid()`, callable through `supabase.rpc()` |
 | `supabase.rls-policy-trusts-user-metadata` | headline | critical | RLS policy decides access from a `user_metadata` claim, which the user writes themselves with `updateUser({ data })` |
 | `supabase.policies-without-rls-enabled` | headline | high | A table carries policies and never got `enable row level security`, so none of them apply |
+| `supabase.view-runs-with-owner-rights` | lead | high, medium when only signed-in users may select it | View created without `security_invoker` over a table with RLS: it runs as its owner, so the table's policies never apply inside it and every row is readable through the view (Supabase lint 0010) |
 | `supabase.service-role-key-exposed-to-client` | headline | critical | Service-role key reaches the browser (`NEXT_PUBLIC_*`, client components) |
 | `supabase.service-role-object-access-without-tenant-scope` | lead | critical | Service-role client, or a direct Drizzle/Prisma connection, reads or writes a row by user-supplied id without tenant scope (IDOR / BOLA) |
 | `supabase.user-controlled-tenant-scope` | lead | critical | Tenant scope comes from the request (body, query, params) instead of the session |
@@ -153,6 +154,7 @@ ships with a vulnerable fixture that must fire and a secure fixture that must st
 | `supabase.mass-assignment-from-request-body` | lead | high | Request body written to a table without an allow-list, where RLS does not already refuse the write |
 | `supabase.role-check-from-user-metadata` | lead | high | Authorization decided by `user_metadata`, which the user can edit |
 | `supabase.storage-policy-without-owner-check` | lead | high | Policy on `storage.objects` that only checks `bucket_id`: every user reads, overwrites or deletes every file in the bucket |
+| `supabase.dynamic-sql-from-function-parameter` | lead | critical if `SECURITY DEFINER` and anon can execute, high for signed-in only, medium for `SECURITY INVOKER` | Function callable through `supabase.rpc()` glues a text parameter into the SQL it runs with `EXECUTE` (`\|\|`, `format('%s')`), instead of `USING` or `format('%L' / '%I')` |
 | `supabase.server-trusts-unverified-session` | lead | high | A handler decides access from `supabase.auth.getSession()`, which reads the cookie without revalidating it, instead of `getUser()` or `getClaims()` |
 
 Severity is the rule's own rating. A lead is printed at medium at most, with this rating next to it.
@@ -161,8 +163,8 @@ Findings are reported as `likely`, never `confirmed`: confirmation needs evidenc
 means a reproduced request. Suppressed findings stay in the output, marked `suppressed`.
 
 The database rules (`anon-write-policy`, `rls-policy-trusts-user-metadata`,
-`policies-without-rls-enabled`, and `security-definer-function-without-caller-check` for functions
-the app never calls) need no query from your application, because PostgREST exposes the schema to
+`policies-without-rls-enabled`, `view-runs-with-owner-rights`, and `security-definer-function-without-caller-check` and
+`dynamic-sql-from-function-parameter` for functions the app never calls) need no query from your application, because PostgREST exposes the schema to
 anyone holding the public key. Their findings name the Data API as the entry point instead of a
 route.
 
@@ -209,9 +211,17 @@ are left out of the denominator.
 | 1st, 13 Sep 2026 | 20 | 100 | 36% (36/100) | 35% (32/92) |
 | 2nd, 13 Sep 2026, after precision rounds 4–5 | 20 new | 100 | 46% (44/95, 95% interval 37–56%) | 49% (43/87) |
 | 3rd, 14 Sep 2026, after precision round 6 | 20 new | 100 | 31% (31/99, 95% interval 23–41%) | 32% (29/92) |
-| 4th, 19 Sep 2026, after precision round 7 | 30 new | 100 | **30%** (29/96, 95% interval 22–40%) | 32% (27/85) |
+| 4th, 19 Sep 2026, after precision round 7 | 30 new | 100 | 30% (29/96, 95% interval 22–40%) | 32% (27/85) |
+| 5th, 23 Sep 2026, after headlines/leads and precision round 8 | 30 new | 100 | **22%** (22/100, 95% interval 15–31%) | 18% (3/17) |
 
-- **About a third of what it reports is a real hole, and the last round of fixes did not change
+- **The fifth sample came out lower, within noise.** 22% against 30% (p ≈ 0.19). Everything changed
+  since the fourth sample lifted the figure on the four labeled samples from 41.8% to 42.3% and did
+  not carry over to new code. On this sample headlines were right 3 times out of 17 and leads 19 out
+  of 83; seven of the 14 wrong headlines come from one migration that revokes `EXECUTE` on every
+  `SECURITY DEFINER` function with a loop over `pg_proc`, which the engine does not read. Because
+  leads never block, only 17 of the 100 findings are in the blocking tier, so that column says
+  little this time. A second labeller agreed on 27 of 30 (90%, Cohen's kappa 0.67).
+- **Before that, about a third of what it reported was a real hole, and round 7 did not change
   that.** Round 7 was made with the third sample's labels in view and lifted the figure on those
   labels from 31% to 36%. On 30 repositories it had never seen, the same build scored 30% — no
   difference from the third sample (p ≈ 0.87; blocking tier p ≈ 0.97). Fixes keep landing on the
@@ -362,6 +372,8 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 037 | policy-trusts-user-metadata | rls-policy-trusts-user-metadata, the admin claim read from `user_metadata` vs `app_metadata` |
 | 038 | policies-without-rls-enabled | policies-without-rls-enabled, four policies on a table whose RLS was never switched on |
 | 039 | anon-write-policy | anon-write-policy, an open delete policy for `anon` next to a deliberate public insert |
+| 045 | dynamic-sql-from-function-parameter | dynamic-sql-from-function-parameter, search text glued into `EXECUTE` vs bound with `USING`, in a definer function that does check the caller |
+| 046 | view-runs-with-owner-rights | view-runs-with-owner-rights, a per-tenant view created the default way vs `with (security_invoker = on)` |
 
 Each fixture also carries the `security-test` the hosted product runs in a sandbox: `DENY` tests
 are the security assertion (Alice must not read Bob's row), `ALLOW` tests are the sanity check

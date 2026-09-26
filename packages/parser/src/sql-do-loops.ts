@@ -33,6 +33,26 @@ export interface DoBlockExpansion {
   statements: SqlStatement[];
   /** The block also runs SQL the expansion could not follow. */
   dynamic: boolean;
+  /**
+   * Loops over every SECURITY DEFINER function of one schema (see `functionCatalogLoop`). Which
+   * functions exist is the model's knowledge, not the block's, so the caller runs each one against
+   * the functions it knows at that point, with `renderFunctionSweep`.
+   */
+  functionSweeps: FunctionSweep[];
+}
+
+/**
+ * `for fn in select p.oid::regprocedure from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+ *  where n.nspname = 'public' and p.prosecdef loop execute format('revoke ... on function %s ...',
+ *  fn.x); end loop;` — a privilege statement for every SECURITY DEFINER function of a schema.
+ */
+export interface FunctionSweep {
+  schema: string;
+  /** How many of the block's expanded statements run before the loop. */
+  before: number;
+  variable: string;
+  /** The loop's EXECUTE statements, each rendering one GRANT or REVOKE. */
+  body: Token[][];
 }
 
 interface Placeholder {
@@ -245,6 +265,151 @@ function signatureLoop(
   return { variable, schema, rest: tk.slice(loopAt + 1) };
 }
 
+/**
+ * The catalog loop of `FunctionSweep`, matched exactly: the select list is the function's signature
+ * (`oid::regprocedure`), the only relations are `pg_proc` and `pg_namespace`, and the WHERE clause is
+ * a conjunction of a literal schema, `prosecdef`, the join condition and at most `prokind = 'f'`.
+ * Anything else (a name filter, NOT, EXISTS, IN, OR, a LIMIT) selects a subset this parser cannot
+ * evaluate, so the loop stays dynamic SQL.
+ */
+function functionCatalogLoop(
+  tk: readonly Token[],
+): { variable: string; schema: string; field: string; rest: Token[] } | null {
+  if (!isWord(tk[0], "for")) return null;
+  const variable = identOf(tk[1])?.toLowerCase();
+  if (variable === undefined || !isWord(tk[2], "in")) return null;
+  const loopAt = findWord(tk, 3, "loop");
+  if (loopAt < 0) return null;
+  const q = tk.slice(3, loopAt);
+  if (!isWord(q[0], "select")) return null;
+  const fromAt = findWord(q, 1, "from");
+  const whereAt = findWord(q, 1, "where");
+  if (fromAt < 0 || whereAt < fromAt) return null;
+  const text = (part: readonly Token[]): string =>
+    part
+      .map((t) => t.raw)
+      .join(" ")
+      .toLowerCase();
+  // The select list is the signature: `oid::regprocedure`, optionally cast to text, optionally named.
+  // The record field the body may read is that name, or `oid` without one.
+  const select = /^(?:(\w+) \. )?oid :: regprocedure(?: :: text)?(?: (?:as )?(\w+))?$/.exec(
+    text(q.slice(1, fromAt)),
+  );
+  if (!select) return null;
+  const field = select[2] ?? "oid";
+  // Exactly pg_proc joined to pg_namespace on the namespace, in either order or as a comma join with
+  // the condition in WHERE; nothing else in FROM, so no ON clause can filter.
+  const rel = "(?:pg_catalog \\. )?(?:pg_proc|pg_namespace)(?: (?:as )?\\w+)?";
+  const on = "(?:\\w+ \\. )?(?:oid = (?:\\w+ \\. )?pronamespace|pronamespace = (?:\\w+ \\. )?oid)";
+  const fromText = text(q.slice(fromAt + 1, whereAt));
+  const relations = fromText.match(/pg_proc|pg_namespace/g) ?? [];
+  if (relations.length !== 2 || relations[0] === relations[1]) return null;
+  if (
+    !new RegExp(`^${rel} (?:inner )?join ${rel} on ${on}$`).test(fromText) &&
+    !new RegExp(`^${rel} , ${rel}$`).test(fromText)
+  )
+    return null;
+  const where = q.slice(whereAt + 1);
+  const banned = [
+    "or",
+    "not",
+    "exists",
+    "in",
+    "like",
+    "ilike",
+    "select",
+    "limit",
+    "offset",
+    "union",
+  ];
+  if (where.some((t) => t.kind === "word" && banned.includes(t.value))) return null;
+  let schema: string | null = null;
+  let secdef = false;
+  let conjunct: Token[] = [];
+  const conjuncts: Token[][] = [];
+  for (const [i, t] of where.entries()) {
+    if (isWord(t, "and") && depthAt(where, i) === 0) {
+      conjuncts.push(conjunct);
+      conjunct = [];
+    } else conjunct.push(t);
+  }
+  conjuncts.push(conjunct);
+  for (const c of conjuncts) {
+    const x = text(c);
+    const last = c[c.length - 1];
+    // Postgres compares nspname case-sensitively, so the literal is kept as written.
+    if (/^(?:\w+ \. )?nspname = \S+$/.test(x) && last?.kind === "string" && c.length <= 5) {
+      schema = last.value;
+    } else if (/^(?:\w+ \. )?prosecdef(?: = true| is true)?$/.test(x)) secdef = true;
+    else if (new RegExp(`^${on}$`).test(x)) continue;
+    else if (/^(?:\w+ \. )?prokind = 'f'$/.test(x)) continue;
+    else return null;
+  }
+  if (schema === null || !secdef) return null;
+  return { variable, schema, field, rest: tk.slice(loopAt + 1) };
+}
+
+/** Statements a block may hold next to a `FunctionSweep`: declarations, notices and its END. */
+function sweepCompatible(tk: readonly Token[]): boolean {
+  if (isWord(tk[0], "declare")) return true;
+  if (isWord(tk[0], "end") && tk.length <= 2) return true;
+  if (isWord(tk[0], "raise") && ["notice", "info", "log", "debug"].some((w) => isWord(tk[1], w)))
+    return true;
+  // `r record;` or `n text;`, a further declaration in the DECLARE section.
+  return tk.length === 2 && identOf(tk[0]) !== null && tk[1]?.kind === "word";
+}
+
+/**
+ * Plain GRANT statements anywhere in a DO block — at the top, after THEN or ELSE, in a nested BEGIN,
+ * in an exception handler. They are applied whether or not the branch runs: reading a grant can only
+ * report more, never hide a finding, while dropping one can hide a function a later block re-opened.
+ */
+export function grantsInDoBlock(stmt: SqlStatement): SqlStatement[] {
+  const body = stmt.tokens.find((t) => t.kind === "string");
+  if (!body || !isWord(stmt.tokens[0], "do")) return [];
+  const out: SqlStatement[] = [];
+  for (const inner of splitSqlStatements(body.value)) {
+    const tk = inner.tokens;
+    const at = tk.findIndex(
+      (t, i) =>
+        isWord(t, "grant") &&
+        (i === 0 ||
+          ["then", "else", "begin", "loop", "others"].some((w) => isWord(tk[i - 1], w)) ||
+          isPunct(tk[i - 1], ";")),
+    );
+    if (at < 0) continue;
+    const tokens = tk.slice(at);
+    out.push({ ...inner, tokens, line: stmt.line });
+  }
+  return out;
+}
+
+/** A signature as `oid::regprocedure` prints it, for `renderFunctionSweep`. */
+export function sweepSignature(schema: string, name: string, args: string | null): string {
+  return `${quoteIdent(schema)}.${quoteIdent(name)}(${args ?? ""})`;
+}
+
+/**
+ * The GRANT and REVOKE statements a `FunctionSweep` runs for one function, or null when any of its
+ * EXECUTEs renders something else.
+ */
+export function renderFunctionSweep(
+  sweep: FunctionSweep,
+  signature: string,
+  line: number,
+): SqlStatement[] | null {
+  const out: SqlStatement[] = [];
+  for (const tk of sweep.body) {
+    const sql = executedSql(tk, sweep.variable, signature);
+    if (sql === null) return null;
+    for (const st of splitSqlStatements(sql)) {
+      if (!isWord(st.tokens[0], "grant") && !isWord(st.tokens[0], "revoke")) return null;
+      out.push({ ...st, line });
+    }
+  }
+  return out;
+}
+
 /** `declare v_tables text[] := array['a', 'b'];` (also `default`, `constant`): the literal list a loop may iterate. */
 function declaredList(tk: readonly Token[]): [string, string[]] | null {
   let i = 0;
@@ -281,7 +446,7 @@ function conditionalDelta(tk: readonly Token[]): number {
  */
 export function expandDoBlock(stmt: SqlStatement): DoBlockExpansion {
   const body = stmt.tokens.find((t) => t.kind === "string");
-  const out: DoBlockExpansion = { statements: [], dynamic: false };
+  const out: DoBlockExpansion = { statements: [], dynamic: false, functionSweeps: [] };
   if (!body || !isWord(stmt.tokens[0], "do")) return out;
   const inner = splitSqlStatements(body.value).map((s) => stripBegin(s.tokens));
   const emit = (sql: string | null): void => {
@@ -301,10 +466,37 @@ export function expandDoBlock(stmt: SqlStatement): DoBlockExpansion {
   const bodyStatements: Token[][] = [];
   let sigLoop: { variable: string; schema: string; rest: Token[] } | null = null;
   const sigBody: Token[][] = [];
+  // Anything but declarations, the loop, a notice and END (a GRANT after the loop, an IF, a nested
+  // block, a DROP) may change what the loop did, and the rest of the block is not modelled here.
+  let otherStatements = false;
+  let catalog: {
+    variable: string;
+    schema: string;
+    field: string;
+    body: Token[][];
+    valid: boolean;
+  } | null = null;
   for (const tk of inner) {
     if (tk.length === 0) continue;
+    if (catalog) {
+      inCatalog(tk);
+      continue;
+    }
     if (loop) {
       inLoop(tk);
+      continue;
+    }
+    const cat = conditional === 0 ? functionCatalogLoop(tk) : null;
+    if (!cat && !sweepCompatible(tk)) otherStatements = true;
+    if (cat) {
+      catalog = {
+        variable: cat.variable,
+        schema: cat.schema,
+        field: cat.field,
+        body: [],
+        valid: true,
+      };
+      if (cat.rest.length > 0) inCatalog(cat.rest);
       continue;
     }
     const header = loopHeader(tk, declared);
@@ -319,8 +511,47 @@ export function expandDoBlock(stmt: SqlStatement): DoBlockExpansion {
     conditional = Math.max(0, conditional + conditionalDelta(tk));
     if (isWord(tk[0], "execute")) emit(conditional > 0 ? null : executedSql(tk, null, null));
   }
-  if (loop) out.dynamic = true;
+  if (loop || catalog) out.dynamic = true;
+  // An exception handler may swallow a failed statement, so what the block did is not known.
+  if (
+    out.functionSweeps.length > 0 &&
+    (otherStatements || inner.some((tk) => isWord(tk[0], "exception")))
+  ) {
+    out.functionSweeps = [];
+    out.dynamic = true;
+  }
   return out;
+
+  function inCatalog(tk: Token[]): void {
+    if (!catalog) return;
+    if (isWord(tk[0], "end") && isWord(tk[1], "loop")) {
+      const sweep: FunctionSweep = {
+        schema: catalog.schema,
+        before: out.statements.length,
+        variable: catalog.variable,
+        body: catalog.body,
+      };
+      const probe = renderFunctionSweep(sweep, sweepSignature(catalog.schema, "f", ""), stmt.line);
+      if (catalog.valid && catalog.body.length > 0 && probe !== null)
+        out.functionSweeps.push(sweep);
+      else out.dynamic = true;
+      catalog = null;
+      return;
+    }
+    // Only privilege statements (and notices) may run in the loop body, and the record is read only
+    // through the signature column: `fn.x` for another name fails in Postgres, `fn` alone renders the
+    // whole row.
+    const readsRecord = tk.every(
+      (t, i) =>
+        identOf(t)?.toLowerCase() !== catalog?.variable ||
+        (isPunct(tk[i + 1], ".") && identOf(tk[i + 2])?.toLowerCase() === catalog?.field),
+    );
+    const quietRaise =
+      isWord(tk[0], "raise") &&
+      ["notice", "info", "log", "debug", "warning"].some((w) => isWord(tk[1], w));
+    if (isWord(tk[0], "execute") && readsRecord) catalog.body.push(tk);
+    else if (!quietRaise) catalog.valid = false;
+  }
 
   function inLoop(tk: Token[]): void {
     if (!loop) return;

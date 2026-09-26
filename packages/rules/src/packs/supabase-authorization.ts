@@ -859,6 +859,9 @@ export const serviceRoleQueryWithoutAuthentication: Rule = {
     const out: Finding[] = [];
     for (const h of handlerViews(ctx)) {
       if (h.authenticated) continue;
+      // The route returns first thing in a production build (parser production-exit.ts): nobody
+      // reaches the query in a deployed application.
+      if (h.data.productionExit) continue;
       const views = queryViews(ctx, h.handler).filter(
         (v) => bypassesRls(v.clientData?.kind) && !coveredByObjectAccessRule(v.data),
       );

@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.dynamic-sql-from-function-parameter",
+  "title": "SQL injection through parameter \"p_customer\" of \"search_invoices\"",
+  "severity": "critical",
+  "minConfidence": 0.8,
+  "entrypoints": ["POST /rest/v1/rpc/search_invoices", "GET /api/invoices/search"],
+  "sources": ["query:q", "rpc arguments"],
+  "sinks": ["postgres.execute:public.search_invoices"],
+  "mustMentionFiles": ["vulnerable/supabase/migrations/0001_init.sql"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "the anon key calls search_invoices with p_customer = %' or true -- and gets every tenant's invoices",
+    "expectedAfter": "the anon call is refused (permission denied for function); Alice's injected search matches no invoice of another tenant"
+  }
+}

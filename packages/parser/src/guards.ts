@@ -1,6 +1,14 @@
 import ts from "typescript";
-import { boundNames, enclosingFunction, identifiersIn, unwrap, walk, walkOwn } from "./ast.js";
-import { exitKind } from "./auth-evidence.js";
+import {
+  boundNames,
+  enclosingFunction,
+  identifiersIn,
+  isFunctionLikeNode,
+  unwrap,
+  walk,
+  walkOwn,
+} from "./ast.js";
+import { alwaysStops, exitKind } from "./auth-evidence.js";
 
 /**
  * Guard queries: "read the row through RLS (or filtered by the caller), stop if it is missing, then
@@ -285,4 +293,36 @@ export function compareOrder(a: readonly number[], b: readonly number[]): number
     if (d !== 0) return d;
   }
   return a.length - b.length;
+}
+
+/**
+ * Is there an `if (cond) return|throw …` that runs before `node` on every path to it, with `accept`
+ * true of its condition? Such an `if` is an earlier statement of a block that contains `node`
+ * (blocks are entered only at their start, so it runs first), and its branch never falls through.
+ * The walk stops at `body`, the function being read, and at any nested function: a hoisted
+ * declaration can run before the check, and a callback may run in another order.
+ *
+ * This is dominance in the form structured code allows. A check that sits in a branch of its own
+ * (`if (body.strict) { if (!ok) return }`) does not dominate what follows the branch, and a check
+ * that only logs does not stop anything.
+ */
+export function stoppedBefore(
+  node: ts.Node,
+  body: ts.Node,
+  accept: (stop: ts.IfStatement) => boolean,
+): boolean {
+  let child: ts.Node = node;
+  let cur: ts.Node | undefined = node.parent;
+  while (cur) {
+    if (ts.isBlock(cur)) {
+      for (const stmt of cur.statements) {
+        if (stmt === child) break;
+        if (ts.isIfStatement(stmt) && alwaysStops(stmt.thenStatement) && accept(stmt)) return true;
+      }
+    }
+    if (cur === body || isFunctionLikeNode(cur)) return false;
+    child = cur;
+    cur = cur.parent;
+  }
+  return false;
 }
