@@ -76,6 +76,11 @@ export interface ScanResult {
   coverage: CoverageSummary;
   coverageStatement: string;
   blocking: boolean;
+  /**
+   * A rule threw during evaluation (REVIEW.md #1): its findings are missing from this report, so
+   * a clean result here is not proof the project is clean. The message is in `summary.warnings`.
+   */
+  incomplete: boolean;
 }
 
 export function summarize(
@@ -120,7 +125,12 @@ export function runScan(path: string, opts: ScanOptions = {}): ScanResult {
   const publicTables = cfg.config.publicTables ?? [];
   const runOpts = { ...(opts.now === undefined ? {} : { now: opts.now }), publicTables };
   // The rules say what is wrong; the tiers say what the product may claim about it (ADR-005).
+  // runRules never throws: a broken rule is caught internally and reported as a warning on `model`
+  // (rule.ts). Nothing else touches `model.warnings` across this call, so any warning that appears
+  // here is that catch firing, and the scan below must not report itself as clean.
+  const warningsBeforeRules = model.warnings.length;
   const rulesFindings = applyTiers(runRules(defaultRules, model, graph, runOpts));
+  const incomplete = model.warnings.length > warningsBeforeRules;
   // A fix that follows from the schema alone is attached right here: no model, no network, and
   // the same proposal for everyone who scans this repository. Findings whose fix depends on
   // application code get none, which is deliberate.
@@ -149,5 +159,6 @@ export function runScan(path: string, opts: ScanOptions = {}): ScanResult {
     coverage,
     coverageStatement: renderCoverageStatement(coverage),
     blocking: findings.some((f) => isBlocking(f)),
+    incomplete,
   };
 }

@@ -25,7 +25,8 @@ Options:
                        Reads your database as it is, not as your migrations say it should be.
   -h, --help           show this help
 
-Exit code: 0 clean, 1 a finding reached --fail-on, 2 usage error or <path> is not a directory
+Exit code: 0 clean, 1 a finding reached --fail-on or a rule crashed (report incomplete),
+           2 usage error or <path> is not a directory
 
 Config: <path>/audit.config.json { "ignore": ["evals/**"], "migrations": ["supabase/migrations"] }
 Suppress a finding: // auditai:ignore <ruleId|*> -- reason   (above the handler or at the top of a file)
@@ -73,7 +74,11 @@ function main(argv: string[]): number {
     process.stdout.write(
       values.json ? `${JSON.stringify(out.result, null, 2)}\n` : formatSnapshotText(out.result),
     );
-    return reachesFailOn(out.result.findings, failOn as FindingStatus) ? 1 : 0;
+    // A rule that crashed makes this report incomplete regardless of --fail-on: a security scan
+    // must never exit 0 on a scan it did not finish (REVIEW.md #1).
+    return reachesFailOn(out.result.findings, failOn as FindingStatus) || out.result.incomplete
+      ? 1
+      : 0;
   }
   const migrations = (values.migrations as string[]).map((m) => resolve(m));
   let result: ScanResult;
@@ -88,7 +93,9 @@ function main(argv: string[]): number {
   process.stdout.write(
     values.json ? `${JSON.stringify(result, null, 2)}\n` : formatScanText(result),
   );
-  return reachesFailOn(result.findings, failOn as FindingStatus) ? 1 : 0;
+  // A rule that crashed makes this report incomplete regardless of --fail-on: a security scan must
+  // never exit 0 on a scan it did not finish (REVIEW.md #1).
+  return reachesFailOn(result.findings, failOn as FindingStatus) || result.incomplete ? 1 : 0;
 }
 
 try {

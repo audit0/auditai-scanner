@@ -122,6 +122,12 @@ export function formatSnapshotText(r: SnapshotScanResult): string {
     `Postgres ${r.postgres || "unknown"} · Tables ${s.tablesKnown} · With RLS ${s.tablesWithRls}/${s.tablesKnown} · Rules ${s.rules}`,
     "",
   ];
+  if (r.incomplete) {
+    out.push(
+      "INCOMPLETE SCAN: a rule crashed before finishing (see warning below). This report is missing findings, not clean.",
+      "",
+    );
+  }
   const reads = r.publicReads;
   if (r.findings.length === 0 && reads.length === 0)
     out.push(
@@ -149,6 +155,11 @@ export function formatScanText(r: ScanResult): string {
     `Audit AI scan  ${displayRoot(s.root)}`,
     `Files ${s.files} · Routes ${s.routes} · Supabase queries ${s.queries} · Tables with RLS ${s.tablesWithRls}/${s.tablesKnown} · Rules ${s.rules}`,
   ];
+  if (r.incomplete) {
+    out.push(
+      "INCOMPLETE SCAN: a rule crashed before finishing (see warning below). This report is missing findings, not clean.",
+    );
+  }
   if (s.publicTables.length > 0) {
     // The declaration is never silent: what it suppressed is counted next to it.
     const n = r.findings.filter((f) => f.evidence.some((e) => e.data?.publicTables)).length;

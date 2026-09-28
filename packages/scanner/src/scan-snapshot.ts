@@ -47,6 +47,11 @@ export interface SnapshotScanResult {
   coverage: CoverageSummary;
   coverageStatement: string;
   blocking: boolean;
+  /**
+   * A rule threw during evaluation (REVIEW.md #1): its findings are missing from this report, so
+   * a clean result here is not proof the database is clean. The message is in `summary.warnings`.
+   */
+  incomplete: boolean;
   /** When the database reported the snapshot was taken. */
   takenAt: string;
   postgres: string;
@@ -202,12 +207,16 @@ export function scanSnapshot(
   );
   // Same pipeline as a repository scan: rules, then what the product may claim, then the schema fix
   // that follows from the facts alone. Only headlines get a fix here — a lead is not a hole we found.
-  const findings = applyTiers(
-    runRules(defaultRules, model, graph, {
-      ...(opts.now === undefined ? {} : { now: opts.now }),
-      publicTables,
-    }),
-  )
+  // runRules never throws: a broken rule is caught internally and reported as a warning on `model`
+  // (rule.ts). Nothing else touches `model.warnings` across this call, so any warning that appears
+  // here is that catch firing, and the scan below must not report itself as clean (REVIEW.md #1).
+  const warningsBeforeRules = model.warnings.length;
+  const ruleFindings = runRules(defaultRules, model, graph, {
+    ...(opts.now === undefined ? {} : { now: opts.now }),
+    publicTables,
+  });
+  const incomplete = model.warnings.length > warningsBeforeRules;
+  const findings = applyTiers(ruleFindings)
     .filter((f) => !redundant(f, deadPolicies))
     // Numbered again after the filter, so the report reads AUDIT-001, AUDIT-002 without a gap.
     .map((f, i) => ({ ...f, id: `AUDIT-${String(i + 1).padStart(3, "0")}` }))
@@ -225,6 +234,7 @@ export function scanSnapshot(
       coverage,
       coverageStatement: renderCoverageStatement(coverage),
       blocking: findings.some((f) => isBlocking(f)),
+      incomplete,
       takenAt: snap.takenAt,
       postgres: snap.postgres,
       limits: LIMITS,
