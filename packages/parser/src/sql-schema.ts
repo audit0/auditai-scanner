@@ -1,4 +1,5 @@
 import type { ColumnInfo, RlsTable, SqlFunctionInfo, SqlTrigger, StorageBucket } from "./model.js";
+import { isCliMigrationFile } from "./sql-cli-files.js";
 import {
   type ColumnDef,
   identList,
@@ -21,10 +22,11 @@ import {
   applyGrantRevoke,
   type FunctionRegistry,
   finishFunctions,
-  functionBodyOf,
+  functionStateOf,
   newFunctionRegistry,
   relationsOf,
 } from "./sql-functions.js";
+import { definerGuardSkipsEveryone } from "./sql-inert-guard.js";
 import {
   findWord,
   groupEnd,
@@ -42,6 +44,7 @@ import {
   finishBuckets,
   newBucketRegistry,
 } from "./sql-storage.js";
+import { applyTableGrant } from "./sql-table-grants.js";
 
 /**
  * Schema knowledge from migration SQL, applied statement by statement in file order so that later
@@ -575,10 +578,22 @@ function createView(state: SqlSchemaState, stmt: SqlStatement, file: string): vo
   if (isWord(tk[i], "recursive")) i += 1;
   if (!isWord(tk[i], "view")) return;
   i += 1;
-  if (isWord(tk[i], "if") && isWord(tk[i + 1], "not") && isWord(tk[i + 2], "exists")) i += 3;
+  const ifNotExists =
+    isWord(tk[i], "if") && isWord(tk[i + 1], "not") && isWord(tk[i + 2], "exists");
+  if (ifNotExists) i += 3;
   const q = readQualifiedName(tk, i);
   if (!q) return;
   const key = qualifiedKey(q);
+  // IF NOT EXISTS leaves an earlier relation of that name as it was.
+  // SQL outside the CLI migrations is read first but may never have run: a migration's own
+  // definition then stands (alphaclone's DEPLOY_NOW.sql).
+  const earlier = state.tables.get(key);
+  if (
+    ifNotExists &&
+    earlier &&
+    !(isCliMigrationFile(file) && !isCliMigrationFile(earlier.location.file))
+  )
+    return;
   const t = ensureTable(state, key, file, stmt.line);
   t.location = { file, line: stmt.line };
   const exact = qualifiedExact(q);
@@ -597,7 +612,38 @@ function createView(state: SqlSchemaState, stmt: SqlStatement, file: string): vo
   const as = findWord(tk, i, "as");
   const body = as >= 0 ? stmt.text.slice((tk[as]?.end ?? stmt.start) - stmt.start) : "";
   t.viewSources = relationsOf(body).filter((r) => r !== key);
+  t.viewCalls = callsOf(body);
 }
+
+/** Lowercase names of the functions a view's query calls (`public.can_view(x)` -> `can_view`). */
+function callsOf(body: string): string[] {
+  const out = new Set<string>();
+  for (const m of body.matchAll(/([A-Za-z_][A-Za-z0-9_$]*)"?\s*\(/g)) {
+    const name = (m[1] ?? "").toLowerCase();
+    if (!SQL_NOT_CALLS.has(name)) out.add(name);
+  }
+  return [...out];
+}
+
+const SQL_NOT_CALLS = new Set([
+  "as",
+  "in",
+  "and",
+  "or",
+  "not",
+  "exists",
+  "select",
+  "from",
+  "where",
+  "join",
+  "on",
+  "over",
+  "filter",
+  "values",
+  "using",
+  "any",
+  "all",
+]);
 
 /** ALTER [MATERIALIZED] VIEW [IF EXISTS] name SET (security_invoker = on) | RESET (security_invoker). */
 function alterView(state: SqlSchemaState, stmt: SqlStatement): void {
@@ -765,6 +811,9 @@ function doBlock(state: SqlSchemaState, stmt: SqlStatement, file: string): void 
     else if (isWord(tokens[0], "alter") && isWord(tokens[1], "type")) alterType(state, s);
     else if (isWord(tokens[0], "alter") && isWord(tokens[1], "table")) {
       alterTable(state, s, file, true);
+    } else if (isWord(tokens[0], "grant") || isWord(tokens[0], "revoke")) {
+      // Hardening scripts wrap these in `IF to_regclass('public.x') IS NOT NULL THEN`.
+      applyTableGrant(state.tables, s);
     }
   }
 }
@@ -865,8 +914,27 @@ const MAX_TRIGGER_COLUMNS = 200;
  * and also reads off OLD, assigns with `:=`, or reads in a body that raises. A trigger that only
  * stamps `new.updated_at := now()` holds back nothing else.
  */
+/** A literal, optionally cast: `'member'`, `'member'::user_role`, `null`, `0`. */
+const FORCED_VALUE =
+  /^\s*(?:'(?:[^']|'')*'|null|-?\d+(?:\.\d+)?|true|false)(?:\s*::\s*[\w.]+)?\s*$/i;
+
 function finishTrigger(state: SqlSchemaState, t: TriggerState): SqlTrigger {
-  const body = functionBodyOf(state.functions, t.fn) ?? "";
+  const fn = functionStateOf(state.functions, t.fn);
+  if (fn?.securityDefiner && definerGuardSkipsEveryone(fn.body)) {
+    // `IF current_user NOT IN ('authenticated', 'anon') THEN RETURN NEW` under SECURITY DEFINER:
+    // current_user is the owner, so the trigger returns before looking at any column.
+    return {
+      name: t.name,
+      table: t.table,
+      timing: t.timing,
+      events: [...t.events],
+      checkedColumns: [],
+      inert: true,
+      function: qualifiedKey(t.fn),
+      location: t.location,
+    };
+  }
+  const body = fn?.body ?? "";
   const raises = /(?<![A-Za-z0-9_$])raise(?![A-Za-z0-9_$])/i.test(body);
   const read = new Set<string>();
   for (const m of body.matchAll(NEW_COLUMN)) {
@@ -875,6 +943,16 @@ function finishTrigger(state: SqlSchemaState, t: TriggerState): SqlTrigger {
     if (read.size >= MAX_TRIGGER_COLUMNS) break;
   }
   const checked = new Set(t.ofColumns);
+  const forced = new Set<string>();
+  for (const col of read) {
+    // `new.role := 'member'`: the trigger overrides whatever the row brought with a literal. A value
+    // computed from something else (`lower(new.role)`, a role looked up by `new.role_id`) may still
+    // be the writer's own choice.
+    const assignment = new RegExp(`(?<![A-Za-z0-9_$])new\\s*\\.\\s*"?${col}"?\\s*:=([^;]*)`, "gi");
+    for (const m of body.matchAll(assignment)) {
+      if (FORCED_VALUE.test(m[1] ?? "")) forced.add(col);
+    }
+  }
   for (const col of read) {
     const old = new RegExp(`(?<![A-Za-z0-9_$])old\\s*\\.\\s*"?${col}"?(?![A-Za-z0-9_$])`, "i");
     const assigned = new RegExp(`(?<![A-Za-z0-9_$])new\\s*\\.\\s*"?${col}"?\\s*:=`, "i");
@@ -886,6 +964,7 @@ function finishTrigger(state: SqlSchemaState, t: TriggerState): SqlTrigger {
     timing: t.timing,
     events: [...t.events],
     checkedColumns: [...checked],
+    ...(forced.size > 0 ? { forcedColumns: [...forced] } : {}),
     function: qualifiedKey(t.fn),
     location: t.location,
   };
@@ -929,6 +1008,7 @@ export function applySchemaStatement(
     else if (w1 === "trigger") dropTrigger(state, stmt);
   } else if (w0 === "grant" || w0 === "revoke") {
     applyGrantRevoke(state.functions, stmt);
+    applyTableGrant(state.tables, stmt);
   } else if (w0 === "do") {
     doBlock(state, stmt, file);
   } else if (w0 === "insert" || w0 === "update" || w0 === "delete") {

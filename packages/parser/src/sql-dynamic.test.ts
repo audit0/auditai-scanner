@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatSpecifiers, paramsReachingExecute } from "./sql-dynamic.js";
+import { executeGatedByCaller, formatSpecifiers, paramsReachingExecute } from "./sql-dynamic.js";
 
 const text = (...names: string[]) => names.map((name) => ({ name, type: "text" }));
 
@@ -150,5 +150,42 @@ describe("formatSpecifiers", () => {
 
   it("keeps %s when a position is used both ways", () => {
     expect(formatSpecifiers("%1$I %1$s").get(1)).toBe("s");
+  });
+});
+
+describe("CASE conditions and caller gates", () => {
+  it("does not count a parameter that only picks a literal branch of CASE", () => {
+    const body = `begin
+  return query execute format($q$ select id from listings where status = $1 %s $q$,
+    case when p_type is not null then 'and listing_type = $2' else '' end)
+  using p_status, p_type;
+end`;
+    expect(paramsReachingExecute(body, text("p_status", "p_type"))).toEqual([]);
+    const branch = `begin execute format('select %s', case when p_a is null then p_b else 'x' end); end`;
+    expect(paramsReachingExecute(branch, text("p_a", "p_b"))).toEqual(["p_b"]);
+  });
+
+  it("recognises a caller check that raises before the first EXECUTE", () => {
+    const gated = `declare r text; begin
+  select role into r from profiles where id = auth.uid();
+  if r is null or r != 'admin' then raise exception 'admins only'; end if;
+  execute p_sql; end`;
+    expect(executeGatedByCaller(gated)).toBe(true);
+    expect(
+      executeGatedByCaller(
+        "begin if not public.is_admin() then raise exception 'no'; end if; execute p_sql; end",
+      ),
+    ).toBe(true);
+    expect(
+      executeGatedByCaller(
+        "begin execute p_sql; if auth.uid() is null then raise exception 'x'; end if; end",
+      ),
+    ).toBe(false);
+    expect(
+      executeGatedByCaller(
+        "begin if p_sql is null then raise exception 'empty'; end if; execute p_sql; end",
+      ),
+    ).toBe(false);
+    expect(executeGatedByCaller("")).toBe(false);
   });
 });

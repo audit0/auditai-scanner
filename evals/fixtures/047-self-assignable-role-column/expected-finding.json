@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.self-assignable-role-column",
+  "title": "Signed-in users can rewrite \"profiles.role\", which grants privileges",
+  "severity": "critical",
+  "minConfidence": 0.8,
+  "entrypoints": ["PATCH /rest/v1/profiles", "GET /api/admin/users"],
+  "sources": ["update body:role"],
+  "sinks": ["supabase.update:public.profiles"],
+  "mustMentionFiles": ["vulnerable/supabase/migrations/0001_init.sql"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "Alice updates her own profile with role = 'admin' and then lists every tenant's users through /api/admin/users",
+    "expectedAfter": "the update of role is refused (permission denied for column), her role stays member, and /api/admin/users answers 403"
+  }
+}

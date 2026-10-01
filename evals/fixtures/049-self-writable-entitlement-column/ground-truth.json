@@ -1,0 +1,26 @@
+{
+  "id": "049-self-writable-entitlement-column",
+  "vulnerabilityExists": true,
+  "class": ["business-logic", "rls", "broken-function-level-authorization"],
+  "cwe": ["CWE-863", "CWE-840"],
+  "severity": "high",
+  "stack": ["nextjs-app-router", "supabase", "postgresql", "typescript"],
+  "vulnerablePath": [
+    "PATCH /rest/v1/profiles?id=eq.<own id> with the caller's own token and body { credits: 1000000 }",
+    "policy \"profiles: update own\" allows the update: USING (id = auth.uid()), no WITH CHECK, default UPDATE privilege on every column",
+    "profiles.credits is now 1000000",
+    "POST /api/invoices/export and public.spend_export_credit() read profiles.credits: paid exports without paying"
+  ],
+  "expectedSecureBehavior": "A signed-in user can edit their display name but never their credits; exports stop at zero credits.",
+  "acceptableFixes": [
+    "Revoke UPDATE on profiles from authenticated and grant back only the columns users may edit",
+    "WITH CHECK that keeps credits equal to the stored value, plus the same for INSERT",
+    "Move credits to a table only the service role and SECURITY DEFINER functions write",
+    "A BEFORE INSERT OR UPDATE trigger that raises when credits change for a non-service caller"
+  ],
+  "unacceptableFixes": [
+    "Checking the credits only in the API route while PostgREST still accepts the update",
+    "A column-level REVOKE UPDATE (credits) while the table-level UPDATE privilege stays",
+    "A CHECK constraint on credits (a user still picks any value inside it)"
+  ]
+}

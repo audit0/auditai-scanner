@@ -12,6 +12,7 @@ import type {
   SupabaseQuery,
 } from "./model.js";
 import { paramsReachingExecute } from "./sql-dynamic.js";
+import { roleColumnsIn } from "./sql-role-source.js";
 
 /**
  * A snapshot of a live Postgres database, read by the query in
@@ -345,6 +346,8 @@ function readFunction(v: unknown): SqlFunctionInfo | null {
   }
   const tables = relationsIn(body);
   if (tables.length > 0) fn.tables = tables;
+  const roleColumns = roleColumnsIn(body);
+  if (roleColumns.length > 0) fn.roleColumns = roleColumns;
   // Tables a function that is not SECURITY DEFINER updates, deletes from or merges into, as the
   // query reads them off its definition; `*` when it runs dynamic SQL next to such a word.
   const changes = [

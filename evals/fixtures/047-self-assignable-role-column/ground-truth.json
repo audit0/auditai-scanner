@@ -1,0 +1,26 @@
+{
+  "id": "047-self-assignable-role-column",
+  "vulnerabilityExists": true,
+  "class": ["privilege-escalation", "rls", "broken-function-level-authorization", "multi-tenancy"],
+  "cwe": ["CWE-269", "CWE-863"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "postgresql", "typescript"],
+  "vulnerablePath": [
+    "PATCH /rest/v1/profiles?id=eq.<own id> with the caller's own token and body { role: 'admin' }",
+    "policy \"profiles: update own\" allows the update: USING (id = auth.uid()), no WITH CHECK, default UPDATE privilege on every column",
+    "profiles.role is now 'admin'",
+    "GET /api/admin/users and public.is_admin() read profiles.role: every tenant's users and invoices open"
+  ],
+  "expectedSecureBehavior": "A signed-in user can edit their display name but never their role; the admin route and the admin policies stay closed to them.",
+  "acceptableFixes": [
+    "Revoke UPDATE on profiles from authenticated and grant back only the columns users may edit",
+    "WITH CHECK that keeps role equal to the stored value, plus the same for INSERT",
+    "Move roles to a table (or app_metadata) that only the service role writes",
+    "A BEFORE INSERT OR UPDATE trigger that raises when role changes for a non-service caller"
+  ],
+  "unacceptableFixes": [
+    "Checking the role only in the API route while PostgREST still accepts the update",
+    "A column-level REVOKE UPDATE (role) while the table-level UPDATE privilege stays",
+    "A trigger on UPDATE only, when a DELETE and INSERT policy lets the user recreate their row"
+  ]
+}

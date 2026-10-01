@@ -7,7 +7,7 @@ import {
   qualifiedKey,
   readQualifiedName,
 } from "./sql-columns.js";
-import { paramsReachingExecute } from "./sql-dynamic.js";
+import { executeGatedByCaller, paramsReachingExecute } from "./sql-dynamic.js";
 import {
   groupEnd,
   isPunct,
@@ -17,6 +17,8 @@ import {
   splitTopLevelTokens,
   type Token,
 } from "./sql-lexer.js";
+import { metadataCopiesIn } from "./sql-metadata-copy.js";
+import { entitlementColumnsIn, roleColumnsIn, scopeColumnsIn } from "./sql-role-source.js";
 
 /**
  * SQL functions from migrations: SECURITY DEFINER, whether the body looks at the caller, and who
@@ -91,11 +93,19 @@ export function functionBodyOf(
   reg: FunctionRegistry,
   q: { schema: string | null; name: string },
 ): string | null {
+  return functionStateOf(reg, q)?.body ?? null;
+}
+
+/** Like `functionBodyOf`, with whether the function is SECURITY DEFINER. */
+export function functionStateOf(
+  reg: FunctionRegistry,
+  q: { schema: string | null; name: string },
+): { body: string; securityDefiner: boolean } | null {
   const direct = reg.byKey.get(qualifiedKey(q));
-  if (direct) return direct.body;
+  if (direct) return direct;
   if (q.schema !== null) return null;
   const lower = q.name.toLowerCase();
-  for (const f of reg.byKey.values()) if (f.name.toLowerCase() === lower) return f.body;
+  for (const f of reg.byKey.values()) if (f.name.toLowerCase() === lower) return f;
   return null;
 }
 
@@ -986,7 +996,10 @@ export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
       );
       if (keys.length > 0) info.keys = keys;
       const injected = paramsReachingExecute(f.body, params);
-      if (injected.length > 0) info.sqlFromParams = injected;
+      if (injected.length > 0) {
+        info.sqlFromParams = injected;
+        if (executeGatedByCaller(f.body)) info.executeGated = true;
+      }
     }
     const tables = relationsOf(f.body);
     if (tables.length > 0) info.tables = tables;
@@ -996,6 +1009,14 @@ export function finishFunctions(reg: FunctionRegistry): SqlFunctionInfo[] {
     if (writes.length > 0) info.writes = writes;
     const changes = changesOf(f.body);
     if (changes.length > 0) info.changes = changes;
+    const roleColumns = roleColumnsIn(f.body);
+    if (roleColumns.length > 0) info.roleColumns = roleColumns;
+    const scopeColumns = scopeColumnsIn(f.body);
+    if (scopeColumns.length > 0) info.scopeColumns = scopeColumns;
+    const entitlementColumns = entitlementColumnsIn(f.body);
+    if (entitlementColumns.length > 0) info.entitlementColumns = entitlementColumns;
+    const metadataCopies = metadataCopiesIn(f.body);
+    if (metadataCopies.length > 0) info.metadataCopies = metadataCopies;
     return info;
   });
 }

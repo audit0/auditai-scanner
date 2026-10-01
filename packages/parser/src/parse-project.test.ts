@@ -334,6 +334,47 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     expect(qs[0]?.clientLocation?.file).toBe("lib/db.ts");
   });
 
+  it("reads Prisma through a singleton factory and unfolds relation and compound-key filters", async () => {
+    const dir = await tempProject({
+      "lib/prisma.ts": `import { PrismaClient } from "@prisma/client";
+const prismaClientSingleton = () => {
+  return new PrismaClient();
+};
+const g = globalThis as unknown as { prismaGlobal?: PrismaClient };
+const prisma = g.prismaGlobal ?? prismaClientSingleton();
+export default prisma;
+`,
+      "app/api/leave/[id]/route.ts": `import prisma from "@/lib/prisma";
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const org = req.headers.get("x-org");
+  await prisma.leaveRequest.findFirst({ where: { id, user: { organization_id: "o1" } } });
+  await prisma.leaveRequest.findFirst({ where: { id, members: { some: { user_id: "u1" } } } });
+  await prisma.leaveRequest.findFirst({ where: { id, members: { none: { user_id: "u1" } } } });
+  await prisma.balance.findUnique({ where: { user_id_year: { user_id: org, year: 2026 } } });
+  return Response.json({});
+}
+`,
+    });
+    const qs = parseProject(dir).routes[0]?.queries ?? [];
+    expect(qs.map((q) => q.client)).toEqual(["direct_db", "direct_db", "direct_db", "direct_db"]);
+    const cols = (i: number) => qs[i]?.filters.map((f) => [f.column, f.inputDerived]);
+    expect(cols(0)).toEqual([
+      ["id", true],
+      ["organization_id", false],
+    ]);
+    expect(cols(1)).toEqual([
+      ["id", true],
+      ["user_id", false],
+    ]);
+    // `none` keeps rows by what they lack: no scope.
+    expect(cols(2)).toEqual([["id", true]]);
+    expect(cols(3)).toEqual([
+      ["user_id", true],
+      ["year", false],
+    ]);
+  });
+
   it("reads Prisma calls through the global singleton and maps models to tables via @@map", async () => {
     const dir = await tempProject({
       "prisma/schema.prisma": `model Invoice { id String @id\n tenantId String\n @@map("invoices") }\nmodel Profile { id String @id }`,

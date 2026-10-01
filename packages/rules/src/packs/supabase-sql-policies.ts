@@ -6,7 +6,11 @@ import type {
   RlsTable,
   SqlFunctionInfo,
 } from "@auditai/parser";
+import { isCliMigrationFile } from "@auditai/parser";
 import type { Rule, RuleContext } from "../rule.js";
+import { roleFromSignupMetadata } from "./role-from-signup-metadata.js";
+import { selfAssignableRoleColumn } from "./self-assignable-role.js";
+import { selfWritableEntitlementColumn } from "./self-writable-entitlement.js";
 
 /**
  * Rules that read only the migrations. Unlike the authorization pack, they do not need a query from
@@ -839,6 +843,35 @@ function selectOpenToAnon(t: RlsTable): boolean {
 }
 
 /**
+ * Every signed-in user reads every row already: a permissive SELECT policy for them whose USING is
+ * `true` or only asks for a session (`auth.uid() is not null`), and no RESTRICTIVE one narrowing it.
+ */
+function selectOpenToSignedIn(t: RlsTable): boolean {
+  const reads = t.policyDetails.filter((p) => p.command === "select" || p.command === "all");
+  if (reads.some((p) => !opensAccess(p))) return false;
+  return reads.some(
+    (p) =>
+      (p.roles.length === 0 ||
+        p.roles.some((r) => ["authenticated", "public"].includes(r.toLowerCase()))) &&
+      (isTautology(p.using) || ASKS_FOR_SESSION.test(p.using?.trim() ?? "")),
+  );
+}
+
+/** The view's query calls a function that a SELECT policy of the table calls too. */
+function filtersLikePolicy(v: RlsTable, t: RlsTable, defined: ReadonlySet<string>): boolean {
+  // Only helpers the migrations define: now(), coalesce() and the like filter nothing.
+  const calls = (v.viewCalls ?? []).filter((c) => defined.has(c));
+  return t.policyDetails.some(
+    (p) =>
+      (p.command === "select" || p.command === "all") &&
+      calls.some((c) => new RegExp(`(?<![A-Za-z0-9_$])${c}"?\\s*\\(`, "i").test(p.using ?? "")),
+  );
+}
+
+const ASKS_FOR_SESSION =
+  /^\(*\s*(?:\(\s*select\s+auth\.uid\(\)\s*(?:as\s+\w+\s*)?\)|auth\.uid\(\))\s+is\s+not\s+null\s*\)*$|^\(*\s*auth\.role\(\)\s*=\s*'authenticated'(?:::text)?\s*\)*$/i;
+
+/**
  * A view runs with its owner's rights unless it says `security_invoker`, and on Supabase the owner
  * is postgres, whom row level security does not bind. So a view over a protected table shows every
  * row of it to whoever may select the view, and the default grants let both API roles select it.
@@ -856,17 +889,31 @@ export const viewRunsWithOwnerRights: Rule = {
   evaluate(ctx) {
     const out: Finding[] = [];
     const byKey = new Map(ctx.model.tables.map((t) => [t.table, t]));
+    // With Supabase CLI migrations, a view defined only in other SQL (a schema dump, database/*.sql,
+    // a script) may never have been created in the database the migrations build.
+    const defined = new Set((ctx.model.sqlFunctions ?? []).map((f) => f.name.toLowerCase()));
+    const cli = ctx.model.tables.some((t) => isCliMigrationFile(t.location.file));
+    // A script kept in the migrations folder under another name counts: it was written to be run.
+    const inMigrations = (file: string) =>
+      /(?:^|\/)supabase\/migrations\/[^/]+\.sql$/i.test(file.split("\\").join("/"));
     for (const v of publicTables(ctx)) {
       if (!isView(v) || v.viewSecurityInvoker !== false || !v.viewSources) continue;
+      if (cli && !inMigrations(v.location.file)) continue;
       // The Data API refuses before the view runs unless an API role may select it.
       if (!apiReaches(v, [], ["select"])) continue;
+      const revoked = v.selectRevoked ?? [];
+      if (revoked.includes("anon") && revoked.includes("authenticated")) continue;
       // Tables whose rows the view hands out: protected by RLS, not public already, not views.
-      const shown = v.viewSources
+      let shown = v.viewSources
         .map((k) => byKey.get(k))
         .filter((t): t is RlsTable => t !== undefined && !isView(t) && t.rlsEnabled)
-        .filter((t) => !selectOpenToAnon(t));
+        .filter((t) => !selectOpenToAnon(t))
+        // The view filters by the caller with the table's own policy helper (Vilo-Research-OS).
+        .filter((t) => !filtersLikePolicy(v, t, defined));
+      const anon = apiReaches(v, ["anon"], ["select"]) && !revoked.includes("anon");
+      // Only signed-in users reach the view: tables they read whole already add nothing.
+      if (!anon) shown = shown.filter((t) => !selectOpenToSignedIn(t));
       if (shown.length === 0) continue;
-      const anon = apiReaches(v, ["anon"], ["select"]);
       const who = anon ? "anyone holding the public anon key" : "any signed-in user";
       const what = v.kind === "matview" ? "materialized view" : "view";
       const names = shown.map((t) => `public.${t.table}`).join(", ");
@@ -930,4 +977,7 @@ export const supabaseSqlPoliciesPack: readonly Rule[] = [
   policiesWithoutRlsEnabled,
   anonWritePolicy,
   viewRunsWithOwnerRights,
+  selfAssignableRoleColumn,
+  roleFromSignupMetadata,
+  selfWritableEntitlementColumn,
 ];

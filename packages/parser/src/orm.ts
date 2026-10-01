@@ -185,10 +185,24 @@ export function prismaWhereFilters(where: ts.Expression | null, sf: ts.SourceFil
               q.name.getText(sf),
             ),
         );
+        if (!opProp) {
+          // A relation filter: `user: { organization_id: org }` keeps rows whose related record
+          // matches, as do `is: {...}` and `some: {...}`; `none`, `every` and `isNot` keep rows by
+          // what they lack, so they scope nothing.
+          const wrapped = init.properties.find(
+            (q): q is ts.PropertyAssignment =>
+              ts.isPropertyAssignment(q) && /^(is|some)$/.test(q.name.getText(sf)),
+          );
+          const negated = init.properties.some(
+            (q) => ts.isPropertyAssignment(q) && /^(none|every|isNot)$/.test(q.name.getText(sf)),
+          );
+          if (!negated) out.push(...prismaWhereFilters(wrapped ? wrapped.initializer : init, sf));
+          continue;
+        }
         out.push({
-          method: opProp ? opProp.name.getText(sf) : "eq",
+          method: opProp.name.getText(sf),
           column: key,
-          value: opProp ? opProp.initializer : init,
+          value: opProp.initializer,
           text: pr.getText(sf),
         });
         continue;

@@ -251,6 +251,12 @@ export interface RouteHandler {
   ignores: IgnoreDirective[];
   /** Role/claim predicates that stop the entry point (see RoleCheck). Absent in older models. */
   roleChecks?: RoleCheck[];
+  /**
+   * Exits decided by an entitlement column (credits, balance, plan...) of a row the caller's identity
+   * selected: `if (profile.credits <= 0) return 402`. Same shape as a RoleCheck with table and column
+   * set. Absent in models written before 27 September 2026.
+   */
+  entitlementChecks?: RoleCheck[];
   /** Calls to the Auth admin API. Absent in models written before 19 September 2026. */
   adminApiCalls?: AdminApiCall[];
   /**
@@ -367,6 +373,31 @@ export interface SqlFunctionInfo {
    * snapshot only for SECURITY DEFINER functions, whose bodies the query sends.
    */
   sqlFromParams?: string[];
+  /**
+   * The body refuses callers without an admin-like privilege before its first EXECUTE (see
+   * `executeGatedByCaller` in `sql-dynamic.ts`). Set only next to `sqlFromParams`.
+   */
+  executeGated?: true;
+  /**
+   * Columns of the caller's own row the body treats as a privilege (`select 1 from profiles where id =
+   * auth.uid() and role = 'admin'`), see `roleColumnsIn` in `sql-role-source.ts`. Absent when none.
+   */
+  roleColumns?: Array<{ table: string; column: string }>;
+  /**
+   * Tenant columns of the caller's own row the body reads (`select organisation_id from user_profiles
+   * where id = auth.uid()`), see `scopeColumnsIn` in `sql-role-source.ts`. Absent when none.
+   */
+  scopeColumns?: Array<{ table: string; column: string }>;
+  /**
+   * Entitlement columns the body decides on (`select credits into v from profiles ...; if v <= 0`),
+   * whatever row it picks, see `entitlementColumnsIn` in `sql-role-source.ts`. Absent when none.
+   */
+  entitlementColumns?: Array<{ table: string; column: string }>;
+  /**
+   * Columns the body fills unchanged from sign-up metadata (`new.raw_user_meta_data ->> 'role'`), see
+   * `metadataCopiesIn` in `sql-metadata-copy.ts`. Absent when none.
+   */
+  metadataCopies?: Array<{ table: string; column: string; key: string }>;
 }
 
 /** A trigger from migration SQL, kept for what RLS cannot express: columns a row's owner may not change. */
@@ -382,6 +413,16 @@ export interface SqlTrigger {
    * and also reads off OLD, assigns with `:=`, or reads in a body that raises.
    */
   checkedColumns: string[];
+  /**
+   * Columns the trigger function sets to a literal (`new.role := 'member'`): whatever the writer
+   * sent, the row gets the trigger's value on the paths where it runs.
+   */
+  forcedColumns?: string[];
+  /**
+   * The function is SECURITY DEFINER and first returns unless `current_user` is a signed-in role; there
+   * `current_user` is the owner, so the trigger holds nothing back (`sql-inert-guard.ts`).
+   */
+  inert?: boolean;
   /** The trigger function, keyed like `SqlFunctionInfo.name`. */
   function: string;
   location: FileRef;
@@ -441,6 +482,26 @@ export interface RlsTable {
    * absent. Migration scans only; absent otherwise.
    */
   policiesUnread?: true;
+  /**
+   * What `authenticated` may still UPDATE or INSERT column by column after the migrations' GRANT and
+   * REVOKE statements (`sql-table-grants.ts`): a key holds the columns left, `[]` none. Absent, or a
+   * key absent: every column, which is Supabase's default for tables in public. Migration scans only;
+   * a live snapshot says it with `apiGrants` instead.
+   */
+  authenticatedWrites?: { update?: string[]; insert?: string[] };
+  /**
+   * Data API roles whose SELECT on the whole relation a migration REVOKE took away and no later GRANT
+   * gave back (`sql-table-grants.ts`). Absent: both keep it, Supabase's default in public. Migration
+   * scans only; a live snapshot says it with `apiGrants` instead.
+   */
+  selectRevoked?: ("anon" | "authenticated")[];
+  /** Lowercase names of the functions a view's query calls; views only, migration scans only. */
+  viewCalls?: string[];
+  /**
+   * Lowercase names of policies an ALTER POLICY statement changed. The parser does not apply ALTER
+   * POLICY, so the USING and WITH CHECK listed for them may be stale: nothing is concluded from them.
+   */
+  alteredPolicies?: string[];
 }
 
 export type ExposureKind = "service_role_in_client_component" | "public_env_service_role";
@@ -506,4 +567,9 @@ export interface ProjectModel {
    * function the migrations call, or in SQL it does not evaluate.
    */
   fromLiveDatabase?: true;
+  /**
+   * The project has package.json files and none depends on a `@supabase/` package, so its Supabase SQL
+   * is not what the running application uses. Migration scans only.
+   */
+  supabaseClientAbsent?: true;
 }

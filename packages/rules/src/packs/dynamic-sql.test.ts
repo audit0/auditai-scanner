@@ -99,4 +99,16 @@ end $$;
 `);
     expect(findings).toEqual([]);
   });
+
+  it("stays silent on an admin-only SQL runner that checks the caller before EXECUTE", () => {
+    const findings = findingsFor(`create table public.profiles (id uuid primary key, role text);
+create function public.run_sql(p_sql text) returns void language plpgsql security definer as $$
+declare r text;
+begin
+  select role into r from public.profiles where id = auth.uid();
+  if r is distinct from 'admin' then raise exception 'admins only'; end if;
+  execute p_sql;
+end $$;`);
+    expect(findings).toEqual([]);
+  });
 });

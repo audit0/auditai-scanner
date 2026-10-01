@@ -126,6 +126,12 @@ function unsafeNames(
   const visit = (tokens: readonly Token[]): void => {
     for (let i = 0; i < tokens.length; i += 1) {
       const t = tokens[i];
+      // `case when p_filter is not null then 'and x = $6' else '' end`: the condition only picks a
+      // branch; what reaches the text is the branch, read on its own after THEN or ELSE.
+      if (isWord(t, "when")) {
+        i = thenAfter(tokens, i);
+        continue;
+      }
       const name = nameOf(t);
       if (name === null) continue;
       const open = tokens[i + 1];
@@ -153,6 +159,40 @@ function unsafeNames(
   visit(expr);
   return out;
 }
+
+/** Index of the THEN that closes the WHEN at `at` (same paren depth), or the last token. */
+function thenAfter(tokens: readonly Token[], at: number): number {
+  let depth = 0;
+  for (let j = at + 1; j < tokens.length; j += 1) {
+    const t = tokens[j];
+    if (isPunct(t, "(") || isPunct(t, "[")) depth += 1;
+    else if (isPunct(t, ")") || isPunct(t, "]")) depth -= 1;
+    if (depth < 0) return j - 1;
+    if (depth === 0 && isWord(t, "then")) return j;
+  }
+  return tokens.length - 1;
+}
+
+/**
+ * The body refuses callers without a privilege before its first EXECUTE: it reads the caller's identity
+ * (`auth.uid()`, `auth.jwt()`) or calls an `is_admin()`-style helper, and raises, with an admin-like
+ * literal or that helper in the text before the EXECUTE. A SQL runner kept for admins is a design choice,
+ * not an injection by strangers; whether a user can make themselves admin is S6's question.
+ */
+export function executeGatedByCaller(body: string): boolean {
+  const at = body.search(EXECUTE_WORD);
+  if (at < 0) return false;
+  const before = body.slice(0, at);
+  if (!/(?<![A-Za-z0-9_$])raise(?![A-Za-z0-9_$])/i.test(before)) return false;
+  if (ADMIN_HELPER.test(before)) return true;
+  if (!/auth\s*\.\s*(?:uid|jwt)\s*\(/i.test(before)) return false;
+  return [...before.matchAll(/'([^']*)'/g)].some((m) => ADMIN_LITERAL.test(m[1] ?? ""));
+}
+
+const ADMIN_HELPER =
+  /(?<![A-Za-z0-9_$])(?:is_?(?:super_?|platform_?|org_?)?admin|has_?role|check_?admin|require_?admin)\s*\(/i;
+const ADMIN_LITERAL =
+  /^(?:admin|admins|administrator|super_?admin|superadmin|superuser|owner|staff|platform_admin|system_admin)$/i;
 
 /** `x::int`, `x::regclass::text`: the first cast decides. */
 function isSafeCast(tokens: readonly Token[], at: number): boolean {

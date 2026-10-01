@@ -88,7 +88,8 @@ import {
 import { productionExitOf } from "./production-exit.js";
 import { Resolver } from "./resolve.js";
 import { appliedSqlFiles, parseSqlForRls, sqlSchemaFor } from "./rls.js";
-import { roleGatesIn, sessionNamesIn } from "./role-gates.js";
+import { roleGatesIn, rowGatesIn, sessionNamesIn } from "./role-gates.js";
+import { ENTITLEMENT_COLUMN } from "./sql-role-source.js";
 import {
   bucketName,
   CallerScope,
@@ -258,6 +259,7 @@ interface Acc {
   authChecks: AuthCheck[];
   adminApiCalls: AdminApiCall[];
   roleChecks: RoleCheck[];
+  entitlementChecks: RoleCheck[];
   queries: SupabaseQuery[];
   metadataAccesses: MetadataAccess[];
   visited: Set<string>;
@@ -509,6 +511,17 @@ function instanceOfCall(
   return null;
 }
 
+/**
+ * `prismaClientSingleton()` where a function of the same module returns `new PrismaClient()`: the
+ * singleton Prisma's Next.js guide recommends (`globalThis.prismaGlobal ?? prismaClientSingleton()`).
+ */
+function callsPrismaFactory(e: ts.Expression, scope: Map<string, Sym>): boolean {
+  if (!ts.isCallExpression(e) || !ts.isIdentifier(e.expression)) return false;
+  const sym = scope.get(e.expression.text);
+  if (sym?.kind !== "function") return false;
+  return returnedExpressions(sym.fn).some((r) => isPrismaNew(clientCreatingOperand(r)));
+}
+
 /** Module-level `const supabase = createClient(...)` / `const api = new Api(...)`, classified once. */
 function varBinding(p: Project, sym: Extract<Sym, { kind: "var" }>): ArgBinding {
   const key = `${sym.facts.file}#${sym.name}`;
@@ -520,7 +533,7 @@ function varBinding(p: Project, sym: Extract<Sym, { kind: "var" }>): ArgBinding 
   const scope = scopeOf(p, sym.facts);
   const init = clientCreatingOperand(sym.init);
   let out: ArgBinding = NO_ARG;
-  if (isPrismaNew(init)) {
+  if (isPrismaNew(init) || callsPrismaFactory(init, scope)) {
     out = {
       client: {
         kind: "direct_db",
@@ -1142,6 +1155,22 @@ function analyzeFrame(p: Project, frame: Frame, acc: Acc): void {
       ...(typeof table === "string" && column !== undefined ? { table, column } : {}),
     });
   }
+  // What the caller paid for, read off their own row: `if (profile.credits <= 0) return 402`.
+  const rows = new Set(
+    [...frame.identities].filter(([, t]) => typeof t === "string" && t !== "").map(([n]) => n),
+  );
+  for (const gate of rowGatesIn(body, rows, ENTITLEMENT_COLUMN)) {
+    if (gate.exit === "return" && !frame.exitPropagates) continue;
+    const table = frame.identities.get(gate.root);
+    if (typeof table !== "string") continue;
+    acc.entitlementChecks.push({
+      ...loc(gate.node),
+      source: gate.source,
+      text: gate.node.expression.getText(sf).replace(/\s+/g, " ").slice(0, 160),
+      table,
+      column: gate.column,
+    });
+  }
   // The same decision taken one level down: a permission helper whose answer comes from the caller's
   // own identity, checked here with an early exit (see permissionHelperGate).
   for (const call of collect(body, ts.isCallExpression)) {
@@ -1753,6 +1782,7 @@ function permissionHelperGate(
     authChecks: [],
     adminApiCalls: [],
     roleChecks: [],
+    entitlementChecks: [],
     queries: [],
     metadataAccesses: [],
     visited: new Set(),
@@ -2087,6 +2117,7 @@ function returnTaint(
     authChecks: [],
     adminApiCalls: [],
     roleChecks: [],
+    entitlementChecks: [],
     queries: [],
     metadataAccesses: [],
     visited: new Set(),
@@ -2267,6 +2298,7 @@ function returnFresh(
     authChecks: [],
     adminApiCalls: [],
     roleChecks: [],
+    entitlementChecks: [],
     queries: [],
     metadataAccesses: [],
     visited: new Set(),
@@ -2690,6 +2722,7 @@ function returnIdentity(
     authChecks: [],
     adminApiCalls: [],
     roleChecks: [],
+    entitlementChecks: [],
     queries: [],
     metadataAccesses: [],
     visited: new Set(),
@@ -2807,6 +2840,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     authChecks: [],
     adminApiCalls: [],
     roleChecks: [],
+    entitlementChecks: [],
     queries: [],
     metadataAccesses: [],
     visited: new Set(),
@@ -2892,6 +2926,7 @@ function analyzeHandler(p: Project, h: HandlerInput): RouteHandler {
     metadataAccesses: acc.metadataAccesses,
     ignores,
     roleChecks: acc.roleChecks,
+    ...(acc.entitlementChecks.length > 0 ? { entitlementChecks: acc.entitlementChecks } : {}),
     adminApiCalls: acc.adminApiCalls,
     ...(productionExit ? { productionExit } : {}),
   };
@@ -3059,7 +3094,42 @@ export function parseProject(rootInput: string, opts: ParseOptions = {}): Projec
       ? { dataApiRefusesUnfilteredWrites: false }
       : {}),
     ...(schema.policiesUnread ? { policiesUnread: true } : {}),
+    ...(supabaseClientAbsent(root, manifests, warnings) ? { supabaseClientAbsent: true } : {}),
   };
+}
+
+/**
+ * The project has package.json files and none of them depends on a `@supabase/` package: whatever
+ * sits in `supabase/` is left over from before a move to another database (Studzy moved to Neon and
+ * Drizzle and kept its old migrations). An unreadable manifest counts as depending on Supabase.
+ */
+function supabaseClientAbsent(
+  root: string,
+  manifests: readonly string[],
+  warnings: string[],
+): boolean {
+  if (manifests.length === 0) return false;
+  for (const rel of manifests) {
+    let json: unknown;
+    try {
+      json = JSON.parse(readFileSync(join(root, rel), "utf8"));
+    } catch (e) {
+      warnings.push(`could not read ${rel}: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
+    if (typeof json !== "object" || json === null) return false;
+    const record = json as Record<string, unknown>;
+    for (const field of ["dependencies", "devDependencies", "peerDependencies"]) {
+      const deps = record[field];
+      if (
+        typeof deps === "object" &&
+        deps !== null &&
+        Object.keys(deps).some((d) => d.startsWith("@supabase/"))
+      )
+        return false;
+    }
+  }
+  return true;
 }
 
 /**

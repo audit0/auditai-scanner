@@ -135,3 +135,44 @@ export function roleGatesIn(body: ts.Node, sessionNames: ReadonlySet<string>): R
   });
   return out;
 }
+
+export interface RowGate {
+  node: ts.IfStatement;
+  /** `profile.credits`. */
+  source: string;
+  /** The binding the row is read off, a key of `rows`. */
+  root: string;
+  column: string;
+  exit: "throw" | "return";
+}
+
+/**
+ * Every exiting `if` of the function's own statements whose condition reads a `property`-named field
+ * straight off a row binding: `if (!profile || profile.credits <= 0) return 402`. `rows` holds the
+ * bindings of rows the caller's identity selected; the rules ask who can write the column.
+ */
+export function rowGatesIn(body: ts.Node, rows: ReadonlySet<string>, property: RegExp): RowGate[] {
+  const out: RowGate[] = [];
+  if (rows.size === 0) return out;
+  walkOwn(body, (n) => {
+    if (!ts.isIfStatement(n)) return;
+    const exit = exitKind(n.thenStatement);
+    if (!exit) return;
+    const visit = (e: ts.Node): void => {
+      if (ts.isPropertyAccessExpression(e)) {
+        const path = propertyPath(e);
+        const root = path?.[0];
+        const column = path?.[1];
+        if (path?.length === 2 && root !== undefined && column !== undefined) {
+          if (rows.has(root) && property.test(column)) {
+            out.push({ node: n, source: path.join("."), root, column: column.toLowerCase(), exit });
+            return;
+          }
+        }
+      }
+      e.forEachChild(visit);
+    };
+    visit(n.expression);
+  });
+  return out;
+}

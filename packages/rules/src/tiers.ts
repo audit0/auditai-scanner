@@ -12,6 +12,12 @@ export interface RuleTier {
   tier: FindingTier;
   /** Measured on the blind samples: real / false positive. Null for a rule no sample reached. */
   measured: { real: number; falsePositive: number } | null;
+  /**
+   * A rule-targeted blind sample (repositories picked by the shapes the rule needs, only its findings
+   * labelled): precision on unseen code, kept apart from `measured` because such a corpus is richer in
+   * the rule's shapes than an average project and must not move the tier totals the product quotes.
+   */
+  targeted?: { real: number; falsePositive: number; unsure: number; sample: string };
   why: string;
 }
 
@@ -94,7 +100,40 @@ export const RULE_TIERS: Readonly<Record<string, RuleTier>> = {
   "supabase.dynamic-sql-from-function-parameter": {
     tier: "lead",
     measured: null,
-    why: "SQL text read off the function body; on 26 September 2026 it found one function across the six corpora (155 repositories), a real injection read by hand, which is too few to claim more",
+    targeted: {
+      real: 5,
+      falsePositive: 2,
+      unsure: 1,
+      sample: "docs/realworld/2026-09-27-blind-sample-6-rules.md",
+    },
+    why: "SQL text read off the function body; on 26 September 2026 it found one function across the six corpora (155 repositories), a real injection read by hand, which is too few to claim more After the targeted blind sample, the two false-positive shapes it found (a parameter that only picks a literal CASE branch, an admin-only SQL runner) are silenced: 0 real lost on either corpus.",
+  },
+  "supabase.role-from-signup-metadata": {
+    tier: "lead",
+    measured: null,
+    targeted: {
+      real: 7,
+      falsePositive: 0,
+      unsure: 4,
+      sample: "docs/realworld/2026-09-27-blind-sample-6-rules.md",
+    },
+    why: "read on 26 September 2026 across 155 repositories of six corpora: 12 findings in 11 repositories, 8 real (every repository a hand count found), 4 unsure (the sign-up function only in loose SQL outside the ordered migrations), no false positive. The tenant-column copy added 27 September: 3 findings, 2 real (salon_id, organisation_id), 1 unsure (loose SQL), no false positive. Not yet a blind sample, so it stays a lead",
+  },
+  "supabase.self-assignable-role-column": {
+    tier: "lead",
+    measured: null,
+    targeted: {
+      real: 21,
+      falsePositive: 4,
+      unsure: 9,
+      sample: "docs/realworld/2026-09-27-blind-sample-6-rules.md",
+    },
+    why: "read on 26 September 2026 across 155 repositories of six corpora: 34 findings, 26 real, 2 false positive (a CHECK that allows no admin value, a policy dropped by a pg_policies loop), 6 unsure (loose SQL outside the ordered migrations, a Clerk-only app); not yet a blind sample, so it stays a lead After the targeted blind sample, rows no one creates and projects without a Supabase dependency are skipped: its 4 false positives (and closr, whose sign-up function a migration drops) go, 0 real lost; on the 155 repositories one finding goes (solistech-pro moved to Prisma and Auth.js).",
+  },
+  "supabase.self-writable-entitlement-column": {
+    tier: "lead",
+    measured: null,
+    why: "read on 27 September 2026 across the cached corpora (about 700 repositories): 12 findings in 10 repositories, all correct as far as the code shows; 8 are credits, a balance, a plan or a KYC status the server trusts, 4 are game points or class coins (reported at medium). Built on repositories that were already read, so it stays a lead until a blind sample",
   },
   "supabase.view-runs-with-owner-rights": {
     tier: "lead",

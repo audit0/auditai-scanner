@@ -1,5 +1,6 @@
 import type { PolicyCommand, RlsTable } from "./model.js";
-import { qualifiedKey } from "./sql-columns.js";
+import { CLI_MIGRATION, isCliMigrationFile } from "./sql-cli-files.js";
+import { identOf, qualifiedKey, readQualifiedName } from "./sql-columns.js";
 import {
   expandDoBlock,
   type FunctionSweep,
@@ -76,7 +77,8 @@ const REFERENCE_SQL_DIRS: ReadonlySet<string> = new Set([
 ]);
 
 /** A migration the Supabase CLI applies: `<version>_<name>.sql` directly inside `supabase/migrations/`. */
-const CLI_MIGRATION = /(?:^|\/)supabase\/migrations\/[0-9]+_[^/]*\.sql$/;
+export { isCliMigrationFile };
+
 /** The seed the Supabase CLI runs after the migrations. */
 const CLI_SEED = /(?:^|\/)supabase\/seed\.sql$/;
 
@@ -216,11 +218,26 @@ function headEnd(rest: string): number {
   return ends.length === 0 ? rest.length : Math.min(...ends);
 }
 
+/** `alter policy <name> on <table> ...` with literal names: the table remembers the policy was changed. */
+function noteAlteredPolicy(state: SqlSchemaState, stmt: SqlStatement): void {
+  const tk = stmt.tokens;
+  const name = identOf(tk[2]);
+  if (name === null || !isWord(tk[3], "on")) return;
+  const q = readQualifiedName(tk, 4);
+  if (q === null) return;
+  const t = state.tables.get(qualifiedKey(q));
+  if (!t) return;
+  const lower = name.toLowerCase();
+  if (!(t.alteredPolicies ?? []).includes(lower))
+    t.alteredPolicies = [...(t.alteredPolicies ?? []), lower];
+}
+
 /** CREATE POLICY goes to the table's policy list; everything else to the schema handlers. */
 function applyStatement(state: SqlSchemaState, stmt: SqlStatement, rel: string): void {
   // ALTER POLICY (new roles, a new USING, a new name) is not applied to the model.
   if (/^\s*alter\s+policy\b/i.test(stmt.text)) {
     markUnreadPolicies(state, stmt.text);
+    noteAlteredPolicy(state, stmt);
     return;
   }
   const cp = CREATE_POLICY.exec(stmt.text);
@@ -277,6 +294,10 @@ function dropPolicy(state: SqlSchemaState, stmt: SqlStatement): boolean {
   if (t) {
     t.policies = t.policies.filter((p) => p !== name);
     t.policyDetails = t.policyDetails.filter((p) => p.name !== name);
+    // A policy created again under the same name is read afresh.
+    const altered = (t.alteredPolicies ?? []).filter((p) => p !== name.toLowerCase());
+    if (altered.length > 0) t.alteredPolicies = altered;
+    else delete t.alteredPolicies;
   }
   return true;
 }

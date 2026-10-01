@@ -1,3 +1,6 @@
+export { roleFromSignupMetadata } from "./packs/role-from-signup-metadata.js";
+export { selfAssignableRoleColumn } from "./packs/self-assignable-role.js";
+export { selfWritableEntitlementColumn } from "./packs/self-writable-entitlement.js";
 export * from "./packs/supabase-authorization.js";
 export * from "./packs/supabase-sql-policies.js";
 export * from "./packs/supabase-storage-rpc.js";

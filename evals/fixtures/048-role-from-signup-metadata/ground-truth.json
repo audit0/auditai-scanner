@@ -1,0 +1,25 @@
+{
+  "id": "048-role-from-signup-metadata",
+  "vulnerabilityExists": true,
+  "class": ["privilege-escalation", "mass-assignment", "broken-function-level-authorization", "multi-tenancy"],
+  "cwe": ["CWE-269", "CWE-915"],
+  "severity": "critical",
+  "stack": ["nextjs-app-router", "supabase", "postgresql", "typescript"],
+  "vulnerablePath": [
+    "POST /auth/v1/signup with the public anon key and options.data = { role: 'admin' }",
+    "trigger on_auth_user_created on auth.users runs public.handle_new_user() as its owner",
+    "user_roles.role = coalesce(raw_user_meta_data ->> 'role', 'member') = 'admin'",
+    "GET /api/admin/users and public.is_admin() read user_roles.role: every tenant's users and invoices open"
+  ],
+  "expectedSecureBehavior": "Whatever the client puts in sign-up metadata, a new account starts without admin rights; admins are promoted only by the server.",
+  "acceptableFixes": [
+    "An allow-list of non-privileged roles with a safe default (CASE ... IN ... ELSE 'member')",
+    "Ignore the metadata for the role and keep the column default; promote admins with the service role",
+    "A BEFORE INSERT trigger on user_roles that forces the default for anything but the service role"
+  ],
+  "unacceptableFixes": [
+    "Hiding the role field in the sign-up form while the Auth API still accepts options.data",
+    "A trigger that guards UPDATE only",
+    "A guard that trusts current_user, which is the function owner inside the SECURITY DEFINER sign-up function"
+  ]
+}

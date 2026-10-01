@@ -1,0 +1,16 @@
+{
+  "ruleId": "supabase.self-writable-entitlement-column",
+  "title": "Signed-in users can rewrite \"profiles.credits\", which the server trusts",
+  "severity": "high",
+  "minConfidence": 0.7,
+  "entrypoints": ["PATCH /rest/v1/profiles", "POST /api/invoices/export"],
+  "sources": ["update body:credits"],
+  "sinks": ["supabase.update:public.profiles"],
+  "mustMentionFiles": ["vulnerable/supabase/migrations/0001_init.sql"],
+  "mustNotFlag": ["secure/supabase/migrations/0001_init.sql"],
+  "verification": {
+    "strategy": "identity-matrix",
+    "expectedBefore": "Alice sets her own credits to 1000000 and exports more times than she paid for",
+    "expectedAfter": "the update of credits is refused (permission denied for column), her credits stay as they were, and exports stop at zero"
+  }
+}

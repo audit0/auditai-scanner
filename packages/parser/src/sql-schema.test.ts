@@ -833,6 +833,8 @@ describe("fixtures", () => {
         // Named parameters (none) and the tables the body reads: what an rpc proof binds and seeds.
         params: [],
         tables: ["profiles"],
+        // The tenant column of the caller's row it reads: what S7 checks sign-up copies against.
+        scopeColumns: [{ table: "profiles", column: "tenant_id" }],
       },
     ]);
     const policy = m.tables.find((t) => t.table === "invoices")?.policyDetails[0];

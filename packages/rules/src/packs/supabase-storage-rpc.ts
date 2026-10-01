@@ -578,7 +578,9 @@ export const securityDefinerFunctionWithoutCallerCheck: Rule = {
  * statement runs with the owner's rights and RLS does not apply: critical when anon or PUBLIC can
  * execute it, high when only signed-in users can. A SECURITY INVOKER function still runs the
  * caller's SQL, but only with the caller's own grants and under RLS: medium. The parser decides which
- * parameters count (`SqlFunctionInfo.sqlFromParams`): USING, quote_* and format %L / %I are safe.
+ * parameters count (`SqlFunctionInfo.sqlFromParams`): USING, quote_* and format %L / %I are safe,
+ * and so is a parameter that only picks a literal branch of CASE. Silent on a function that refuses
+ * callers without an admin-like privilege before its EXECUTE (`executeGated`): an admin's SQL runner.
  */
 export const dynamicSqlFromFunctionParameter: Rule = {
   id: "supabase.dynamic-sql-from-function-parameter",
@@ -598,7 +600,7 @@ export const dynamicSqlFromFunctionParameter: Rule = {
     const out: Finding[] = [];
     for (const fn of sqlFunctionsOf(ctx.model)) {
       const injected = fn.sqlFromParams ?? [];
-      if (injected.length === 0) continue;
+      if (injected.length === 0 || fn.executeGated) continue;
       // Other schemas are not exposed through PostgREST by default; trigger functions cannot be called.
       if (fn.name.includes(".")) continue;
       if (fn.returns === "trigger" || fn.returns === "event_trigger") continue;

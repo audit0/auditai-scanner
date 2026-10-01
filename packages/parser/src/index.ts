@@ -25,8 +25,18 @@ export {
   routeFromFile,
 } from "./nextjs.js";
 export { type ParseOptions, parseProject } from "./parse-project.js";
-export { isAppliedSqlFile, parseSqlForRls, sqlSchemaFor } from "./rls.js";
+export { isAppliedSqlFile, isCliMigrationFile, parseSqlForRls, sqlSchemaFor } from "./rls.js";
+export { recursivePolicies } from "./rls-recursion.js";
 export { normalizeType } from "./sql-columns.js";
 export { type SqlStatement, splitSqlStatements, type Token } from "./sql-lexer.js";
+export {
+  ENTITLEMENT_COLUMN,
+  entitlementColumnsIn,
+  isRoleValue,
+  ROLE_COLUMN,
+  roleColumnsIn,
+  scopeColumnsIn,
+  TENANT_COLUMN,
+} from "./sql-role-source.js";
 export type { SqlSchemaExtras } from "./sql-schema.js";
 export { analyzeModule, classifyCreateClientCall } from "./supabase.js";

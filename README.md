@@ -144,6 +144,9 @@ ships with a vulnerable fixture that must fire and a secure fixture that must st
 | `supabase.security-definer-function-without-caller-check` | headline | high, critical if anon can execute | `SECURITY DEFINER` function (RLS skipped inside) that never reads `auth.uid()`, callable through `supabase.rpc()` |
 | `supabase.rls-policy-trusts-user-metadata` | headline | critical | RLS policy decides access from a `user_metadata` claim, which the user writes themselves with `updateUser({ data })` |
 | `supabase.policies-without-rls-enabled` | headline | high | A table carries policies and never got `enable row level security`, so none of them apply |
+| `supabase.role-from-signup-metadata` | lead | critical | A sign-up trigger on `auth.users` copies a role from `raw_user_meta_data` (set by the client in `signUp({ options: { data } })`) into a column that decides admin, or the tenant id the policies scope by |
+| `supabase.self-assignable-role-column` | lead | critical | A column of the user's own row decides admin (a route's role check, an `is_admin()` helper or a policy) and an own-row UPDATE policy leaves it writable: no `WITH CHECK`, column privilege or `BEFORE UPDATE` trigger holds it |
+| `supabase.self-writable-entitlement-column` | lead | high | A column of the user's own row holds credits, a balance, a plan or a KYC status that the server decides on (a route exits when `profile.credits <= 0`, a SQL function or policy compares it) and an own-row UPDATE policy leaves it writable: no `WITH CHECK`, column privilege or trigger. One `PATCH` gives a user credits or a paid plan. Points, coins and gems at medium |
 | `supabase.view-runs-with-owner-rights` | lead | high, medium when only signed-in users may select it | View created without `security_invoker` over a table with RLS: it runs as its owner, so the table's policies never apply inside it and every row is readable through the view (Supabase lint 0010) |
 | `supabase.service-role-key-exposed-to-client` | headline | critical | Service-role key reaches the browser (`NEXT_PUBLIC_*`, client components) |
 | `supabase.service-role-object-access-without-tenant-scope` | lead | critical | Service-role client, or a direct Drizzle/Prisma connection, reads or writes a row by user-supplied id without tenant scope (IDOR / BOLA) |
@@ -374,6 +377,9 @@ rule; the secure twin must produce zero findings. `npm run evals` enforces both 
 | 039 | anon-write-policy | anon-write-policy, an open delete policy for `anon` next to a deliberate public insert |
 | 045 | dynamic-sql-from-function-parameter | dynamic-sql-from-function-parameter, search text glued into `EXECUTE` vs bound with `USING`, in a definer function that does check the caller |
 | 046 | view-runs-with-owner-rights | view-runs-with-owner-rights, a per-tenant view created the default way vs `with (security_invoker = on)` |
+| 047 | self-assignable-role-column | self-assignable-role-column, an own-row update policy without `WITH CHECK` vs `UPDATE` revoked and granted back on `full_name` only |
+| 048 | role-from-signup-metadata | role-from-signup-metadata, `handle_new_user` copies the requested role vs an allow-list with a safe default |
+| 049 | self-writable-entitlement-column | self-writable-entitlement-column, an own-row update policy without `WITH CHECK` over `profiles.credits` that a paid export checks vs `UPDATE` revoked and granted back on `full_name` only |
 
 Each fixture also carries the `security-test` the hosted product runs in a sandbox: `DENY` tests
 are the security assertion (Alice must not read Bob's row), `ALLOW` tests are the sanity check

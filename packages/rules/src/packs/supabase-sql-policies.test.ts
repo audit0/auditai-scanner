@@ -682,6 +682,109 @@ describe("view-runs-with-owner-rights", () => {
     });
   });
 
+  it("leaves out a view defined only outside the Supabase CLI migrations", () => {
+    const cli = { "supabase/migrations/20260101000000_init.sql": OWNED };
+    const f = (files: Record<string, string>) => of(scan("", { ...cli, ...files }));
+    // A schema file next to the migrations may never have been applied.
+    expect(
+      f({ "database/views.sql": "create view public.v as select * from public.notes;" }),
+    ).toEqual([]);
+    // The same view in a migration is reported.
+    expect(
+      f({
+        "supabase/migrations/20260102000000_v.sql":
+          "create view public.v as select * from public.notes;",
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("stays silent when only signed-in users reach the view and they read the whole table already", () => {
+    const view = `create view public.v as select * from public.notes;
+revoke select on public.v from anon;
+`;
+    for (const using of ["true", "auth.uid() is not null", "((select auth.uid()) is not null)"]) {
+      const sql = `${NOTES}create policy "signed in read" on public.notes for select to authenticated using (${using});
+${view}`;
+      expect(of(scan(sql))).toEqual([]);
+    }
+    // Anon still reaching the view is another matter: the table is closed to anon.
+    expect(
+      of(
+        scan(`${NOTES}create policy "signed in read" on public.notes for select to authenticated using (true);
+create view public.v as select * from public.notes;`),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("stays silent when the view filters with the helper the table's policy uses", () => {
+    const base = `${NOTES}create function public.can_view(o uuid) returns boolean language sql stable as $$ select o = auth.uid() $$;
+create policy "members read" on public.notes for select using (public.can_view(owner_id));
+`;
+    expect(
+      of(
+        scan(
+          `${base}create view public.v as select * from public.notes n where public.can_view(n.owner_id);`,
+        ),
+      ),
+    ).toEqual([]);
+    // Any other function in the view is no filter.
+    expect(
+      of(scan(`${base}create view public.v as select id, lower(body) from public.notes;`)),
+    ).toHaveLength(1);
+  });
+
+  it("keeps an earlier relation when CREATE VIEW IF NOT EXISTS meets its name", () => {
+    const f = of(
+      scan(`${OWNED}create view public.v with (security_invoker = on) as select * from public.notes;
+create materialized view if not exists public.v as select * from public.notes;`),
+    );
+    expect(f).toEqual([]);
+  });
+
+  it("follows migration GRANT and REVOKE of SELECT on the view", () => {
+    const view = `${OWNED}create view public.v as select * from public.notes;\n`;
+    // Both API roles lose SELECT: PostgREST refuses before the view runs.
+    for (const sql of [
+      `${view}revoke select on public.v from anon, authenticated;`,
+      `${view}revoke all on table public.v from anon;\nrevoke all privileges on public.v from authenticated;`,
+      `${view}revoke all on all tables in schema public from anon, authenticated;`,
+    ]) {
+      expect(of(scan(sql))).toEqual([]);
+    }
+    // Only anon loses it: signed-in users still read every row, medium.
+    const signedIn = of(scan(`${view}revoke select on public.v from anon;`));
+    expect(signedIn).toHaveLength(1);
+    expect(signedIn[0]?.severity).toBe("medium");
+    // Revoking PUBLIC leaves anon's and authenticated's own grants; a later GRANT gives SELECT back;
+    // a column list is not the whole view.
+    for (const sql of [
+      `${view}revoke all on public.v from public;`,
+      `${view}revoke select on public.v from anon, authenticated;\ngrant select on public.v to anon;`,
+      `${view}revoke select (body) on public.v from anon, authenticated;`,
+    ]) {
+      expect(of(scan(sql))).toHaveLength(1);
+    }
+    // A hardening script guards the revoke with IF ... THEN inside a DO block.
+    expect(
+      of(
+        scan(`${view}do $$ begin
+  if to_regclass('public.v') is not null then
+    revoke all privileges on table public.v from anon;
+    revoke all privileges on table public.v from authenticated;
+  end if;
+end $$;`),
+      ),
+    ).toEqual([]);
+    // A view dropped and created again starts with the default grants.
+    expect(
+      of(
+        scan(
+          `${view}revoke select on public.v from anon, authenticated;\ndrop view public.v;\ncreate view public.v as select * from public.notes;`,
+        ),
+      ),
+    ).toHaveLength(1);
+  });
+
   it("stays silent for security_invoker views, views over open or unprotected tables, and views over views", () => {
     for (const sql of [
       `${OWNED}create view public.v with (security_invoker = on) as select * from public.notes;`,
